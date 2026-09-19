@@ -83,6 +83,8 @@ An article asserts only facts a human or agent verified:
 | `not_ready: true` | Needs more blueprint work before it can be attempted. |
 | `lean: Ns.decl` | Declaration name(s) that discharge the article. |
 | `discussion: 42` | Issue number or URL where the article is being discussed. |
+| `skeleton_approved: sha256:<64 hex>` | A person approved the statement's skeleton at this semantic hash. |
+| `skeleton_evidence: sha256:<64 hex>` | The evidence hash of the joint packet that person read. |
 
 Everything a reader thinks of as progress is *derived* from the DAG on every
 run, so it cannot go stale:
@@ -367,12 +369,28 @@ compares reports across builds; it is not a stable statement identifier,
 reviewer authentication, or an approval key.
 
 Reports and packet manifests also carry an evidence hash over the exact packet
-shown to a reviewer. It identifies those bytes but does not authenticate who
-reviewed them. An article review hash additionally binds the joint packet to the
-cited passage, its locator, and the drift hash, so a review recorded against it
-does not survive a change of meaning that leaves the packet text unchanged. All
-three are advisory provenance checksums when candidate code controls the
-checkout.
+proof-free text shown to a reviewer. Semantic hashes survive presentation-only
+edits; evidence hashes ensure an approval is attached to the bytes that were
+actually reviewed. An article review hash additionally binds the joint packet
+to the cited passage, its locator, and the drift hash, so a review recorded
+against it does not survive a change of meaning that leaves the packet text
+unchanged. All three are advisory provenance checksums when candidate code
+controls the checkout. Two kinds of testimony are pinned to these hashes:
+
+- **Approval.** When a person has compared the book statement with the
+  skeleton and agreed that the Lean says what the book says, the article
+  records `skeleton_approved: <article hash>`, the semantic hash, and
+  `skeleton_evidence: <article evidence hash>` for the exact joint packet
+  that was read. Both are assertions, so they live in frontmatter like every
+  other checked fact; the evidence key is optional, the semantic key is not.
+- **Read-backs.** An independent agent that has seen only one declaration's
+  packet writes what it literally asserts, in mathematical English, and files
+  it as `blueprint/readbacks/<article id>/<Lean name>.md` with `declaration`,
+  `skeleton` (the semantic hash), `packet` (the evidence hash of the packet it
+  read), and `model` frontmatter. Read-backs are testimony, not derived
+  state, so they are committed with the book. The
+  [read-back reference](../skills/human-review/references/readback.md) gives
+  the auditor its instructions; the practice follows Prove2me's mission audits.
 
 `--packets DIR` writes one comment-stripped packet per skeleton, with a
 manifest mapping packets to articles and hashes. The destination must be empty
@@ -435,9 +453,20 @@ the packets, one per article, in a separate, disjoint managed directory. It
 requires `--packets`. Each article directory also holds `article.lean`, the
 joint packet of every declaration the article
 names, because a source theorem is often formalized by several declarations
-together and each alone is honestly incomplete. A judge of faithfulness is
-given the article packet and its passage; an auditor asked what one
-declaration asserts is given that declaration's packet alone.
+together and each alone is honestly incomplete. A faithfulness judge is given
+the article packet and its passage; a read-back auditor is given one
+declaration's packet alone, since a read-back is testimony about one
+declaration.
+
+`autoform audit … --skeleton skeleton.json` compares both with the current
+report: `skeleton-drift` names an approval whose skeleton meaning has moved,
+`skeleton-evidence-drift` one whose recorded packet text has, and
+`readback-stale`, `readback-revised`, or `readback-missing` names testimony
+whose skeleton moved, whose packet text changed, or that was never filed. `autoform render … --skeleton skeleton.json` adds a
+*Review* disclosure under every statement box, showing the skeleton, the
+assumed library notions, the axioms, the read-back with its currency, and the
+approval state, so a reviewer compares book text, Lean, and testimony without
+leaving the page. Read-backs are never published as pages of their own.
 
 When `--output`, `--packets`, and `--passages` are combined, all three outputs
 are staged before publication and a failed commit restores the previous set.
