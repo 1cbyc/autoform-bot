@@ -2517,7 +2517,7 @@ def extract_skeletons(
         node_ids=node_ids,
     )
     if index_project(root).source_digest != index.source_digest:
-        raise SkeletonError(["Lean sources changed while skeletons were being extracted; retry after the build is idle"])
+        raise SkeletonError(["Lean sources changed during skeleton extraction; retry after the build is idle"])
     if _project_control_snapshot(root) != control_snapshot:
         raise SkeletonError(
             ["Lean project configuration changed while skeletons were being extracted; retry after the project is idle"]
