@@ -1526,6 +1526,16 @@ def _run_registered_command(
             process = None
 
 
+def evidence_hash_of(packet: str) -> str:
+    """The evidence hash of packet text, however it reached the caller.
+
+    A read-back card shows its packet verbatim, so a reader can hash what the
+    card displays and compare it with what the card records.
+    """
+
+    return _sha256_id(packet.encode("utf-8"))
+
+
 # --------------------------------------------------------------------------- #
 # Lean project layout
 # --------------------------------------------------------------------------- #
@@ -3628,6 +3638,7 @@ __all__ = [
     "SkeletonError",
     "SkeletonReport",
     "TrustedDeclaration",
+    "evidence_hash_of",
     "extract_graph_skeletons",
     "extract_skeletons",
     "format_report",
