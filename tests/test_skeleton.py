@@ -36,8 +36,6 @@ from autoform_cli.skeleton import (
     _remove_output,
     _rename_no_replace,
     _run_bounded_command,
-    _replace_outputs,
-    _stage_output,
     _hash_module_files,
     _local_safety_issue,
     _without_comments,
@@ -49,8 +47,10 @@ from autoform_cli.skeleton import (
     module_of,
     parse_probe_output,
     path_of,
+    replace_managed_outputs,
     render_probe,
     run_probe,
+    stage_managed_output,
     write_packets,
     write_skeleton_report,
 )
@@ -3839,7 +3839,7 @@ def test_packet_publication_cleans_up_when_second_stage_fails(
     report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
     packets = tmp_path / "packets"
     passages = tmp_path / "passages"
-    stage_output = _stage_output
+    stage_output = stage_managed_output
     calls = 0
 
     def fail_second_stage(destination: Path) -> Path:
@@ -3849,7 +3849,7 @@ def test_packet_publication_cleans_up_when_second_stage_fails(
             raise OSError("simulated passage staging failure")
         return stage_output(destination)
 
-    monkeypatch.setattr("autoform_cli.skeleton._stage_output", fail_second_stage)
+    monkeypatch.setattr("autoform_cli.skeleton.stage_managed_output", fail_second_stage)
 
     with pytest.raises(SkeletonError, match="could not prepare skeleton output"):
         write_packets(report, packets, passages=passages)
@@ -3869,9 +3869,9 @@ def test_packet_publication_detects_a_concurrent_file_edit(tmp_path: Path, monke
 
     def edit_then_replace(outputs) -> None:
         marker.write_text("concurrent edit\n", encoding="utf-8")
-        _replace_outputs(outputs)
+        replace_managed_outputs(outputs)
 
-    monkeypatch.setattr("autoform_cli.skeleton._replace_outputs", edit_then_replace)
+    monkeypatch.setattr("autoform_cli.skeleton.replace_managed_outputs", edit_then_replace)
 
     with pytest.raises(SkeletonError, match="changed during publication"):
         write_packets(report, packets)
