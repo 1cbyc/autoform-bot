@@ -36,3 +36,10 @@ and Lean-source links. Record each human decision as `approve`, `revise`, or
 from the person's judgment. Do not silently apply requested revisions: hand
 mathematical-plan changes to Roadmap, Lean implementation changes to
 Orchestrate, and autonomous rubric scoring to Agent Review.
+
+Treat the landing page's `Scoped roadmap` percentage as completion among
+formalizable leaf targets only: proofs for theorems, bodies for definitions,
+and verified Mathlib targets. Treat it never as whole-source completion. Read
+the adjacent declared source coverage and its linked coverage contract before
+making scope claims. A statement-only theorem remains incomplete whether it is
+blocked or ready to prove.
