@@ -55,6 +55,17 @@ def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> Non
     assert "report as advisory" in normalized
 
 
+def test_quick_start_keeps_the_cli_agent_facing(repo_root: Path) -> None:
+    readme = (repo_root / "README.md").read_text(encoding="utf-8")
+    quick_start = readme.split("## Quick start", 1)[1].split("## Blueprint model", 1)[0]
+    normalized = " ".join(quick_start.split())
+
+    assert "agent window" in normalized
+    assert "users do not need to learn or run its commands" in normalized
+    assert "/autoform:setup" in quick_start
+    assert "uv run autoform" not in quick_start
+
+
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     example = repo_root / _EXAMPLE
     blueprint = example / "blueprint"
@@ -372,24 +383,12 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     for required in (
         "references/cabannes-thesis-roadmap.md",
         "blueprint/roadmap/",
-        "blueprint/coverage/",
-        "blueprint/roadmap/**/*.md",
-        "declaration",
-        "coarse roadmap",
+        "blueprint/coverage/README.md",
+        "blueprint/sources/",
         "## Depends on",
-        "ordered mathematical book",
-        "reading order",
-        "mathematical significance",
-        "pull-request-sized unit",
+        "## Proof depends on",
         "one unique main result",
-        "targeted lookups",
-        "exact verified upstream result",
-        "Reconcile every page whose claims this work has just invalidated",
-        "GitHub pull requests and issues",
-        "Zulip topics",
         "../setup/references/zulip.md",
-        "project-authored specification",
-        "never contact people",
     ):
         assert required in roadmap
     assert "autoform init" in setup
@@ -417,6 +416,8 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert len(develop_plugin.split()) <= 220
     assert "$setup" in setup_metadata
     assert "$roadmap" in roadmap_metadata
+    assert "one invocation" in roadmap_metadata
+    assert "persistent Goal" in roadmap_metadata
     assert "$agent-review" in agent_review_metadata
     assert "$human-review" in human_review_metadata
     assert "$develop-plugin" in develop_plugin_metadata
@@ -429,6 +430,38 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert "coherent pull\nrequest and review unit" in roadmap_example
     assert (repo_root / "skills/agent-review/references/thesis-review-case.md").is_file()
     assert (repo_root / "skills/agent-review/references/roadmap-quality.md").is_file()
+
+
+def test_roadmap_skill_owns_a_compact_complete_pass(repo_root: Path) -> None:
+    """A direct Roadmap invocation is a full job, not one planning checkpoint."""
+
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+    normalized = " ".join(roadmap.split())
+
+    assert len(roadmap.split()) <= 650
+    for required in (
+        "one complete planning pass",
+        "model-callable Goal lifecycle",
+        "If no compatible Goal can be used",
+        "complete the same pass in the current run",
+        "leave any unrelated Goal unchanged",
+        "Do not ask the user to invoke another command",
+        "internal checkpoints",
+        "Do not pause for approval",
+        "Treat every other `DEFERRED` row as queued work",
+        "Do not stop after discovery",
+        "Mark an active Goal complete only after these conditions hold",
+    ):
+        assert required in normalized
+
+    for obsolete in (
+        "internal/runbooks/planning.md",
+        "Let the user choose whether",
+        "for user approval before",
+        "After approval",
+        "Do not infer missing scope",
+    ):
+        assert obsolete not in roadmap
 
 
 def test_setup_skill_offers_opt_in_zulip_project_sync(repo_root: Path) -> None:
