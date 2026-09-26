@@ -24,6 +24,7 @@ logger = getLogger(__name__)
 DEFAULT_MAX_DIAGNOSTICS = 10
 DEFAULT_SMOKE_TEST_TIMEOUT = 10
 DEFAULT_REPL_STARTUP_TIMEOUT = 180.0
+DEFAULT_REPL_CLEANUP_SECONDS = 2.0
 REPL_ABORT_TERM_SECONDS = 0.5
 REPL_ABORT_KILL_SECONDS = 1.0
 
@@ -541,6 +542,8 @@ class LeanRepl:
         self.cwd = config.cwd
         self.process: subprocess.Popen | None = None
         self._process_group_id: int | None = None
+        # Set while a process handle is owned but a close() has not completed.
+        self._retire_pending = False
 
         self.request_timeout = config.request_timeout
         self.max_retries = config.max_retries
@@ -593,6 +596,7 @@ class LeanRepl:
                 start_new_session=True,
             )
             self._process_group_id = self.process.pid
+            self._retire_pending = False
             self._stderr_bytes = 0
             self._stderr_tail.clear()
 
@@ -647,11 +651,20 @@ class LeanRepl:
             raise
 
     def close(self, *, deadline: float | None = None) -> None:
-        """Close the Lean REPL process."""
+        """Close the Lean REPL process.
+
+        A caller's deadline bounds cleanup only while it leaves at least
+        ``DEFAULT_REPL_CLEANUP_SECONDS``. Request paths reach close() after their
+        own deadline has expired, and a large Lean process cannot be reaped in a
+        zero budget.
+        """
+        if deadline is not None:
+            deadline = max(deadline, time.monotonic() + DEFAULT_REPL_CLEANUP_SECONDS)
         process = self.process
         process_group_id = self._process_group_id
         try:
             if process is not None:
+                self._retire_pending = True
                 if process_group_id is None:
                     try:
                         process_group_id = process.pid
@@ -666,6 +679,7 @@ class LeanRepl:
                         _kill_subprocesses(process, process_group_id, deadline)
             self.process = None
             self._process_group_id = None
+            self._retire_pending = False
         finally:
             self._base_env_id = None
             self._stderr_bytes = 0
@@ -684,9 +698,14 @@ class LeanRepl:
         self.start(startup_timeout=remaining)
 
     def is_alive(self) -> bool:
-        """Conservatively check without reaping the process-group leader."""
+        """Conservatively check without reaping the process-group leader.
+
+        A process whose close() failed is not alive even while its leader is
+        unreaped, so the next request retries cleanup instead of dispatching.
+        """
         return (
             self.process is not None
+            and not self._retire_pending
             and getattr(self.process, "returncode", None) is None
         )
 

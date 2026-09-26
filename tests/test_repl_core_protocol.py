@@ -1599,3 +1599,105 @@ def test_wire_protocol_rejects_oversized_response(monkeypatch):
 
         with pytest.raises(repl_core.ReplOutcomeUnknown, match="response exceeded 8 bytes"):
             repl._run("#check Nat", env_id=None, timeout=1)
+
+
+_RESPONSIVE_FAKE_REPL = (
+    "import json, sys, time\n"
+    "buf = ''\n"
+    "n = 0\n"
+    "for line in sys.stdin:\n"
+    "    if line.strip():\n"
+    "        buf += line\n"
+    "        continue\n"
+    "    request = json.loads(buf)\n"
+    "    buf = ''\n"
+    "    if 'HANG' in request['cmd']:\n"
+    "        time.sleep(3600)\n"
+    "    sys.stdout.write(json.dumps({'env': n}) + '\\n\\n')\n"
+    "    sys.stdout.flush()\n"
+    "    n += 1\n"
+)
+
+
+def _responsive_fake_repl():
+    return repl_core.LeanRepl(
+        repl_core.LeanReplConfig(
+            repl_command=[sys.executable, "-c", _RESPONSIVE_FAKE_REPL],
+            warmup_imports=frozenset({"Mathlib"}),
+            validate_imports=False,
+        )
+    )
+
+
+def test_close_after_an_expired_deadline_still_reserves_cleanup_time(monkeypatch):
+    repl = repl_core.LeanRepl(
+        repl_core.LeanReplConfig(warmup_imports=frozenset(), validate_imports=False)
+    )
+    repl.process = object()
+    repl._process_group_id = 1234
+    deadlines = []
+    monkeypatch.setattr(
+        repl_core,
+        "_kill_subprocesses",
+        lambda process, process_group_id, deadline=None: deadlines.append(deadline),
+    )
+
+    before = time.monotonic()
+    repl.close(deadline=before - 5)
+
+    assert deadlines[0] >= before + repl_core.DEFAULT_REPL_CLEANUP_SECONDS
+
+
+def test_request_timeout_reaps_a_slow_to_exit_process_without_cleanup_failure(
+    monkeypatch,
+):
+    real_kill = repl_core._kill_subprocesses
+
+    def slow_reap(process, process_group_id, deadline=None):
+        # A large Lean process needs real time to exit after SIGKILL.
+        if deadline is not None and deadline - time.monotonic() < 0.5:
+            raise RuntimeError("timed out reaping the Lean REPL process")
+        real_kill(process, process_group_id, deadline)
+
+    monkeypatch.setattr(repl_core, "_kill_subprocesses", slow_reap)
+    repl = _responsive_fake_repl()
+    repl.start()
+    try:
+        response = repl.run("HANG", timeout=0.5)
+
+        assert response.get("outcome_unknown") is True
+        assert "cleanup also failed" not in response["repl_error"]
+        assert repl.process is None
+        assert repl._process_group_id is None
+        assert repl._retire_pending is False
+    finally:
+        repl.close()
+
+
+def test_worker_whose_close_failed_is_restarted_before_the_next_request(
+    monkeypatch,
+):
+    repl = _responsive_fake_repl()
+    repl.start()
+    real_kill = repl_core._kill_subprocesses
+    failures = iter([RuntimeError("timed out reaping the Lean REPL process")])
+
+    def fail_once(process, process_group_id, deadline=None):
+        error = next(failures, None)
+        if error is not None:
+            # The group is dead but its leader is left unreaped.
+            os.killpg(process_group_id, signal.SIGKILL)
+            raise error
+        real_kill(process, process_group_id, deadline)
+
+    monkeypatch.setattr(repl_core, "_kill_subprocesses", fail_once)
+    try:
+        with pytest.raises(RuntimeError, match="timed out reaping"):
+            repl.close()
+        assert not repl.is_alive()
+
+        response = repl.run("#check Nat", timeout=10)
+
+        assert "repl_error" not in response
+    finally:
+        repl.close()
