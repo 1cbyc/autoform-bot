@@ -15,6 +15,7 @@ import pytest
 import psutil
 
 from autoform_cli.__main__ import main
+from autoform_cli.lean import Declaration, SourceIndex
 from autoform_cli.skeleton import (
     PACKET_MANIFEST,
     PROBE_MARKER,
@@ -31,6 +32,7 @@ from autoform_cli.skeleton import (
     _replace_outputs,
     _stage_output,
     _hash_module_files,
+    _check_local_safety,
     extract_skeletons,
     format_report,
     lean_libraries,
@@ -107,6 +109,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
 
     eligible = {
         "name": "Skel.Eligible",
+        "source_name": "Skel.Eligible",
         "kind": "def",
         "module": "Skel.Defs",
         "range": [5, 6],
@@ -118,6 +121,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
     }
     non_ambiguous = {
         "name": "Skel.NonAmbiguous",
+        "source_name": "Skel.NonAmbiguous",
         "kind": "def",
         "module": "Skel.Defs",
         "range": [8, 10],
@@ -133,6 +137,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
     }
     observation = {
         "name": "Skel.Observation",
+        "source_name": "Skel.Observation",
         "kind": "structure",
         "module": "Skel.Defs",
         "range": [15, 18],
@@ -202,6 +207,7 @@ def test_probe_spells_names_without_trusting_lean_to_parse_them() -> None:
     assert f'"{PROBE_MARKER}' in probe
     assert 'Name.str (Name.anonymous) "Init"' in probe
     assert "info.fromClass" in probe
+    assert "privateToUserName c" in probe
 
 
 def test_probe_transports_quoted_and_numeric_name_components_structurally() -> None:
@@ -665,6 +671,79 @@ def test_extraction_orders_the_skeleton_and_locates_every_source(tmp_path: Path)
     assert declaration.declaration_lines == 4
 
 
+@pytest.mark.parametrize("candidate_count", [0, 2])
+def test_local_safety_fails_closed_for_unmatched_source_coordinates(
+    tmp_path: Path, candidate_count: int
+) -> None:
+    path = Path("Project.lean")
+    declaration = Declaration("sourceName", path, 1, "def", "safe")
+    candidates = tuple(declaration for _ in range(candidate_count))
+    index = SourceIndex(
+        root=tmp_path,
+        declarations={},
+        locations={(path, 1): candidates} if candidates else {},
+        source_digest="",
+    )
+
+    with pytest.raises(SkeletonError, match="cannot verify source safety"):
+        _check_local_safety(
+            "environmentName",
+            "sourceName",
+            _semantic({"type": {}, "value": {}}),
+            index,
+            path=path.as_posix(),
+            start_line=1,
+            end_line=1,
+        )
+
+
+@pytest.mark.parametrize("candidate_name", ["sourceName", ""])
+def test_local_safety_accepts_exact_or_anonymous_coordinate_match(
+    tmp_path: Path, candidate_name: str
+) -> None:
+    path = Path("Project.lean")
+    candidate = Declaration(candidate_name, path, 1, "instance", "safe")
+    locations = {(path, 1): (Declaration("other", path, 1, "def", "safe"), candidate)}
+    if not candidate_name:
+        locations = {(path, 1): (candidate,)}
+    index = SourceIndex(
+        root=tmp_path,
+        declarations={"sourceName": candidate} if candidate_name else {},
+        locations=locations,
+        source_digest="",
+    )
+
+    _check_local_safety(
+        "environmentName" if candidate_name else "sourceName",
+        "sourceName",
+        _semantic({"type": {}, "value": {}}),
+        index,
+        path=path.as_posix(),
+        start_line=1,
+        end_line=1,
+    )
+
+
+def test_local_safety_leaves_other_generated_declarations_to_lean(tmp_path: Path) -> None:
+    path = Path("Project.lean")
+    index = SourceIndex(
+        root=tmp_path,
+        declarations={"Box": Declaration("Box", path, 1, "structure", "safe")},
+        locations={(path, 1): (Declaration("Box", path, 1, "structure", "safe"),)},
+        source_digest="",
+    )
+
+    _check_local_safety(
+        "instDecidableEqBox",
+        "instDecidableEqBox",
+        _semantic({"type": {}, "value": {}}),
+        index,
+        path=path.as_posix(),
+        start_line=1,
+        end_line=1,
+    )
+
+
 def test_skeleton_hash_uses_elaborated_semantics_not_source_formatting(tmp_path: Path) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
@@ -741,6 +820,7 @@ def test_trusted_theorem_source_never_exposes_its_proof(tmp_path: Path) -> None:
     trusted.append(
         {
             "name": "Skel.eligible_of",
+            "source_name": "Skel.eligible_of",
             "kind": "theorem",
             "module": "Skel.Defs",
             "range": [12, 13],
@@ -1585,6 +1665,59 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
     )
     with pytest.raises(SkeletonError, match="build artifacts are stale"):
         extract_skeletons(blueprint, lean_root=project)
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_private_dependency_safety_uses_source_coordinates(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    build = subprocess.run(
+        ["lake", "build", "Skel.Semantics"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+
+    unsafe_blueprint = _blueprint(
+        tmp_path / "private-unsafe",
+        lean={"unsafe": "Skel.Semantics.usesPrivateUnsafe"},
+    )
+    unsafe_report = extract_skeletons(unsafe_blueprint, lean_root=project)
+    (unsafe_root,) = unsafe_report.nodes[0].declarations
+    (unsafe_dependency,) = unsafe_root.trusted
+    assert unsafe_dependency.name != "Skel.Semantics.privateUnsafeValue"
+    assert json.loads(unsafe_dependency.semantic)["root"]["safety"] == "unsafe"
+
+    partial_blueprint = _blueprint(
+        tmp_path / "private-partial",
+        lean={"partial": "Skel.Semantics.usesPrivatePartial"},
+    )
+    error = "partial declaration Skel.Semantics.privatePartialValue cannot be included"
+    with pytest.raises(SkeletonError, match=error):
+        extract_skeletons(partial_blueprint, lean_root=project)
+
+    source = project / "Skel" / "Semantics.lean"
+    before = source.read_text(encoding="utf-8")
+    after = before.replace(
+        "if n == 0 then 1 else privatePartialValue (n - 1)",
+        "if n == 0 then 2 else privatePartialValue (n - 1)",
+    )
+    assert after != before
+    source.write_text(after, encoding="utf-8")
+    rebuild = subprocess.run(
+        ["lake", "build", "Skel.Semantics"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert rebuild.returncode == 0, rebuild.stderr
+
+    with pytest.raises(SkeletonError, match=error):
+        extract_skeletons(partial_blueprint, lean_root=project)
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")

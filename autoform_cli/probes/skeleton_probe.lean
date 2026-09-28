@@ -403,6 +403,7 @@ def skeleton
       match ← declarationSource c with | some s => pure (Json.str s) | none => pure Json.null
     items := items.push <| Json.mkObj [
       ("name", Json.str (toString c)),
+      ("source_name", Json.str (toString (privateToUserName c))),
       ("kind", Json.str kind),
       ("module", Json.str (toString ((moduleOf env c).getD Name.anonymous))),
       ("range", ← rangeJson c),

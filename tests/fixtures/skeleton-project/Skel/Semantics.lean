@@ -41,6 +41,15 @@ unsafe def unsafeValue : Nat := 1
 
 partial def partialValue (n : Nat) : Nat := partialValue n
 
+private partial def privatePartialValue (n : Nat) : Nat :=
+  if n == 0 then 1 else privatePartialValue (n - 1)
+
+def usesPrivatePartial : Nat := privatePartialValue 0
+
+private unsafe def privateUnsafeValue : Nat := 1
+
+unsafe def usesPrivateUnsafe : Nat := privateUnsafeValue
+
 universe u
 
 def universeNamed (α : Type u) : Type u := α

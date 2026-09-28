@@ -135,6 +135,10 @@ def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
     index = _index(tmp_path, "instance : Inhabited Nat := ⟨0⟩\n")
 
     assert index.declarations == {}
+    (declaration,) = index.find_in(Path("Project/Basic.lean"), 1, 1)
+    assert declaration.name == ""
+    assert declaration.keyword == "instance"
+    assert declaration.safety == "safe"
 
 
 def test_declaration_names_splits_a_list() -> None:

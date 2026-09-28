@@ -1473,7 +1473,18 @@ _FOUND_RECORD_FIELDS = frozenset(
     }
 )
 _TRUSTED_RECORD_FIELDS = frozenset(
-    {"depends", "kind", "module", "name", "range", "semantic", "semantic_schema", "signature", "source"}
+    {
+        "depends",
+        "kind",
+        "module",
+        "name",
+        "range",
+        "semantic",
+        "semantic_schema",
+        "signature",
+        "source",
+        "source_name",
+    }
 )
 _DECLARATION_KINDS = frozenset(
     {"axiom", "class", "constructor", "def", "inductive", "instance", "opaque", "quot", "recursor", "structure", "theorem"}
@@ -1559,6 +1570,7 @@ def _validate_trusted_record(record: dict[str, object], *, root: str) -> None:
     if record.keys() != _TRUSTED_RECORD_FIELDS:
         raise SkeletonError([f"the skeleton probe emitted invalid trusted fields for {context}"])
     _require_nonempty_string(name, field="name", context=root)
+    _require_nonempty_string(record.get("source_name"), field="source_name", context=context)
     _require_kind(record.get("kind"), context=context)
     _require_semantic(record, context=context, kind=str(record["kind"]))
     _require_nonempty_string(record.get("module"), field="module", context=context)
@@ -1724,15 +1736,42 @@ def _semantic_safety(semantic: str) -> str:
     return str(payload["root"]["safety"])
 
 
-def _check_local_safety(name: str, semantic: str, index: SourceIndex) -> None:
+def _check_local_safety(
+    name: str,
+    source_name: str,
+    semantic: str,
+    index: SourceIndex,
+    *,
+    path: str | None,
+    start_line: int | None,
+    end_line: int | None,
+) -> None:
     """Reject partial declarations and cross-check source and environment safety."""
 
-    declaration = index.find(name)
+    declaration = index.find(source_name)
+    rewritten = source_name != name
+    if rewritten:
+        declaration = None
+        if path is not None and start_line is not None and end_line is not None:
+            matches = index.find_in(path, start_line, end_line)
+            named = tuple(candidate for candidate in matches if candidate.name == source_name)
+            declaration = named[0] if len(named) == 1 else None
+    elif declaration is None and path is not None and start_line is not None and end_line is not None:
+        matches = index.find_in(path, start_line, end_line)
+        if len(matches) == 1 and not matches[0].name:
+            declaration = matches[0]
     if declaration is None:
+        if rewritten:
+            raise SkeletonError(
+                [f"cannot verify source safety for local declaration {name}"]
+            )
         return
     if declaration.safety == "partial":
         raise SkeletonError(
-            [f"partial declaration {name} cannot be included in a trusted skeleton"]
+            [
+                f"partial declaration {declaration.name} cannot be included "
+                "in a trusted skeleton"
+            ]
         )
     if declaration.safety != _semantic_safety(semantic):
         raise SkeletonError(
@@ -2117,14 +2156,23 @@ def _declaration(
     ]
     name = str(record["root"])
     semantic = str(record["semantic"])
-    _check_local_safety(name, semantic, index)
     module = str(record.get("module") or "")
     start, end = _range(record.get("range"))
+    path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
+    _check_local_safety(
+        name,
+        name,
+        semantic,
+        index,
+        path=path,
+        start_line=start,
+        end_line=end,
+    )
     declaration = DeclarationSkeleton(
         name=name,
         kind=str(record.get("kind") or "unknown"),
         module=module,
-        path=_source_path(name, module, libraries=libraries, lean_root=lean_root, index=index),
+        path=path,
         start_line=start,
         end_line=end,
         signature=str(record.get("signature") or ""),
@@ -2156,15 +2204,25 @@ def _trusted(
     index: SourceIndex,
 ) -> TrustedDeclaration:
     name = str(item.get("name") or "")
+    source_name = str(item.get("source_name") or "")
     semantic = str(item["semantic"])
-    _check_local_safety(name, semantic, index)
     module = str(item.get("module") or "")
     start, end = _range(item.get("range"))
+    path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
+    _check_local_safety(
+        name,
+        source_name,
+        semantic,
+        index,
+        path=path,
+        start_line=start,
+        end_line=end,
+    )
     trusted = TrustedDeclaration(
         name=name,
         kind=str(item.get("kind") or "unknown"),
         module=module,
-        path=_source_path(name, module, libraries=libraries, lean_root=lean_root, index=index),
+        path=path,
         start_line=start,
         end_line=end,
         signature=str(item.get("signature") or ""),

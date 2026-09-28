@@ -8,9 +8,8 @@ description: >-
 
 # Develop Autoform from consumer nudges
 
-Treat Autoform as an example-based plugin whose product is installed behavior
-in an independent formalization repository. Use the bundled Cabannes thesis
-repository only as an executable consumer example.
+Treat Autoform as an example-based plugin installed in an independent
+formalization repository. Use the Cabannes thesis as an executable consumer example.
 
 Inspect the worktree, state a consumer scenario, and observe installed behavior.
 For a refactor, name the invariant. Trace needed layers.
@@ -38,3 +37,5 @@ make check-example
 Run `lake build` when example Lean results change. Validate edited skills and
 the manifest with skill-creator and plugin-creator. Use cachebuster and reinstall
 only to test installed discovery in a new thread. Report outcome and checks.
+Treat rewritten private declaration safety as fail-closed evidence: correlate
+the official user name to its lexical declaration by source coordinates.
