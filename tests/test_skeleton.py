@@ -633,7 +633,7 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
     record = _fake_found_record()
     trusted = record["trusted"]
     assert isinstance(trusted, list) and isinstance(trusted[0], dict)
-    trusted[0]["source"] = None
+    trusted[0]["source"] = trusted[0]["source_comments"] = None
     (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
     assert "omitted required source" in str(_probe_record_issue(parsed))
 
@@ -648,7 +648,7 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
         parse_probe_output(PROBE_MARKER + json.dumps(record))
 
     record = _fake_found_record()
-    record["statement_source"] = None
+    record["statement_source"] = record["statement_comments"] = None
     (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
     assert "omitted required statement_source" in str(_probe_record_issue(parsed))
 
@@ -661,7 +661,7 @@ def test_generated_companions_without_a_source_range_need_no_source() -> None:
     assert base["name"] == "Skel.NonAmbiguous" and base["range"] is not None
 
     def rangeless(name: str) -> dict[str, object]:
-        return dict(base, name=name, source_name=name, range=None, source=None)
+        return dict(base, name=name, source_name=name, range=None, source=None, source_comments=None)
 
     # Lean's internal-detail spellings, or any name under a declaration with a range.
     companions = ["Skel.NonAmbiguous._unary", "Skel.Other.eq_1", "Skel.NonAmbiguous.generated"]
@@ -687,8 +687,10 @@ def test_unrecoverable_statement_fails_only_its_node(tmp_path: Path) -> None:
     trusted = record["trusted"]
     assert isinstance(trusted, list) and isinstance(trusted[0], dict)
     companion = dict(trusted[0], name="Skel.NonAmbiguous._unary", source_name="Skel.NonAmbiguous._unary")
-    record["trusted"] = [*trusted, dict(companion, range=None, source=None)]
-    unparsable = dict(record, root="Skel.supervision_nonAmbiguous", statement_source=None)
+    record["trusted"] = [*trusted, dict(companion, range=None, source=None, source_comments=None)]
+    unparsable = dict(
+        record, root="Skel.supervision_nonAmbiguous", statement_source=None, statement_comments=None
+    )
     output = "\n".join(PROBE_MARKER + json.dumps(item) for item in (record, unparsable))
 
     report = extract_skeletons(blueprint, lean_root=project, runner=lambda probe, root: output)
