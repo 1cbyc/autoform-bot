@@ -233,6 +233,12 @@ def signatureOf (c : Name) : CommandElabM String := do
   let sig ← liftTermElabM (PrettyPrinter.ppSignature c)
   return sig.fmt.pretty 100
 
+/-- The signature with every notation, infix operator, and unexpander turned
+off. Project syntax can print `HMul.hMul a b` as `a + b`; this form cannot. -/
+def notationFreeSignatureOf (c : Name) : CommandElabM String := do
+  let sig ← liftTermElabM <| withOptions (·.setBool `pp.notation false) (PrettyPrinter.ppSignature c)
+  return sig.fmt.pretty 100
+
 /-- First node of syntax kind `k` inside `stx`, depth-first. -/
 partial def findKind? (stx : Syntax) (k : SyntaxNodeKind) : Option Syntax :=
   if stx.getKind == k then some stx else stx.getArgs.findSome? (findKind? · k)
@@ -261,9 +267,69 @@ def sourceSlice (text : String) (r : DeclarationRange) : String :=
   let endPos := fileMap.ofPosition r.endPos
   String.fromUTF8! (text.toUTF8.extract startPos.byteIdx endPos.byteIdx)
 
-/-- Capture a declaration from the same source snapshot the probe inspects.
-The surrounding source-tree guard rejects concurrent edits. -/
-def declarationSource (c : Name) : CommandElabM (Option String) := do
+/-! Comment ranges. Lean's parser, not a lexer guess, decides what is a comment:
+a project token such as `=--` or `+/-` is code, and `/--/ … -/` is a docstring.
+Arithmetic below is spelled `Nat.succ`/`Nat.add` because project notation that
+redefines `+` is imported above this file and would apply here too. -/
+
+/-- End of a line comment starting at `i`: the next newline, kept as layout. -/
+partial def lineCommentEnd (bytes : ByteArray) (i stop : Nat) : Nat :=
+  if Nat.ble stop i || bytes[i]! == 10 then i else lineCommentEnd bytes i.succ stop
+
+/-- End of a block comment whose body starts at `i`, nested `depth` deep. -/
+partial def blockCommentEnd (bytes : ByteArray) (i stop depth : Nat) : Nat :=
+  if depth == 0 then i
+  else if Nat.ble stop i.succ then stop
+  else if bytes[i]! == 45 && bytes[i.succ]! == 47 then blockCommentEnd bytes (Nat.add i 2) stop depth.pred
+  else if bytes[i]! == 47 && bytes[i.succ]! == 45 then blockCommentEnd bytes (Nat.add i 2) stop depth.succ
+  else blockCommentEnd bytes i.succ stop depth
+
+/-- Comments inside `bytes[i:stop]`, a whitespace run Lean attached to a token.
+Whitespace holds only blanks, `--` line comments, and `/- -/` block comments. -/
+partial def whitespaceComments (bytes : ByteArray) (i stop : Nat) (acc : Array (Nat × Nat)) :
+    Array (Nat × Nat) :=
+  if Nat.ble stop i.succ then acc
+  else if bytes[i]! == 45 && bytes[i.succ]! == 45 then
+    let e := lineCommentEnd bytes i stop
+    whitespaceComments bytes e stop (acc.push (i, e))
+  else if bytes[i]! == 47 && bytes[i.succ]! == 45 then
+    let e := blockCommentEnd bytes (Nat.add i 2) stop 1
+    whitespaceComments bytes e stop (acc.push (i, e))
+  else whitespaceComments bytes i.succ stop acc
+
+def infoComments (bytes : ByteArray) (info : SourceInfo) (acc : Array (Nat × Nat)) :
+    Array (Nat × Nat) :=
+  match info with
+  | .original leading _ trailing _ =>
+    let acc := whitespaceComments bytes leading.startPos.byteIdx leading.stopPos.byteIdx acc
+    whitespaceComments bytes trailing.startPos.byteIdx trailing.stopPos.byteIdx acc
+  | _ => acc
+
+/-- UTF-8 byte ranges of every comment and docstring in `stx`, parsed from `bytes`. -/
+partial def syntaxComments (bytes : ByteArray) (stx : Syntax) (acc : Array (Nat × Nat)) :
+    Array (Nat × Nat) :=
+  match stx with
+  | .node _ k args =>
+    if k == ``Parser.Command.docComment then
+      match stx.getPos?, stx.getTailPos? with
+      | some s, some e => infoComments bytes stx.getTailInfo (acc.push (s.byteIdx, e.byteIdx))
+      | _, _ => acc
+    else args.foldl (fun acc arg => syntaxComments bytes arg acc) acc
+  | .atom info _ => infoComments bytes info acc
+  | .ident info .. => infoComments bytes info acc
+  | .missing => acc
+
+/-- Comment ranges below byte `cut`, deduplicated and sorted, as JSON pairs. -/
+def commentsJson (bytes : ByteArray) (stx : Syntax) (cut : Nat) : Json :=
+  let ranges := (syntaxComments bytes stx #[]).foldl (init := #[]) fun acc (s, e) =>
+    let r := (s, Nat.min e cut)
+    if Nat.ble cut s || acc.contains r then acc else acc.push r
+  Json.arr <| (ranges.qsort (fun a b => Nat.blt a.1 b.1)).map fun (s, e) => Json.arr #[s, e]
+
+/-- Capture a declaration from the same source snapshot the probe inspects,
+and parse it with Lean's own parser. The surrounding source-tree guard rejects
+concurrent edits. The parse is `none` when the slice does not parse alone. -/
+def declarationSnippet (c : Name) : CommandElabM (Option (String × Option Syntax)) := do
   let env ← getEnv
   let some r ← findDeclarationRanges? c | return none
   let some idx := env.getModuleIdxFor? c | return none
@@ -271,13 +337,41 @@ def declarationSource (c : Name) : CommandElabM (Option String) := do
   let sp ← getSrcSearchPath
   let some path ← sp.findWithExt "lean" mod | return none
   let text ← IO.FS.readFile path
-  return some (sourceSlice text r.range)
+  let lines := text.splitOn "\n"
+  let snippet := sourceSlice text r.range
+  -- The declaration sits inside the namespaces its name lives in, and `open X`
+  -- written there may refer to any of them, as in `namespace A` … `open B`.
+  let mut scopes : Array Name := #[]
+  let mut ns := (privateToUserName c).getPrefix
+  while ns != Name.anonymous do
+    scopes := scopes.push ns
+    ns := ns.getPrefix
+  -- `activateScoped` mutates the environment. Isolate those parser-only changes
+  -- so one requested declaration cannot change how the next one is parsed.
+  withEnv env do
+    for scope in scopes do
+      if env.isNamespace scope then activateScoped scope
+    for opened in openedNamespaces lines r.range.pos do
+      for scope in scopes.push Name.anonymous do
+        if env.isNamespace (scope ++ opened) then activateScoped (scope ++ opened)
+    match Parser.runParserCategory (← getEnv) `command snippet with
+    | .error _ => return some (snippet, none)
+    | .ok stx => return some (snippet, some stx)
+
+/-- A declaration's source and its comment ranges, `null` when it does not
+parse alone; the caller then decides whether the source can be shown. -/
+def declarationSource (c : Name) : CommandElabM (Option (String × Json)) := do
+  let some (snippet, stx?) ← declarationSnippet c | return none
+  let comments := match stx? with
+    | some stx => commentsJson snippet.toUTF8 stx snippet.utf8ByteSize
+    | none => Json.null
+  return some (snippet, comments)
 
 /-- Lean generates companions such as `f._unary`, `f._f` and `S.x._default`
 without a source range. Their kernel material is bound separately; for reading,
 show the declaration they were generated from, unless that is a theorem or
 axiom, whose source would carry a proof. -/
-partial def companionSource (c : Name) : CommandElabM (Option String) := do
+partial def companionSource (c : Name) : CommandElabM (Option (String × Json)) := do
   let env ← getEnv
   let parent := c.getPrefix
   if (← findDeclarationRanges? c).isSome || !env.contains parent then return none
@@ -291,53 +385,33 @@ partial def companionSource (c : Name) : CommandElabM (Option String) := do
   declarationSource shown
 
 /-- The declaration's source up to its value: the statement as written, without
-the proof. Parsed with Lean's own parser rather than cut by pattern matching. -/
-def statementSource (root : Name) : CommandElabM (Option String) := do
+the proof, with its comment ranges. Parsed with Lean's own parser rather than
+cut by pattern matching. -/
+def statementSource (root : Name) : CommandElabM (Option (String × Json)) := do
   let env ← getEnv
-  let some r ← findDeclarationRanges? root | return none
-  let some idx := env.getModuleIdxFor? root | return none
-  let mod := env.header.moduleNames[idx.toNat]!
-  let sp ← getSrcSearchPath
-  let some path ← sp.findWithExt "lean" mod | return none
-  let text ← IO.FS.readFile path
-  let lines := text.splitOn "\n"
-  let snippet := sourceSlice text r.range
+  let some (snippet, stx?) ← declarationSnippet root | return none
+  let withComments (written : String) : Option (String × Json) :=
+    some (written, match stx? with
+      | some stx => commentsJson snippet.toUTF8 stx written.utf8ByteSize
+      | none => Json.null)
   let kind := kindOf env root
   -- A type declaration has no value to strip: all of it is the statement.
   if kind == "structure" || kind == "class" || kind == "inductive" then
-    return some snippet.trimAsciiEnd.toString
-  -- The declaration sits inside the namespaces its name lives in, and `open X`
-  -- written there may refer to any of them, as in `namespace A` … `open B`.
-  let mut scopes : Array Name := #[]
-  let mut ns := (privateToUserName root).getPrefix
-  while ns != Name.anonymous do
-    scopes := scopes.push ns
-    ns := ns.getPrefix
-  -- `activateScoped` mutates the environment. Isolate those parser-only changes
-  -- so one requested declaration cannot change how the next one is parsed.
-  withEnv env do
-    for scope in scopes do
-      if env.isNamespace scope then activateScoped scope
-    for opened in openedNamespaces lines r.range.pos do
-      for scope in scopes.push Name.anonymous do
-        if env.isNamespace (scope ++ opened) then activateScoped (scope ++ opened)
-    let parserEnv ← getEnv
-    match Parser.runParserCategory parserEnv `command snippet with
-    | .error _ => return none
-    | .ok stx =>
-      let decl := (findKind? stx ``Parser.Command.declaration).getD stx
-      let val := (findKind? decl ``Parser.Command.declValSimple).orElse fun _ =>
-        (findKind? decl ``Parser.Command.declValEqns).orElse fun _ =>
-          findKind? decl ``Parser.Command.whereStructInst
-      let some v := val | do
-        if kind == "axiom" || kind == "opaque" then
-          return some snippet.trimAsciiEnd.toString
-        return none
-      let some pos := v.getPos? | return none
-      -- `pos` is a byte position: cut by bytes, not by characters, or every `∀`
-      -- before the value pushes the cut past it.
-      let bytes := snippet.toUTF8.extract 0 pos.byteIdx
-      return some ((String.fromUTF8! bytes).trimAsciiEnd.toString)
+    return withComments snippet.trimAsciiEnd.toString
+  let some stx := stx? | return none
+  let decl := (findKind? stx ``Parser.Command.declaration).getD stx
+  let val := (findKind? decl ``Parser.Command.declValSimple).orElse fun _ =>
+    (findKind? decl ``Parser.Command.declValEqns).orElse fun _ =>
+      findKind? decl ``Parser.Command.whereStructInst
+  let some v := val | do
+    if kind == "axiom" || kind == "opaque" then
+      return withComments snippet.trimAsciiEnd.toString
+    return none
+  let some pos := v.getPos? | return none
+  -- `pos` is a byte position: cut by bytes, not by characters, or every `∀`
+  -- before the value pushes the cut past it.
+  let bytes := snippet.toUTF8.extract 0 pos.byteIdx
+  return withComments (String.fromUTF8! bytes).trimAsciiEnd.toString
 
 def rangeJson (c : Name) : CommandElabM Json := do
   match ← findDeclarationRanges? c with
@@ -447,12 +521,14 @@ def skeleton
   for c in trusted.qsort Name.lt do
     let deps := (edges.find? (·.1 == c)).map (·.2) |>.getD #[]
     let kind := kindOf env c
-    let source ← if kind == "theorem" || kind == "axiom" then
-      pure Json.null
+    let (source, sourceComments) ← if kind == "theorem" || kind == "axiom" then
+      pure (Json.null, Json.null)
     else
       match ← declarationSource c with
-      | some s => pure (Json.str s)
-      | none => match ← companionSource c with | some s => pure (Json.str s) | none => pure Json.null
+      | some (s, comments) => pure (Json.str s, comments)
+      | none => match ← companionSource c with
+        | some (s, comments) => pure (Json.str s, comments)
+        | none => pure (Json.null, Json.null)
     items := items.push <| Json.mkObj [
       ("name", Json.str (toString c)),
       ("source_name", Json.str (toString (privateToUserName c))),
@@ -463,14 +539,19 @@ def skeleton
       ("semantic_schema", Json.str semanticSchema),
       ("semantic", Json.str (← cachedSemanticMaterial semanticCache env c)),
       ("depends", Json.arr (deps.map fun d => Json.str (toString d))),
-      ("source", source)]
+      ("source", source),
+      ("source_comments", sourceComments)]
   let rootDeps := (edges.find? (·.1 == root)).map (·.2) |>.getD #[]
-  let statement := match ← statementSource root with | some s => Json.str s | none => Json.null
+  let (statement, statementComments) := match ← statementSource root with
+    | some (s, comments) => (Json.str s, comments)
+    | none => (Json.null, Json.null)
   let rootKind := kindOf env root
-  let source ← if rootKind == "theorem" || rootKind == "axiom" then
-    pure Json.null
+  let (source, sourceComments) ← if rootKind == "theorem" || rootKind == "axiom" then
+    pure (Json.null, Json.null)
   else
-    match ← declarationSource root with | some s => pure (Json.str s) | none => pure Json.null
+    match ← declarationSource root with
+    | some (s, comments) => pure (Json.str s, comments)
+    | none => pure (Json.null, Json.null)
   let mut assumedSemantics : Array Json := #[]
   for d in sortedAssumed do
     assumedSemantics := assumedSemantics.push <| Json.arr #[
@@ -482,12 +563,15 @@ def skeleton
   emit request <| [
     ("found", Json.bool true),
     ("statement_source", statement),
+    ("statement_comments", statementComments),
     ("source", source),
+    ("source_comments", sourceComments),
     ("kind", Json.str rootKind),
     ("lean_version", Json.str Lean.versionString),
     ("module", Json.str (toString ((moduleOf env root).getD Name.anonymous))),
     ("range", ← rangeJson root),
     ("signature", Json.str (← signatureOf root)),
+    ("notation_free_signature", Json.str (← notationFreeSignatureOf root)),
     ("semantic_schema", Json.str semanticSchema),
     ("semantic", Json.str (← cachedSemanticMaterial semanticCache env root)),
     ("depends", Json.arr (rootDeps.map fun d => Json.str (toString d))),

@@ -108,6 +108,12 @@ def _semantic(payload: dict[str, object]) -> str:
     )
 
 
+def _leading_doc(text: str) -> list[list[int]]:
+    """The comment ranges Lean reports for text that opens with one docstring."""
+
+    return [[0, len(text[: text.index("-/") + 2].encode("utf-8"))]]
+
+
 def _fake_probe_output(*, include_ghost: bool = False) -> str:
     """What the probe says about the fixture, as captured from a real run."""
 
@@ -123,6 +129,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "depends": [],
         "source": "/-- A weak observation admits a label. -/\ndef Eligible (S : Y → Prop) (y : Y) : Prop := S y",
     }
+    eligible["source_comments"] = _leading_doc(eligible["source"])
     non_ambiguous = {
         "name": "Skel.NonAmbiguous",
         "source_name": "Skel.NonAmbiguous",
@@ -139,6 +146,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             "  ∀ y z : Y, Eligible S y → Eligible S z → y = z"
         ),
     }
+    non_ambiguous["source_comments"] = _leading_doc(non_ambiguous["source"])
     observation = {
         "name": "Skel.Observation",
         "source_name": "Skel.Observation",
@@ -156,6 +164,12 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             "  nonempty : ∃ y, admits y"
         ),
     }
+    observation["source_comments"] = _leading_doc(observation["source"])
+    statement = (
+        "/-- Uses a structure in its statement, and sorry in its proof. -/\n"
+        "theorem observation_determined (o : Observation Y) (h : NonAmbiguous o.admits) :\n"
+        "    ∃ y, o.admits y ∧ ∀ z, o.admits z → z = y"
+    )
     records = [
         "some unrelated line from Lean",
         _record(
@@ -165,15 +179,16 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             module="Skel.Main",
             range=[14, 17],
             signature="Skel.observation_determined {Y : Type} (o : Skel.Observation Y) :\n  ∃ y, o.admits y",
+            notation_free_signature=(
+                "Skel.observation_determined {Y : Type} (o : Skel.Observation Y) :\n  Exists fun y => o.admits y"
+            ),
             semantic_schema=SEMANTIC_SCHEMA,
             semantic=_semantic({"type": {"sort": {"zero": None}}}),
             lean_version="4.32.2",
             source=None,
-            statement_source=(
-                "/-- Uses a structure in its statement, and sorry in its proof. -/\n"
-                "theorem observation_determined (o : Observation Y) (h : NonAmbiguous o.admits) :\n"
-                "    ∃ y, o.admits y ∧ ∀ z, o.admits z → z = y"
-            ),
+            source_comments=None,
+            statement_source=statement,
+            statement_comments=_leading_doc(statement),
             depends=["Skel.NonAmbiguous", "Skel.Observation"],
             # Deliberately out of dependency order: the report must sort them.
             trusted=[non_ambiguous, observation, eligible],
@@ -928,6 +943,7 @@ def test_trusted_theorem_source_never_exposes_its_proof(tmp_path: Path) -> None:
             "semantic": _semantic({"type": {"sort": {"zero": None}}}),
             "depends": ["Skel.Eligible"],
             "source": None,
+            "source_comments": None,
         }
     )
     output = PROBE_MARKER + json.dumps(record)
@@ -1056,6 +1072,120 @@ def test_extraction_rejects_a_passage_changed_during_probe(tmp_path: Path, monke
         extract_skeletons(blueprint, lean_root=project)
 
 
+def test_blind_packet_shows_the_statement_without_notation(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    declaration = report.nodes[0].declarations[0]
+
+    assert "-- without notation:\n" + declaration.notation_free_signature in declaration.blind_text()
+    assert "Exists fun y => o.admits y" in declaration.blind_text()
+    # Notation that hides a different operator changes the packet a reviewer sees.
+    misread = replace(declaration, notation_free_signature=declaration.notation_free_signature + " ")
+    assert misread.evidence_hash != declaration.evidence_hash
+
+
+def test_review_hash_binds_the_meaning_hash(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    node = report.nodes[0]
+    declaration = node.declarations[0]
+
+    # A packet can read the same across a change of meaning; a review recorded
+    # against the review hash must not carry over.
+    changed = replace(node, declarations=(replace(declaration, semantic=declaration.semantic + " "),))
+    assert changed.evidence_hash == node.evidence_hash
+    assert changed.hash != node.hash
+    assert changed.review_hash != node.review_hash
+
+
+def test_packets_drop_the_comments_lean_reports_and_keep_the_rest(tmp_path: Path) -> None:
+    record = _fake_found_record()
+    trusted = record["trusted"][2]
+    # `/--/` opens a docstring whose body is `/ KEEPOUT `; a lexer that closes
+    # it at the next `-/` would show the docstring as code.
+    trusted["source"] = "/--/ KEEPOUT -/\ndef docOpened : Nat := 6"
+    trusted["source_comments"] = [[0, len("/--/ KEEPOUT -/")]]
+    record["trusted"] = [trusted, record["trusted"][1], record["trusted"][0]]
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+
+    blind = report.nodes[0].blind_text()
+    assert "KEEPOUT" not in blind and "def docOpened : Nat := 6" in blind
+    assert "Uses a structure" not in blind and "theorem observation_determined" in blind
+
+
+def test_packets_fail_closed_when_lean_cannot_locate_comments(tmp_path: Path) -> None:
+    record = _fake_found_record()
+    # `=--` is a project token here, not a line comment. With ranges from Lean
+    # the code is kept; without them the packet is refused, not guessed.
+    record["trusted"][2]["source"] = "def claim : Prop := 2 + 2 =--\n  5"
+    record["trusted"][2]["source_comments"] = []
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+    assert "def claim : Prop := 2 + 2 =--\n  5" in report.nodes[0].blind_text()
+
+    record["trusted"][2]["source_comments"] = None
+    with pytest.raises(SkeletonError, match="cannot separate comments from code"):
+        extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+
+
+@pytest.mark.parametrize("ranges", [[[2, 5]], [[0, 999]], [[0, 5], [3, 8]], [[5, 3]], "none"])
+def test_probe_comment_ranges_must_cover_comments(tmp_path: Path, ranges: object) -> None:
+    record = _fake_found_record()
+    record["statement_comments"] = ranges
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+
+    with pytest.raises(SkeletonError):
+        extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+
+
+@pytest.mark.parametrize(
+    ("link", "why"),
+    [
+        ("../../sources/book.tex#L5-L6", "names no lines of its file"),
+        ("../../sources/book.tex#L2-L1", "names no lines of its file"),
+        ("../../sources/book.tex#L0-L1", "names no lines of its file"),
+        ("../../sources/missing.tex#L1-L1", "names a missing file"),
+        ("../../sources/binary.tex#L1-L1", "not readable UTF-8 text"),
+        ("../../../outside.tex#L1-L1", "points outside the blueprint"),
+    ],
+)
+def test_extraction_reports_a_locator_that_names_no_passage(tmp_path: Path, link: str, why: str) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    sources = blueprint / "sources"
+    sources.mkdir()
+    (sources / "book.tex").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    (sources / "binary.tex").write_bytes(b"\xff\xfe\n")
+    (tmp_path / "outside.tex").write_text("outside\n", encoding="utf-8")
+    article = blueprint / "roadmap" / "basics" / "determined.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(
+            "## Depends on", f"## Sources\n\n- [book]({link})\n\n## Depends on"
+        ),
+        encoding="utf-8",
+    )
+
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+
+    assert not report.clean and report.nodes[0].declarations == ()
+    [unresolved] = report.unresolved
+    assert unresolved.declaration == "Skel.observation_determined"
+    assert unresolved.reason.startswith("source locator ") and why in unresolved.reason
+
+    article.write_text(
+        article.read_text(encoding="utf-8").replace(link, "../../sources/book.tex#L2-L3"), encoding="utf-8"
+    )
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    assert report.clean
+    assert report.nodes[0].passage == "two\nthree"
+
+
 def test_extraction_rejects_lake_configuration_changed_during_probe(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1180,7 +1310,7 @@ def test_report_round_trips_through_json_deterministically(tmp_path: Path) -> No
     with pytest.raises(SkeletonError):
         load_skeleton_report(path)
 
-    for schema in ("autoform-skeleton/v1", "autoform-skeleton/v2"):
+    for schema in ("autoform-skeleton/v1", "autoform-skeleton/v2", "autoform-skeleton/v3"):
         legacy = report.as_dict()
         legacy["schema"] = schema
         path.write_text(json.dumps(legacy), encoding="utf-8")
@@ -1230,6 +1360,7 @@ def test_report_loader_rejects_mismatched_hashes_and_trust_identities(tmp_path: 
 
     payload = report.as_dict()
     payload["nodes"][0]["declarations"][0]["statement"] = "theorem t : True := by trivial"
+    payload["nodes"][0]["declarations"][0]["statement_comments"] = []
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(SkeletonError, match="invalid declaration evidence hash"):
         load_skeleton_report(path)
@@ -1778,6 +1909,65 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
     )
     with pytest.raises(SkeletonError, match="build artifacts are stale"):
         extract_skeletons(blueprint, lean_root=project)
+
+
+def _built_module(tmp_path: Path, module: str, source: str) -> Path:
+    project = _project(tmp_path)
+    (project / "Skel" / f"{module}.lean").write_text(source, encoding="utf-8")
+    build = subprocess.run(
+        ["lake", "build", f"Skel.{module}"], cwd=project, capture_output=True, text=True, timeout=600, check=False
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    return project
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_project_notation_cannot_disguise_the_statement(tmp_path: Path) -> None:
+    project = _built_module(
+        tmp_path,
+        "PktNotation",
+        "namespace Skel.PktNotation\n"
+        'infixl:65 (priority := high) " + " => HMul.hMul\n'
+        "theorem addComm' (a b : Nat) : a + b = b + a := Nat.mul_comm a b\n"
+        "end Skel.PktNotation\n",
+    )
+    blueprint = _blueprint(tmp_path, lean={"comm": "Skel.PktNotation.addComm'"})
+
+    report = extract_skeletons(blueprint, lean_root=project)
+
+    assert report.clean
+    declaration = report.nodes[0].declarations[0]
+    # Every notated form reads as addition; the packet must show multiplication.
+    assert "a + b = b + a" in declaration.signature
+    assert "HMul.hMul a b" in declaration.notation_free_signature
+    assert "-- without notation:\n" + declaration.notation_free_signature in declaration.blind_text()
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_lean_decides_which_source_text_is_comment(tmp_path: Path) -> None:
+    project = _built_module(
+        tmp_path,
+        "PktStrip",
+        "namespace Skel.PktStrip\n"
+        'notation:50 a " =-- " b => a ≠ b\n'
+        "/--/ KEEPOUT_DOC -/\n"
+        "def docOpened : Nat := 6\n"
+        "def claim : Prop := 2 + 2 =--\n"
+        "  5\n"
+        "/-- KEEPOUT_ROOT -/\n"
+        "theorem stripRoot : docOpened = 6 ∧ claim := -- KEEPOUT_PROOF\n"
+        "  ⟨rfl, by unfold claim; decide⟩\n"
+        "end Skel.PktStrip\n",
+    )
+    blueprint = _blueprint(tmp_path, lean={"strip": "Skel.PktStrip.stripRoot"})
+
+    report = extract_skeletons(blueprint, lean_root=project)
+
+    assert report.clean
+    blind = report.nodes[0].blind_text()
+    assert "KEEPOUT" not in blind
+    assert "def docOpened : Nat := 6" in blind
+    assert "def claim : Prop := 2 + 2 =--\n  5" in blind
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")

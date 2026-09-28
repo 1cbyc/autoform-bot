@@ -53,21 +53,14 @@ from pathlib import Path
 import psutil
 
 from .graph import Graph, GraphValidationError, Node, load_graph
-from .lean import (
-    PACKET_SCHEMA,
-    PASSAGE_SCHEMA,
-    SourceIndex,
-    declaration_names,
-    index_project,
-    strip_lean_comments,
-)
+from .lean import PACKET_SCHEMA, PASSAGE_SCHEMA, SourceIndex, declaration_names, index_project
 
 try:  # Python 3.11+
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
-SKELETON_SCHEMA = "autoform-skeleton/v3"
+SKELETON_SCHEMA = "autoform-skeleton/v4"
 SEMANTIC_SCHEMA = "autoform-lean-expr/v4"
 
 #: Every line the probe wants read back starts with this marker, so Lean's own
@@ -122,6 +115,8 @@ class TrustedDeclaration:
     semantic: str
     depends: tuple[str, ...]
     source: str | None = None
+    #: UTF-8 byte ranges of the comments in ``source``, as Lean's parser found them.
+    source_comments: tuple[tuple[int, int], ...] = ()
 
     @property
     def lines(self) -> int:
@@ -139,6 +134,7 @@ class TrustedDeclaration:
             "signature": self.signature,
             "semantic": self.semantic,
             "source": self.source,
+            "source_comments": [list(item) for item in self.source_comments],
             "start_line": self.start_line,
         }
 
@@ -154,6 +150,9 @@ class DeclarationSkeleton:
     start_line: int | None
     end_line: int | None
     signature: str
+    #: The signature printed with notation off, so project syntax cannot make
+    #: ``HMul.hMul a b`` read as ``a + b``.
+    notation_free_signature: str
     semantic: str
     lean_version: str
     depends: tuple[str, ...]
@@ -170,6 +169,9 @@ class DeclarationSkeleton:
     #: elaborated signature is authoritative; this is what the author typed,
     #: shown beside it so neither form can hide what the other shows.
     statement: str | None = None
+    #: UTF-8 byte ranges of the comments in ``source`` and ``statement``.
+    source_comments: tuple[tuple[int, int], ...] = ()
+    statement_comments: tuple[tuple[int, int], ...] = ()
 
     @property
     def defines(self) -> bool:
@@ -235,16 +237,18 @@ class DeclarationSkeleton:
             f"-- axioms: {', '.join(self.axioms) if self.axioms else 'none'}",
             "",
             self.signature,
+            "-- without notation:",
+            self.notation_free_signature,
         ]
-        own = strip_lean_comments(self.source or "").strip("\n")
+        own = _without_comments(self.source or "", self.source_comments).strip("\n")
         if own:
             lines.append(own)
         elif self.statement:
-            written = strip_lean_comments(self.statement).strip("\n")
+            written = _without_comments(self.statement, self.statement_comments).strip("\n")
             if written:
                 lines += ["-- as written:", written]
         for item in self.trusted:
-            body = strip_lean_comments(item.source or "").strip("\n")
+            body = _without_comments(item.source or "", item.source_comments).strip("\n")
             # The elaborated signature restores what `variable` binders and
             # `open` leave implicit in the source, such as the type of `S`.
             lines += ["", f"-- {item.kind} {item.name}", f"-- signature: {item.signature}"]
@@ -267,14 +271,17 @@ class DeclarationSkeleton:
             "lean_version": self.lean_version,
             "module": self.module,
             "name": self.name,
+            "notation_free_signature": self.notation_free_signature,
             "path": self.path,
             "signature": self.signature,
             "semantic": self.semantic,
             "depends": list(self.depends),
             "skeleton_lines": self.skeleton_lines,
             "source": self.source,
+            "source_comments": [list(item) for item in self.source_comments],
             "start_line": self.start_line,
             "statement": self.statement,
+            "statement_comments": [list(item) for item in self.statement_comments],
             "trusted": [item.as_dict() for item in self.trusted],
         }
 
@@ -322,9 +329,14 @@ class NodeSkeleton:
 
     @property
     def review_hash(self) -> str:
-        """Fingerprint the joint packet together with its cited source passage."""
+        """Fingerprint the joint packet, its cited source passage, and its meaning.
+
+        The meaning hash is bound too: a packet can read the same across a change
+        of meaning, and a review recorded against this hash must not survive one.
+        """
 
         material = {
+            "hash": self.hash,
             "packet": self.evidence_hash,
             "passage": self.passage,
             "passage_locator": self.passage_locator,
@@ -581,13 +593,16 @@ _DECLARATION_REPORT_FIELDS = frozenset(
         "lean_version",
         "module",
         "name",
+        "notation_free_signature",
         "path",
         "semantic",
         "signature",
         "skeleton_lines",
         "source",
+        "source_comments",
         "start_line",
         "statement",
+        "statement_comments",
         "trusted",
     }
 )
@@ -602,6 +617,7 @@ _TRUSTED_REPORT_FIELDS = frozenset(
         "semantic",
         "signature",
         "source",
+        "source_comments",
         "start_line",
     }
 )
@@ -681,6 +697,9 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
         start_line=start_line,
         end_line=_report_optional_int(item.get("end_line"), f"end line for {name}"),
         signature=_report_string(item.get("signature"), f"signature for {name}"),
+        notation_free_signature=_report_string(
+            item.get("notation_free_signature"), f"notation-free signature for {name}"
+        ),
         semantic=semantic,
         lean_version=_report_string(item.get("lean_version"), f"Lean version for {name}"),
         depends=_report_string_tuple(item.get("depends"), f"dependencies for {name}"),
@@ -692,6 +711,10 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
         axiom_semantics=axiom_semantics,
         source=source,
         statement=statement,
+        source_comments=_comment_ranges(item.get("source_comments"), source, context=f"the source of {name}"),
+        statement_comments=_comment_ranges(
+            item.get("statement_comments"), statement, context=f"the statement of {name}"
+        ),
     )
     _validate_report_ranges(declaration.start_line, declaration.end_line, context=name)
     if item.get("hash") != declaration.hash:
@@ -726,6 +749,7 @@ def _trusted_from_dict(item: object, *, root: str) -> TrustedDeclaration:
         semantic=semantic,
         depends=_report_string_tuple(item.get("depends"), f"dependencies for {name}"),
         source=source,
+        source_comments=_comment_ranges(item.get("source_comments"), source, context=f"the source of {name}"),
     )
     _validate_report_ranges(trusted.start_line, trusted.end_line, context=name)
     return trusted
@@ -784,6 +808,48 @@ def _validate_report_ranges(start: int | None, end: int | None, *, context: str)
 
 def _sha256_id(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _without_comments(text: str, comments: tuple[tuple[int, int], ...]) -> str:
+    """Remove the comment ranges Lean's parser found, then the blank lines left behind."""
+
+    data = text.encode("utf-8")
+    kept: list[bytes] = []
+    cursor = 0
+    for start, end in comments:
+        kept.append(data[cursor:start])
+        cursor = end
+    kept.append(data[cursor:])
+    return "\n".join(
+        line.rstrip() for line in b"".join(kept).decode("utf-8").splitlines() if line.strip()
+    )
+
+
+def _comment_ranges(
+    value: object, text: str | None, *, context: str
+) -> tuple[tuple[int, int], ...]:
+    """Validate comment ranges: sorted, disjoint UTF-8 byte spans that open a comment."""
+
+    if text is None:
+        if value != []:
+            raise SkeletonError([f"invalid comment ranges for {context}"])
+        return ()
+    data = text.encode("utf-8")
+    ranges: list[tuple[int, int]] = []
+    previous = 0
+    for item in value if isinstance(value, list) else [None]:
+        if not isinstance(item, list) or len(item) != 2 or not all(type(n) is int for n in item):
+            raise SkeletonError([f"invalid comment ranges for {context}"])
+        start, end = item
+        if start < previous or end <= start or end > len(data) or data[start : start + 2] not in {b"--", b"/-"}:
+            raise SkeletonError([f"invalid comment ranges for {context}"])
+        ranges.append((start, end))
+        previous = end
+    try:
+        _without_comments(text, tuple(ranges))
+    except UnicodeDecodeError as exc:
+        raise SkeletonError([f"invalid comment ranges for {context}"]) from exc
+    return tuple(ranges)
 
 
 def _read_snapshot_pass(
@@ -1600,10 +1666,13 @@ _FOUND_RECORD_FIELDS = frozenset(
         "module",
         "range",
         "root",
+        "notation_free_signature",
         "semantic",
         "semantic_schema",
         "signature",
         "source",
+        "source_comments",
+        "statement_comments",
         "statement_source",
         "trusted",
     }
@@ -1619,6 +1688,7 @@ _TRUSTED_RECORD_FIELDS = frozenset(
         "semantic_schema",
         "signature",
         "source",
+        "source_comments",
         "source_name",
     }
 )
@@ -1667,11 +1737,16 @@ def _validate_probe_record(record: dict[str, object], *, root: str) -> None:
     _require_semantic(record, context=root, kind=str(record["kind"]))
     _require_nonempty_string(record.get("module"), field="module", context=root)
     _require_nonempty_string(record.get("signature"), field="signature", context=root)
+    _require_nonempty_string(
+        record.get("notation_free_signature"), field="notation_free_signature", context=root
+    )
     _require_range(record.get("range"), context=root)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=root)
+    _require_probe_comments(record, "source", "source_comments", context=root)
     statement = record.get("statement_source")
     if statement is not None and not isinstance(statement, str):
         raise SkeletonError([f"the skeleton probe emitted an invalid statement_source field for {root}"])
+    _require_probe_comments(record, "statement_source", "statement_comments", context=root)
     for field in ("depends", "assumed", "axioms"):
         _require_string_list(record.get(field), field=field, context=root)
     _require_semantic_pairs(
@@ -1714,6 +1789,7 @@ def _validate_trusted_record(record: dict[str, object], *, root: str) -> None:
     _require_nonempty_string(record.get("signature"), field="signature", context=context)
     _require_range(record.get("range"), context=context)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=context)
+    _require_probe_comments(record, "source", "source_comments", context=context)
     _require_string_list(record.get("depends"), field="depends", context=context)
 
 
@@ -1795,6 +1871,40 @@ def _name_parent(name: str) -> str | None:
     last, quoted = _lean_name_parts(name)[-1]
     length = len(last) + (2 if quoted else 0)
     return name[: -length - 1] if len(name) > length else None
+
+
+def _require_probe_comments(
+    record: dict[str, object], text_field: str, field: str, *, context: str
+) -> None:
+    """Comment ranges are ``null`` when Lean could not parse the text on its own."""
+
+    value = record.get(field)
+    if value is None:
+        return
+    text = record.get(text_field)
+    try:
+        _comment_ranges(value, text if isinstance(text, str) else None, context=context)
+    except SkeletonError as exc:
+        raise SkeletonError([f"the skeleton probe emitted an invalid {field} field for {context}"]) from exc
+
+
+def _probe_comments(value: object, text: str | None, *, name: str) -> tuple[tuple[int, int], ...]:
+    """Comment ranges for display, failing closed when Lean could not find them.
+
+    Only Lean knows where a comment starts: a project token such as ``=--`` is
+    code to it. Text Lean could not parse alone is shown only if it has nothing
+    that could start a comment.
+    """
+
+    if text is None:
+        return ()
+    if value is None:
+        if "--" in text or "/-" in text:
+            raise SkeletonError(
+                [f"cannot separate comments from code in {name}: Lean could not parse its source alone"]
+            )
+        return ()
+    return _comment_ranges(value, text, context=name)
 
 
 def _require_range(value: object, *, context: str) -> None:
@@ -2147,13 +2257,24 @@ def extract_graph_skeletons(
             )
         selected = [(node, names) for node, names in selected if node.id in wanted]
         selection = "filtered"
-    passages = {node.id: source_passage(node, graph.blueprint_dir) for node, _ in selected}
+    passages: dict[str, tuple[str | None, str | None]] = {}
+    # An article whose cited passage cannot be found cannot be judged for
+    # faithfulness, so its declarations are unresolved rather than shown alone.
+    broken_passages: dict[str, str] = {}
+    for node, _ in selected:
+        passage_issues: list[str] = []
+        passages[node.id] = source_passage(node, graph.blueprint_dir, issues=passage_issues)
+        if passage_issues:
+            broken_passages[node.id] = "; ".join(passage_issues)
 
     unresolved: list[UnresolvedTarget] = []
     imports: set[str] = set()
     roots: list[str] = []
     for node, names in selected:
         for name in names:
+            if node.id in broken_passages:
+                unresolved.append(UnresolvedTarget(node.id, name, broken_passages[node.id]))
+                continue
             location = index.find(name)
             module = None if location is None else module_of(lean_root / location.path, libraries)
             if location is None:
@@ -2190,7 +2311,7 @@ def extract_graph_skeletons(
     for node, names in selected:
         declarations: list[DeclarationSkeleton] = []
         for name in names:
-            if name not in roots:
+            if name not in roots or node.id in broken_passages:
                 continue
             record = records.get(name)
             if record is None:
@@ -2256,14 +2377,22 @@ def _statement(value: object) -> str | None:
     return _TRAILING_VALUE.sub("", value).rstrip()
 
 
-def source_passage(node: Node, blueprint: Path) -> tuple[str | None, str | None]:
+def source_passage(
+    node: Node, blueprint: Path, *, issues: list[str] | None = None
+) -> tuple[str | None, str | None]:
     """Return the passage an article cites through a line locator, and the locator.
 
     A ``## Sources`` link to a non-Markdown file inside the blueprint with a
     ``#L<start>-L<end>`` fragment names the exact source text the statement
     came from. The first such link wins. Markdown targets are notes, not
-    passages, and are ignored here.
+    passages, and are ignored here. When the first locator names no text there
+    is no passage, and the reason is appended to ``issues`` if given.
     """
+
+    def broken(target: str, why: str) -> tuple[None, None]:
+        if issues is not None:
+            issues.append(f"source locator {target} {why}")
+        return None, None
 
     for target in node.sources:
         path, _, fragment = target.partition("#")
@@ -2273,20 +2402,23 @@ def source_passage(node: Node, blueprint: Path) -> tuple[str | None, str | None]
         candidate = (node.path.parent / path).resolve()
         try:
             candidate.relative_to(blueprint.resolve())
+        except ValueError:
+            return broken(target, "points outside the blueprint")
+        try:
             captured = _read_snapshot_file(candidate)
             if captured is None:
-                continue
+                return broken(target, "names a missing file")
             # Lines are what an editor or `sed` counts: newline-separated. Python's
             # `splitlines` also breaks on form feeds, which `pdftotext` writes
             # between pages, and every locator into such a file would then drift
             # by one line per page.
             lines = captured[0].decode("utf-8").split("\n")
         except (ValueError, UnicodeError):
-            continue
+            return broken(target, "names a file that is not readable UTF-8 text")
         start = int(match.group(1))
         end = int(match.group(2) or start)
         if start < 1 or end < start or end > len(lines):
-            continue
+            return broken(target, "names no lines of its file")
         relative = candidate.relative_to(blueprint.resolve()).as_posix()
         return "\n".join(lines[start - 1 : end]), f"{relative}#L{start}-L{end}"
     return None, None
@@ -2317,6 +2449,20 @@ def _declaration(
     name = str(record["root"])
     semantic = str(record["semantic"])
     module = str(record.get("module") or "")
+    source = _optional_probe_string(record.get("source"))
+    written = _optional_probe_string(record.get("statement_source"))
+    statement = _statement(written)
+    # `_statement` only trims the end, so the ranges still apply up to its length.
+    limit = len((statement or "").encode("utf-8"))
+    statement_comments = _comment_ranges(
+        [
+            [start, min(end, limit)]
+            for start, end in _probe_comments(record.get("statement_comments"), written, name=name)
+            if start < limit
+        ],
+        statement,
+        context=f"the statement of {name}",
+    )
     start, end = _range(record.get("range"))
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
     _check_local_safety(name, semantic)
@@ -2328,6 +2474,7 @@ def _declaration(
         start_line=start,
         end_line=end,
         signature=str(record.get("signature") or ""),
+        notation_free_signature=str(record["notation_free_signature"]),
         semantic=semantic,
         lean_version=str(record["lean_version"]),
         depends=tuple(_strings(record.get("depends"))),
@@ -2342,8 +2489,10 @@ def _declaration(
         ),
         axioms=tuple(_strings(record.get("axioms"))),
         axiom_semantics=_semantic_pairs(record.get("axiom_semantics")),
-        source=_optional_probe_string(record.get("source")),
-        statement=_statement(record.get("statement_source")),
+        source=source,
+        statement=statement,
+        source_comments=_probe_comments(record.get("source_comments"), source, name=name),
+        statement_comments=statement_comments,
     )
     return declaration
 
@@ -2362,6 +2511,7 @@ def _trusted(
     start, end = _range(item.get("range"))
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
     _check_local_safety(source_name, semantic)
+    source = _optional_probe_string(item.get("source"))
     trusted = TrustedDeclaration(
         name=name,
         kind=str(item.get("kind") or "unknown"),
@@ -2372,7 +2522,8 @@ def _trusted(
         signature=str(item.get("signature") or ""),
         semantic=semantic,
         depends=tuple(_strings(item.get("depends"))),
-        source=_optional_probe_string(item.get("source")),
+        source=source,
+        source_comments=_probe_comments(item.get("source_comments"), source, name=name),
     )
     return trusted
 

@@ -321,7 +321,7 @@ exits nonzero when a `lean:` name is absent from the sources or from the built
 environment, or when its statement cannot be cut from the source (for example,
 a theorem that uses `local notation`); that name is unresolved for its article
 only, other articles still extract, and it writes nothing into the vault;
-`--output` records the `autoform-skeleton/v3` report, which contains no
+`--output` records the `autoform-skeleton/v4` report, which contains no
 timestamp or absolute path, for a later render or review to consume. The
 report identifies the exact blueprint, its complete target set, and whether
 the extraction covered all targets or an explicit `--node` selection. It
@@ -353,7 +353,8 @@ statement identifier, reviewer authentication, or an approval key.
 Reports and packet manifests also carry an evidence hash over the exact packet
 shown to a reviewer. It identifies those bytes but does not authenticate who
 reviewed them. An article review hash additionally binds the joint packet to the
-cited passage and its locator. All three are advisory provenance checksums when
+cited passage, its locator, and the drift hash, so a review recorded against it
+does not survive a change of meaning that leaves the packet text unchanged. All three are advisory provenance checksums when
 candidate code controls the checkout.
 
 `--packets DIR` writes one comment-stripped packet per skeleton, with a
@@ -370,10 +371,16 @@ diagnostic report. Output destinations must be disjoint and non-symlinked, and
 their parent filesystems must support the temporary files, hard links, and
 atomic renames used for guarded replacement.
 
-A packet holds only what a blind auditor may see: the signature, the statement
-as written, and the source of every project definition it rests on, with every
-comment and docstring removed, so that a reader who is asked what the Lean
-literally asserts cannot read the author's intent into it.
+A packet holds only what a blind auditor may see: the signature, the same
+signature printed with notation off, the statement as written, and the source
+of every project definition it rests on, with every comment and docstring
+removed, so that a reader who is asked what the Lean
+literally asserts cannot read the author's intent into it. Lean's parser, not
+a separate lexer, locates the comments, so a project token that contains `--`
+stays code; a source Lean cannot parse on its own is refused if it may hold a
+comment. The notation-free signature spells every application by its constant,
+so project notation such as an `infixl " + " => HMul.hMul` cannot make a
+product read as a sum. Custom delaborators still apply to it.
 
 Each theorem's packet also carries the statement *as written*, cut before its
 value by Lean's parser with its enclosing namespaces and the file's opened
@@ -385,7 +392,9 @@ can hide what the other shows.
 A statement's source passage can travel with it. A `## Sources` link to a
 non-Markdown file inside the blueprint with a `#L<start>-L<end>` fragment, for
 example `../../../sources/lebl-ra/ch-real-nums.tex#L693-L714`, names the exact
-text the statement came from. `--passages DIR` writes those passages beside
+text the statement came from. A first such link that names no text, because
+it points outside the blueprint, names a missing or unreadable file, or names
+no lines of it, leaves the article's declarations unresolved. `--passages DIR` writes those passages beside
 the packets, one per article, in a separate, disjoint managed directory. It
 requires `--packets`. Each article directory also holds `article.lean`, the
 joint packet of every declaration the article
