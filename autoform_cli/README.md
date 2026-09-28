@@ -301,12 +301,16 @@ command that runs Lean: it writes a small probe and runs it with
 `lake env lean` against the built project. Before the probe, Lake must confirm
 without rebuilding that every imported module matches its exact source inputs;
 a missing `lake-manifest.json`, stale artifacts, or a source tree that changes
-during extraction makes the command fail. A lexical closure would miss what
+during extraction makes the command fail. That check rehashes every input and
+rewrites Lake's `.hash` files, so the project's `.lake` directory must be
+writable. A lexical closure would miss what
 `open`, notation, implicit instances, and auto-bound variables bring in, and
 every miss silently shrinks the surface a reader is told to trust. Constructors,
-projections, recursors, matchers, and equation lemmas are folded onto the
+projections, recursors, `noConfusion` helpers, and matchers are folded onto the
 declaration the reader sees in the source, so a structure appears once, as its
-`structure` block. Names outside the project are the trusted base and are not
+`structure` block. Only companions that Lean's environment records as generated
+are folded; a name such as `f.eq_1` or `f._helper` is not. Names outside the
+project are the trusted base and are not
 expanded. The command exits nonzero when a `lean:` name is absent from the
 sources or from the built environment, and it writes nothing into the vault;
 `--output` records the `autoform-skeleton/v3` report, which contains no

@@ -249,6 +249,27 @@ def test_probe_refuses_stale_artifacts_before_executing_lean(tmp_path: Path, mon
     assert calls == [["/bin/lake", "--rehash", "--no-build", "build", "Skel.Main"]]
 
 
+def test_probe_reports_a_failed_freshness_check_apart_from_stale_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "lake-manifest.json").write_text("{}\n", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command, 1, stdout="error: permission denied (error code: 13)", stderr=""
+        )
+
+    monkeypatch.setattr("autoform_cli.skeleton.shutil.which", lambda executable: "/bin/lake")
+    monkeypatch.setattr("autoform_cli.skeleton._run_bounded_command", fake_run)
+    probe = render_probe(imports=("Skel.Main",), roots=("Skel.x",), project_roots=("Skel",))
+
+    with pytest.raises(SkeletonError, match="must be writable") as refused:
+        run_probe(probe, tmp_path)
+
+    assert "stale" not in str(refused.value)
+    assert "permission denied" in str(refused.value)
+
+
 def test_bounded_command_rejects_excess_output(tmp_path: Path) -> None:
     with pytest.raises(SkeletonError, match="1024-byte output limit"):
         _run_bounded_command(

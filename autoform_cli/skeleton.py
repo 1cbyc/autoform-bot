@@ -18,10 +18,11 @@ outside the project are the trusted base and are listed by name rather than
 expanded, so a reader sees that a statement uses Mathlib's notion rather than a
 homemade one.
 
-Generated companions -- constructors, projections, recursors, matchers,
-equation lemmas -- are folded onto the declaration the reader sees in the
+Generated companions -- constructors, projections, recursors, ``noConfusion``
+helpers, matchers -- are folded onto the declaration the reader sees in the
 source, so a structure appears once, as the ``structure`` block, rather than as
-five auto-generated names.
+five auto-generated names. Only companions that Lean's environment records as
+generated are folded; name spelling such as ``f.eq_1`` is not evidence.
 
 The output is deterministic and path-free like every other Autoform report: the
 same sources produce the same JSON, and nothing here writes into the vault.
@@ -73,6 +74,8 @@ _CORE_MODULE_ROOTS = ("Init", "Lean", "Std", "Lake")
 DEFAULT_PROBE_TIMEOUT = 600.0
 DEFAULT_PROBE_OUTPUT_LIMIT = 64 * 1024 * 1024
 _PROCESS_TERMINATION_GRACE = 2.0
+#: Lake's exit status when ``--no-build`` finds a target that needs rebuilding.
+_LAKE_NO_BUILD_EXIT = 3
 _PROCESS_TOKEN_ENV = "_AUTOFORM_PROCESS_TOKEN"
 _SNAPSHOT_FILE_LIMIT = 64 * 1024 * 1024
 _PROJECT_CONTROL_FILES = (
@@ -1507,7 +1510,12 @@ def _probe_modules(probe: str) -> tuple[str, ...]:
 def _check_artifacts_fresh(
     lake: str, lean_root: Path, modules: tuple[str, ...], *, timeout: float
 ) -> None:
-    """Ask Lake to prove that imported artifacts match their exact inputs."""
+    """Ask Lake to prove that imported artifacts match their exact inputs.
+
+    ``--rehash`` distrusts every cached ``.hash`` sidecar and hashes the inputs
+    afresh; Lake has no mode that does so without rewriting those sidecars, so
+    the project's build directory must be writable.
+    """
 
     result = _run_bounded_command(
         [lake, "--rehash", "--no-build", "build", *modules],
@@ -1515,9 +1523,18 @@ def _check_artifacts_fresh(
         timeout=timeout,
         context="cannot verify Lean build freshness",
     )
-    if result.returncode != 0:
+    if result.returncode == _LAKE_NO_BUILD_EXIT:
         detail = (result.stderr or result.stdout).strip()
         raise SkeletonError([f"Lean build artifacts are stale; run `lake build` before extracting skeletons\n{detail}"])
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise SkeletonError(
+            [
+                f"cannot verify Lean build freshness: `lake --rehash --no-build build` exited with status "
+                f"{result.returncode}; the check rewrites `.hash` files under `.lake`, which must be writable"
+                f"\n{detail}"
+            ]
+        )
 
 
 def run_probe(probe: str, lean_root: Path, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> str:
