@@ -331,12 +331,13 @@ controls, not a security or authenticity boundary.
 Every skeleton carries a full SHA-256 **drift hash**. It is derived from
 canonical elaborated expressions for the root, every trusted declaration, each
 direct external assumption, and each axiom, together with the dependency edges,
-Lean version, and source identities for the transitive external boundary. Local
-source spelling and comments do not enter the hash, while macro expansion,
-synthesized instance bodies, types, and definition bodies do. Proof axioms,
-toolchain changes, and unrelated edits in an external source module may also
-rotate it. Compiler-generated matcher and recursor bodies stay in the hash even
-though they are folded out of the human reading list.
+Lean version, and compiled `.olean` identities (every part a module-system
+build writes) for the transitive external boundary. Local source spelling and
+comments do not enter the hash, while macro expansion, synthesized instance
+bodies, types, and definition bodies do. Proof axioms, toolchain changes, and
+unrelated edits in an external module or its imports may also rotate it.
+Compiler-generated matcher and recursor bodies stay in the hash even though
+they are folded out of the human reading list.
 An article with several `lean:` names has one hash over all of them, printed as
 the article skeleton. It compares reports across builds; it is not a stable
 statement identifier, reviewer authentication, or an approval key.

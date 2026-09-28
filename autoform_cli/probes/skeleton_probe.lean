@@ -369,7 +369,7 @@ def skeleton
   let sortedAxioms := axioms.qsort Name.lt
   let mut boundaryClosure := sortedAssumed
   for axiomName in sortedAxioms do
-    if !isCore axiomName && !axiomName.isInternalDetail && !boundaryClosure.contains axiomName then
+    if !isCore axiomName && !boundaryClosure.contains axiomName then
       boundaryClosure := boundaryClosure.push axiomName
   let mut boundaryWork := boundaryClosure
   while h : boundaryWork.size > 0 do
@@ -385,14 +385,21 @@ def skeleton
     if let some mod := moduleOf env c then
       if !boundaryModules.contains mod then boundaryModules := boundaryModules.push mod
   let mut boundaryModuleFiles : Array Json := #[]
-  -- `.olean` bytes embed checkout paths. Exact source bytes plus the reported
-  -- Lean version provide a stable identity and still rotate on every edit.
-  let sourceSearchPath ← getSrcSearchPath
+  -- Compiled artifacts, not source bytes, identify a boundary module: macros,
+  -- options, and instances from outside its source change its elaborated
+  -- meaning. Lean serializes module names rather than checkout paths, so the
+  -- bytes are path-independent for ordinary code. Module-system builds split
+  -- the artifact into `.olean`, `.olean.server`, and `.olean.private` (which
+  -- holds private bodies and proofs); bind every part that exists.
   for mod in boundaryModules.qsort Name.lt do
-    let some path ← sourceSearchPath.findModuleWithExt "lean" mod
-      | throwError "source unavailable for boundary module {{mod}}"
-    boundaryModuleFiles := boundaryModuleFiles.push <| Json.arr #[
-      Json.str (toString mod), Json.str "lean", Json.str path.toString]
+    let olean ← findOLean mod
+    unless ← olean.pathExists do
+      throwError "compiled artifact unavailable for boundary module {{mod}}"
+    for (kind, path) in [("olean", olean), ("olean.server", olean.addExtension "server"),
+        ("olean.private", olean.addExtension "private")] do
+      if kind == "olean" || (← path.pathExists) then
+        boundaryModuleFiles := boundaryModuleFiles.push <| Json.arr #[
+          Json.str (toString mod), Json.str kind, Json.str path.toString]
   let mut items : Array Json := #[]
   for c in trusted.qsort Name.lt do
     let deps := (edges.find? (·.1 == c)).map (·.2) |>.getD #[]

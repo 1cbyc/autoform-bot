@@ -1,4 +1,9 @@
 import Skel.Vendor
+import Skel.VendorMacroUse
+import Skel.VendorModule
+import Skel.VendorPrivA
+import Skel.VendorPrivAxiom
+import Skel.VendorWf
 
 namespace Skel.Semantics
 
@@ -22,6 +27,16 @@ def usesExternalDetail : Nat := Vendor.visible._helper
 def usesExternalMatch : Nat → Nat := Vendor.matchBody
 
 def usesExternalPrivate : Nat := Vendor.usesPrivate
+
+def usesVendorMacro : Nat := Vendor.macroAlias
+
+def usesVendorWf : Nat := Vendor.wfWalk 2 3
+
+def usesVendorPrivateChain : Nat := Vendor.viaPrivateBridge
+
+def usesVendorModule : Nat := Vendor.moduleValue
+
+theorem usesVendorPrivateAxiom : True := Vendor.usesHiddenAxiom
 
 def «quoted.helper» : Nat := 1
 

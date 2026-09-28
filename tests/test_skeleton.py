@@ -178,7 +178,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             trusted=[non_ambiguous, observation, eligible],
             assumed=["Mathlib.Fake"],
             assumed_semantics=[["Mathlib.Fake", _semantic({"type": {"sort": {"zero": None}}})]],
-            boundary_modules=[["Mathlib.Fake", "lean", "Skel/Defs.lean"]],
+            boundary_modules=[["Mathlib.Fake", "olean", "Skel/Defs.lean"]],
             axioms=["sorryAx"],
             axiom_semantics=[["sorryAx", _semantic({"type": {"sort": {"zero": None}}})]],
         ),
@@ -865,23 +865,23 @@ def test_skeleton_hash_uses_elaborated_semantics_not_source_formatting(tmp_path:
 def test_assumed_module_identity_is_path_independent_and_rejects_a_concurrent_edit(
     tmp_path: Path,
 ) -> None:
-    artifact = tmp_path / "first" / "External.lean"
-    other = tmp_path / "second" / "External.lean"
+    artifact = tmp_path / "first" / "External.olean"
+    other = tmp_path / "second" / "External.olean"
     artifact.parent.mkdir()
     other.parent.mkdir()
     artifact.write_bytes(b"old")
     other.write_bytes(b"old")
     first = _hash_module_files(
-        [["External", "lean", str(artifact)]], lean_root=tmp_path, cache={}
+        [["External", "olean", str(artifact)]], lean_root=tmp_path, cache={}
     )
     second = _hash_module_files(
-        [["External", "lean", str(other)]], lean_root=tmp_path, cache={}
+        [["External", "olean", str(other)]], lean_root=tmp_path, cache={}
     )
     assert first == second
 
-    other.write_bytes(b"different source")
+    other.write_bytes(b"different artifact")
     changed = _hash_module_files(
-        [["External", "lean", str(other)]], lean_root=tmp_path, cache={}
+        [["External", "olean", str(other)]], lean_root=tmp_path, cache={}
     )
     assert changed != first
 
@@ -890,11 +890,21 @@ def test_assumed_module_identity_is_path_independent_and_rejects_a_concurrent_ed
 
     with pytest.raises(SkeletonError, match="changed during skeleton extraction"):
         _hash_module_files(
-            [["External", "lean", str(artifact)]],
+            [["External", "olean", str(artifact)]],
             lean_root=tmp_path,
             cache={},
             snapshot_started_ns=started,
         )
+
+
+def test_assumed_module_identity_requires_compiled_parts_with_an_olean(tmp_path: Path) -> None:
+    for entries in (
+        [["External", "lean", "External.lean"]],
+        [["External", "olean.private", "External.olean.private"]],
+        [["External", "olean", "External.olean"], ["External", "olean", "External.olean"]],
+    ):
+        with pytest.raises(SkeletonError, match="assumed module"):
+            _hash_module_files(entries, lean_root=tmp_path, cache={})
 
 
 def test_trusted_theorem_source_never_exposes_its_proof(tmp_path: Path) -> None:
@@ -1891,6 +1901,131 @@ def test_external_internal_detail_rotates_the_declaration_hash(tmp_path: Path) -
     assert changed_detail["semantic"] == detail["semantic"]
     assert changed_detail["assumed_semantics"] != detail["assumed_semantics"]
     assert declaration(changed_detail).hash != detail_hash
+
+
+def _build_semantics(project: Path) -> None:
+    build = subprocess.run(
+        ["lake", "build", "Skel.Semantics"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+
+
+def _probe_declaration(project: Path, root: str):
+    probe = render_probe(imports=("Skel.Semantics",), roots=(root,), project_roots=("Skel.Semantics",))
+    record = parse_probe_output(run_probe(probe, project))[root]
+    declaration = _declaration(
+        record,
+        libraries=lean_libraries(project),
+        lean_root=project,
+        index=index_project(project),
+        module_hashes={},
+        snapshot_started_ns=None,
+    )
+    return record, declaration
+
+
+def _replace_source(path: Path, old: str, new: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    assert old in text
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_vendor_macro_outside_the_boundary_rotates_the_declaration_hash(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build_semantics(project)
+    root = "Skel.Semantics.usesVendorMacro"
+    record, before = _probe_declaration(project, root)
+    # A macro leaves no constant behind, so the module that defines it is not
+    # bound; only the compiled module that expanded it witnesses the change.
+    assert [item[0] for item in record["boundary_modules"]] == ["Skel.VendorMacroUse"]
+
+    _replace_source(project / "Skel" / "VendorMacro.lean", "((1 : Nat))", "((2 : Nat))")
+    _build_semantics(project)
+    changed_record, changed = _probe_declaration(project, root)
+
+    assert changed_record["assumed_semantics"] == record["assumed_semantics"]
+    assert changed.hash != before.hash
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_external_wf_helper_in_another_module_rotates_the_declaration_hash(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build_semantics(project)
+    root = "Skel.Semantics.usesVendorWf"
+    record, before = _probe_declaration(project, root)
+    # `wfWalk` reaches `wfHelper` only through its generated `_unary` body.
+    assert [item[0] for item in record["boundary_modules"]] == ["Skel.VendorWf", "Skel.VendorWfHelper"]
+
+    _replace_source(project / "Skel" / "VendorWfHelper.lean", "n + 1", "n + 2")
+    _build_semantics(project)
+    changed_record, changed = _probe_declaration(project, root)
+
+    assert changed_record["assumed_semantics"] == record["assumed_semantics"]
+    assert changed.hash != before.hash
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_external_private_helper_dependency_in_another_module_rotates_the_hash(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build_semantics(project)
+    root = "Skel.Semantics.usesVendorPrivateChain"
+    record, before = _probe_declaration(project, root)
+    assert [item[0] for item in record["boundary_modules"]] == ["Skel.VendorPrivA", "Skel.VendorPrivB"]
+
+    _replace_source(project / "Skel" / "VendorPrivB.lean", "privateTarget : Nat := 1", "privateTarget : Nat := 2")
+    _build_semantics(project)
+    changed_record, changed = _probe_declaration(project, root)
+
+    assert changed_record["assumed_semantics"] == record["assumed_semantics"]
+    assert changed.hash != before.hash
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_external_private_axiom_binds_its_module(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build_semantics(project)
+    record, _ = _probe_declaration(project, "Skel.Semantics.usesVendorPrivateAxiom")
+
+    assert record["axioms"] == ["_private.Skel.VendorPrivAxiom.0.Vendor.hiddenAxiom"]
+    assert [item[0] for item in record["boundary_modules"]] == ["Skel.VendorPrivAxiom"]
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_boundary_module_identity_is_checkout_path_independent(tmp_path: Path) -> None:
+    roots = ("Skel.Semantics.usesVendorMacro", "Skel.Semantics.usesVendorModule")
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second" / "nested").mkdir(parents=True)
+    identities = []
+    for project in (_project(tmp_path / "first"), _project(tmp_path / "second" / "nested")):
+        _build_semantics(project)
+        probed = {root: _probe_declaration(project, root) for root in roots}
+        identities.append({root: (item.hash, item.boundary_modules) for root, (_, item) in probed.items()})
+    assert identities[0] == identities[1]
+
+    # A module-system build splits its artifact; every part is bound.
+    record, _ = probed["Skel.Semantics.usesVendorModule"]
+    assert [item[:2] for item in record["boundary_modules"]] == [
+        ["Skel.VendorModule", "olean"],
+        ["Skel.VendorModule", "olean.server"],
+        ["Skel.VendorModule", "olean.private"],
+    ]
+
+    started = time.time_ns()
+    private_part = Path(record["boundary_modules"][2][2])
+    os.utime(private_part, ns=(started + 10**9, started + 10**9))
+    with pytest.raises(SkeletonError, match="changed during skeleton extraction"):
+        _hash_module_files(
+            record["boundary_modules"],
+            lean_root=project,
+            cache={},
+            snapshot_started_ns=started,
+        )
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")

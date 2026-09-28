@@ -91,6 +91,9 @@ _PROJECT_CONTROL_FILES = (
     "lean-toolchain",
     "lake-manifest.json",
 )
+#: Compiled parts that identify a boundary module. Module-system builds also
+#: write the server and private parts next to the `.olean`.
+_MODULE_FILE_KINDS = ("olean", "olean.server", "olean.private")
 
 #: A callable that runs a probe and returns Lean's standard output. The default
 #: shells out to ``lake env lean``; tests substitute a fake.
@@ -1939,12 +1942,14 @@ def _module_file_entries(value: object, *, context: str) -> tuple[tuple[str, str
             not isinstance(item, list)
             or len(item) != 3
             or not all(isinstance(part, str) and part for part in item)
-            or item[1] != "lean"
+            or item[1] not in _MODULE_FILE_KINDS
         ):
             raise SkeletonError([f"invalid assumed module files for {context}"])
         entries.append((item[0], item[1], item[2]))
-    if len({module for module, _, _ in entries}) != len(entries):
+    if len({(module, kind) for module, kind, _ in entries}) != len(entries):
         raise SkeletonError([f"duplicate assumed module files for {context}"])
+    if {module for module, _, _ in entries} != {module for module, kind, _ in entries if kind == "olean"}:
+        raise SkeletonError([f"missing assumed module olean for {context}"])
     return tuple(entries)
 
 
@@ -1959,7 +1964,7 @@ def _hash_module_files(
     cache: dict[tuple[str, str], str],
     snapshot_started_ns: int | None = None,
 ) -> tuple[tuple[str, str, str], ...]:
-    """Hash boundary source bytes without allowing their checkout paths into the digest."""
+    """Hash boundary compiled artifacts without allowing their checkout paths into the digest."""
 
     identities: list[tuple[str, str, str]] = []
     for module, file_kind, raw_path in _module_file_entries(value, context="probe output"):
