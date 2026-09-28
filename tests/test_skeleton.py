@@ -464,8 +464,11 @@ def test_bounded_command_termination_signal_kills_the_process_group(
         f"pathlib.Path({str(pids)!r}).write_text(f'{{os.getpid()}} {{child.pid}}'); "
         "time.sleep(60)"
     )
+    # Start from a terminal's dispositions even when pytest runs under nohup or in the background.
     driver = (
-        "import sys; from pathlib import Path; "
+        "import signal, sys; from pathlib import Path; "
+        "signal.signal(signal.SIGHUP, signal.SIG_DFL); "
+        "signal.signal(signal.SIGINT, signal.default_int_handler); "
         "from autoform_cli.skeleton import _run_bounded_command; "
         "_run_bounded_command(sys.argv[1:], cwd=Path.cwd(), timeout=60, context='test command')"
     )
