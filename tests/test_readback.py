@@ -25,9 +25,9 @@ from autoform_cli.skeleton import (
     write_packets,
 )
 
-_PROP = '{"type":{"sort":{"zero":null}}}'
-_BODY = '{"type":{"sort":{"zero":null}},"value":{"bvar":0}}'
-_OTHER_BODY = '{"type":{"sort":{"zero":null}},"value":{"bvar":1}}'
+_PROP = '{"generated":[],"root":{"type":{"sort":{"zero":null}}}}'
+_BODY = '{"generated":[],"root":{"type":{"sort":{"zero":null}},"value":{"bvar":0}}}'
+_OTHER_BODY = '{"generated":[],"root":{"type":{"sort":{"zero":null}},"value":{"bvar":1}}}'
 _ARTICLE_ID = "af_0123456789abcdef01234567"
 
 
