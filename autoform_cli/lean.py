@@ -25,8 +25,9 @@ _SECTION = re.compile(r"^\s*section\b\s*(\S*)")
 _END = re.compile(r"^\s*end\b\s*(\S*)")
 _DECLARATION = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)*"
-    r"(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*"
-    r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+(.+)$"
+    r"(?P<modifiers>(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*)"
+    r"(?P<keyword>theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+"
+    r"(?P<remainder>.+)$"
 )
 _IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
 _MANAGED_OUTPUT_SCHEMAS = frozenset(
@@ -45,6 +46,7 @@ class Declaration:
     path: Path
     line: int
     keyword: str
+    safety: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,12 +143,14 @@ def _scan(text: str, relative: Path) -> list[Declaration]:
 
         declaration_match = _DECLARATION.match(line)
         if declaration_match:
-            keyword = declaration_match.group(1)
-            name = _name_token(declaration_match.group(2))
+            keyword = declaration_match.group("keyword")
+            name = _name_token(declaration_match.group("remainder"))
             if name is None:
                 continue
             qualified = ".".join([*namespaces, name])
-            found.append(Declaration(qualified, relative, number, keyword))
+            modifiers = declaration_match.group("modifiers").split()
+            safety = "partial" if "partial" in modifiers else "unsafe" if "unsafe" in modifiers else "safe"
+            found.append(Declaration(qualified, relative, number, keyword, safety))
     return found
 
 

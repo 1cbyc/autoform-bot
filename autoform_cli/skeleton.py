@@ -59,7 +59,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
 SKELETON_SCHEMA = "autoform-skeleton/v2"
-SEMANTIC_SCHEMA = "autoform-lean-expr/v2"
+SEMANTIC_SCHEMA = "autoform-lean-expr/v3"
 
 #: Every line the probe wants read back starts with this marker, so Lean's own
 #: informational output can never be mistaken for a result.
@@ -507,6 +507,7 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
         raise SkeletonError([f"proof-bearing source is forbidden for {kind} {name}"])
     if kind not in {"theorem", "axiom"} and (source is None or not source.strip()):
         raise SkeletonError([f"required source is missing for {kind} {name}"])
+    statement = _report_string(item.get("statement"), f"statement for {name}")
     declaration = DeclarationSkeleton(
         name=name,
         kind=kind,
@@ -525,7 +526,7 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
         axioms=axioms,
         axiom_semantics=axiom_semantics,
         source=source,
-        statement=_report_optional_string(item.get("statement"), f"statement for {name}"),
+        statement=statement,
     )
     _validate_report_ranges(declaration.start_line, declaration.end_line, context=name)
     if item.get("hash") != declaration.hash:
@@ -1366,8 +1367,8 @@ def _validate_probe_record(record: dict[str, object], *, root: str) -> None:
     _require_nonempty_string(record.get("signature"), field="signature", context=root)
     _require_range(record.get("range"), context=root)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=root)
-    if record.get("statement_source") is not None and not isinstance(record["statement_source"], str):
-        raise SkeletonError([f"the skeleton probe emitted an invalid statement_source for {root}"])
+    if _statement(record.get("statement_source")) is None:
+        raise SkeletonError([f"the skeleton probe omitted required statement_source for {root}"])
     for field in ("depends", "assumed", "axioms"):
         _require_string_list(record.get(field), field=field, context=root)
     _require_semantic_pairs(
@@ -1518,22 +1519,28 @@ def _valid_semantic_name(value: object) -> bool:
 
 def _semantic_keys_for_kind(kind: str) -> set[str]:
     return {
-        "def": {"type", "value"},
-        "instance": {"type", "value"},
-        "opaque": {"type", "value"},
-        "class": {"type", "constructors"},
-        "inductive": {"type", "constructors"},
-        "structure": {"type", "constructors"},
-    }.get(kind, {"type"})
+        "def": {"safety", "type", "value"},
+        "instance": {"safety", "type", "value"},
+        "opaque": {"safety", "type", "value"},
+        "class": {"constructors", "safety", "type"},
+        "inductive": {"constructors", "safety", "type"},
+        "structure": {"constructors", "safety", "type"},
+    }.get(kind, {"safety", "type"})
 
 
 def _validate_semantic_payload(
     payload: object, *, context: str, expected: set[str] | None
 ) -> None:
-    allowed = ({"type"}, {"type", "value"}, {"type", "constructors"})
+    allowed = (
+        {"safety", "type"},
+        {"safety", "type", "value"},
+        {"constructors", "safety", "type"},
+    )
     if not isinstance(payload, dict) or (
         expected is not None and payload.keys() != expected
     ) or (expected is None and set(payload) not in allowed):
+        raise SkeletonError([f"invalid elaborated semantic material for {context}"])
+    if payload.get("safety") not in {"safe", "unsafe", "partial"}:
         raise SkeletonError([f"invalid elaborated semantic material for {context}"])
 
 
@@ -1553,6 +1560,29 @@ def _semantic_pairs(value: object) -> tuple[tuple[str, str], ...]:
     if len({name for name, _ in pairs}) != len(pairs):
         raise SkeletonError(["duplicate semantic identities in skeleton report"])
     return tuple(pairs)
+
+
+def _semantic_safety(semantic: str) -> str:
+    """Return safety from already-validated semantic material."""
+
+    payload = json.loads(semantic)
+    return str(payload["root"]["safety"])
+
+
+def _check_local_safety(name: str, semantic: str, index: SourceIndex) -> None:
+    """Reject partial declarations and cross-check source and environment safety."""
+
+    declaration = index.find(name)
+    if declaration is None:
+        return
+    if declaration.safety == "partial":
+        raise SkeletonError(
+            [f"partial declaration {name} cannot be included in a trusted skeleton"]
+        )
+    if declaration.safety != _semantic_safety(semantic):
+        raise SkeletonError(
+            [f"source and Lean environment disagree about declaration safety for {name}"]
+        )
 
 
 def _require_semantic_pairs(
@@ -1873,6 +1903,8 @@ def _declaration(
         if isinstance(item, dict)
     ]
     name = str(record["root"])
+    semantic = str(record["semantic"])
+    _check_local_safety(name, semantic, index)
     module = str(record.get("module") or "")
     start, end = _range(record.get("range"))
     declaration = DeclarationSkeleton(
@@ -1883,7 +1915,7 @@ def _declaration(
         start_line=start,
         end_line=end,
         signature=str(record.get("signature") or ""),
-        semantic=str(record["semantic"]),
+        semantic=semantic,
         lean_version=str(record["lean_version"]),
         depends=tuple(_strings(record.get("depends"))),
         trusted=tuple(_dependency_order(trusted)),
@@ -1911,6 +1943,8 @@ def _trusted(
     index: SourceIndex,
 ) -> TrustedDeclaration:
     name = str(item.get("name") or "")
+    semantic = str(item["semantic"])
+    _check_local_safety(name, semantic, index)
     module = str(item.get("module") or "")
     start, end = _range(item.get("range"))
     trusted = TrustedDeclaration(
@@ -1921,7 +1955,7 @@ def _trusted(
         start_line=start,
         end_line=end,
         signature=str(item.get("signature") or ""),
-        semantic=str(item["semantic"]),
+        semantic=semantic,
         depends=tuple(_strings(item.get("depends"))),
         source=_optional_probe_string(item.get("source")),
     )

@@ -18,6 +18,7 @@ from autoform_cli.__main__ import main
 from autoform_cli.skeleton import (
     PACKET_MANIFEST,
     PROBE_MARKER,
+    SEMANTIC_SCHEMA,
     SKELETON_SCHEMA,
     SkeletonReport,
     SkeletonError,
@@ -94,7 +95,10 @@ def _record(root: str, **fields: object) -> str:
 
 
 def _semantic(payload: dict[str, object]) -> str:
-    return json.dumps({"generated": [], "root": payload}, separators=(",", ":"))
+    return json.dumps(
+        {"generated": [], "root": {"safety": "safe", **payload}},
+        separators=(",", ":"),
+    )
 
 
 def _fake_probe_output(*, include_ghost: bool = False) -> str:
@@ -106,7 +110,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [5, 6],
         "signature": "Skel.Eligible {Y : Type} (S : Y → Prop) (y : Y) : Prop",
-        "semantic_schema": "autoform-lean-expr/v2",
+        "semantic_schema": SEMANTIC_SCHEMA,
         "semantic": _semantic({"type": {"sort": {"zero": None}}, "value": {"bvar": 0}}),
         "depends": [],
         "source": "/-- A weak observation admits a label. -/\ndef Eligible (S : Y → Prop) (y : Y) : Prop := S y",
@@ -117,7 +121,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [8, 10],
         "signature": "Skel.NonAmbiguous {Y : Type} (S : Y → Prop) : Prop",
-        "semantic_schema": "autoform-lean-expr/v2",
+        "semantic_schema": SEMANTIC_SCHEMA,
         "semantic": _semantic({"type": {"sort": {"zero": None}}, "value": {"bvar": 1}}),
         "depends": ["Skel.Eligible"],
         "source": (
@@ -132,7 +136,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [15, 18],
         "signature": "Skel.Observation (Y : Type) : Type",
-        "semantic_schema": "autoform-lean-expr/v2",
+        "semantic_schema": SEMANTIC_SCHEMA,
         "semantic": _semantic({"type": {"sort": {"zero": None}}, "constructors": []}),
         "depends": [],
         "source": (
@@ -151,11 +155,15 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             module="Skel.Main",
             range=[14, 17],
             signature="Skel.observation_determined {Y : Type} (o : Skel.Observation Y) :\n  ∃ y, o.admits y",
-            semantic_schema="autoform-lean-expr/v2",
+            semantic_schema=SEMANTIC_SCHEMA,
             semantic=_semantic({"type": {"sort": {"zero": None}}}),
             lean_version="4.32.2",
             source=None,
-            statement_source=None,
+            statement_source=(
+                "/-- Uses a structure in its statement, and sorry in its proof. -/\n"
+                "theorem observation_determined (o : Observation Y) (h : NonAmbiguous o.admits) :\n"
+                "    ∃ y, o.admits y ∧ ∀ z, o.admits z → z = y"
+            ),
             depends=["Skel.NonAmbiguous", "Skel.Observation"],
             # Deliberately out of dependency order: the report must sort them.
             trusted=[non_ambiguous, observation, eligible],
@@ -492,6 +500,13 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
 
     record = _fake_found_record()
     semantic = json.loads(str(record["semantic"]))
+    semantic["root"]["safety"] = "unknown"
+    record["semantic"] = json.dumps(semantic)
+    with pytest.raises(SkeletonError, match="invalid elaborated semantic material"):
+        parse_probe_output(PROBE_MARKER + json.dumps(record))
+
+    record = _fake_found_record()
+    semantic = json.loads(str(record["semantic"]))
     semantic["generated"] = [
         {"name": "ambiguous.display.name", "material": semantic["root"]}
     ]
@@ -516,6 +531,11 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
     record = _fake_found_record()
     record["source"] = "theorem t : True := by trivial"
     with pytest.raises(SkeletonError, match="proof-bearing source"):
+        parse_probe_output(PROBE_MARKER + json.dumps(record))
+
+    record = _fake_found_record()
+    record["statement_source"] = None
+    with pytest.raises(SkeletonError, match="omitted required statement_source"):
         parse_probe_output(PROBE_MARKER + json.dumps(record))
 
 
@@ -704,7 +724,7 @@ def test_trusted_theorem_source_never_exposes_its_proof(tmp_path: Path) -> None:
             "module": "Skel.Defs",
             "range": [12, 13],
             "signature": "Skel.eligible_of {Y : Type} (S : Y → Prop) (y : Y) (h : S y) : Skel.Eligible S y",
-            "semantic_schema": "autoform-lean-expr/v2",
+            "semantic_schema": SEMANTIC_SCHEMA,
             "semantic": _semantic({"type": {"sort": {"zero": None}}}),
             "depends": ["Skel.Eligible"],
             "source": None,
@@ -1417,6 +1437,13 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
     assert supervision.axioms == ()
     assert definition.kind == "def" and definition.trusted == ()
 
+    partial_blueprint = _blueprint(
+        tmp_path / "partial",
+        lean={"partial": "Skel.Semantics.partialValue"},
+    )
+    with pytest.raises(SkeletonError, match="partial declaration .* cannot be included"):
+        extract_skeletons(partial_blueprint, lean_root=project)
+
     source = project / "Skel" / "Main.lean"
     source.write_text(
         source.read_text(encoding="utf-8").replace(
@@ -1437,10 +1464,16 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
 
     roots = (
         "Skel.Semantics.expandedMacro",
+        "Skel.Semantics.firstOnLine",
         "Skel.Semantics.matchBody",
+        "Skel.Semantics.safeValue",
+        "Skel.Semantics.secondOnLine",
         "Skel.Semantics.usesOpaque",
         "Skel.Semantics.selectedProposition",
+        "Skel.Semantics.unsafeValue",
+        "Skel.Semantics.universeNamed",
         "Skel.Semantics.usesQuoted",
+        "Skel.Semantics.visible",
     )
 
     def records() -> dict[str, dict[str, object]]:
@@ -1454,8 +1487,12 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
 
     before = records()
     macro = before["Skel.Semantics.expandedMacro"]
-    assert macro["semantic_schema"] == "autoform-lean-expr/v2"
-    assert set(json.loads(str(macro["semantic"]))["root"]) == {"type", "value"}
+    assert macro["semantic_schema"] == SEMANTIC_SCHEMA
+    assert set(json.loads(str(macro["semantic"]))["root"]) == {
+        "safety",
+        "type",
+        "value",
+    }
 
     opaque = before["Skel.Semantics.usesOpaque"]
     assert [item["name"] for item in opaque["trusted"]] == [
@@ -1463,7 +1500,11 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
         "Skel.Semantics.opaqueWitness",
     ]
     opaque_item = next(item for item in opaque["trusted"] if item["name"].endswith("opaqueWitness"))
-    assert set(json.loads(opaque_item["semantic"])["root"]) == {"type", "value"}
+    assert set(json.loads(opaque_item["semantic"])["root"]) == {
+        "safety",
+        "type",
+        "value",
+    }
 
     selected = before["Skel.Semantics.selectedProposition"]
     assert selected["trusted"] == []
@@ -1493,12 +1534,40 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
     assert len(generated) == 1
     assert isinstance(generated[0]["name"], dict)
 
+    visible = before["Skel.Semantics.visible"]
+    assert [item["name"] for item in visible["trusted"]] == [
+        "Skel.Semantics.visible._helper"
+    ]
+    helper_before = visible["trusted"][0]["semantic"]
+
+    first_on_line = before["Skel.Semantics.firstOnLine"]
+    assert first_on_line["source"] == "def firstOnLine : Nat := 1"
+    assert "secondOnLine" not in first_on_line["source"]
+    second_on_line = before["Skel.Semantics.secondOnLine"]
+    assert second_on_line["statement_source"] == "theorem secondOnLine : firstOnLine = 1"
+    assert "firstOnLine : Nat := 1" not in second_on_line["statement_source"]
+    assert "rfl" not in second_on_line["statement_source"]
+
+    assert json.loads(str(before["Skel.Semantics.safeValue"]["semantic"]))["root"][
+        "safety"
+    ] == "safe"
+    assert json.loads(str(before["Skel.Semantics.unsafeValue"]["semantic"]))[
+        "root"
+    ]["safety"] == "unsafe"
+    universe_before = before["Skel.Semantics.universeNamed"]["semantic"]
+
     source = project / "Skel" / "Semantics.lean"
     text = source.read_text(encoding="utf-8")
     source.write_text(
-        text.replace("| `(semanticMacro) => `(1)", "| `(semanticMacro) => `(2)").replace(
+        text.replace("| `(semanticMacro) => `(1)", "| `(semanticMacro) => `(2)")
+        .replace(
             "  | 0 => 10\n  | n + 1 => n",
             "  | 1 => 10\n  | n => n",
+        )
+        .replace("def visible._helper : Nat := 1", "def visible._helper : Nat := 2")
+        .replace(
+            "universe u\n\ndef universeNamed (α : Type u) : Type u := α",
+            "universe v\n\ndef universeNamed (α : Type v) : Type v := α",
         ),
         encoding="utf-8",
     )
@@ -1520,6 +1589,10 @@ def test_probe_semantics_cover_elaboration_and_the_full_trust_boundary(tmp_path:
     assert changed_match["signature"] == matched["signature"]
     assert changed_match["semantic"] != matched["semantic"]
     assert changed_match["trusted"] == []
+    changed_visible = changed["Skel.Semantics.visible"]
+    assert changed_visible["semantic"] == visible["semantic"]
+    assert changed_visible["trusted"][0]["semantic"] != helper_before
+    assert changed["Skel.Semantics.universeNamed"]["semantic"] == universe_before
 
     vendor = project / "Skel" / "Vendor.lean"
     vendor.write_text(

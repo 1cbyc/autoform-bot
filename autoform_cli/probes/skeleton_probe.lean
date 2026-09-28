@@ -20,7 +20,7 @@ namespace AutoformSkeleton
 
 /-- The probe-to-Python contract for elaborated declaration material. Bump this
 when the canonical expression encoding below changes. -/
-def semanticSchema := "autoform-lean-expr/v2"
+def semanticSchema := "autoform-lean-expr/v3"
 
 /-- Preserve the structure of a Lean name. `Name.toString` is deliberately not
 used: quoted components may themselves contain dots. -/
@@ -29,12 +29,18 @@ partial def nameJson : Name → Json
   | .str p s   => Json.mkObj [("str", Json.arr #[nameJson p, Json.str s])]
   | .num p n   => Json.mkObj [("num", Json.arr #[nameJson p, n])]
 
-partial def levelJson : Level → Json
+def levelParamIndex? : List Name → Name → Option Nat
+  | [], _ => none
+  | p :: ps, n => if p == n then some 0 else (levelParamIndex? ps n).map Nat.succ
+
+partial def levelJson (levelParams : List Name) : Level → Json
   | .zero     => Json.mkObj [("zero", Json.null)]
-  | .succ u   => Json.mkObj [("succ", levelJson u)]
-  | .max u v  => Json.mkObj [("max", Json.arr #[levelJson u, levelJson v])]
-  | .imax u v => Json.mkObj [("imax", Json.arr #[levelJson u, levelJson v])]
-  | .param n  => Json.mkObj [("param", nameJson n)]
+  | .succ u   => Json.mkObj [("succ", levelJson levelParams u)]
+  | .max u v  => Json.mkObj [("max", Json.arr #[levelJson levelParams u, levelJson levelParams v])]
+  | .imax u v => Json.mkObj [("imax", Json.arr #[levelJson levelParams u, levelJson levelParams v])]
+  | .param n  => match levelParamIndex? levelParams n with
+    | some i => Json.mkObj [("param", i)]
+    | none   => Json.mkObj [("unknownParam", nameJson n)]
   | .mvar id  => Json.mkObj [("mvar", nameJson id.name)]
 
 def binderInfoJson : BinderInfo → Json
@@ -50,39 +56,55 @@ def literalJson : Literal → Json
 /-- Canonical kernel expression material. Binder display names and metadata do
 not affect meaning, so they are omitted. Applications and implicit arguments
 remain explicit, which exposes macro expansions and synthesized instances. -/
-partial def exprJson : Expr → Json
+partial def exprJson (levelParams : List Name) : Expr → Json
   | .bvar i          => Json.mkObj [("bvar", i)]
   | .fvar id         => Json.mkObj [("fvar", nameJson id.name)]
   | .mvar id         => Json.mkObj [("mvar", nameJson id.name)]
-  | .sort u          => Json.mkObj [("sort", levelJson u)]
+  | .sort u          => Json.mkObj [("sort", levelJson levelParams u)]
   | .const n us      => Json.mkObj [
-      ("const", nameJson n), ("levels", Json.arr (us.toArray.map levelJson))]
-  | .app f a         => Json.mkObj [("app", Json.arr #[exprJson f, exprJson a])]
-  | .lam _ t b bi    => Json.mkObj [("lam", Json.arr #[binderInfoJson bi, exprJson t, exprJson b])]
+      ("const", nameJson n), ("levels", Json.arr (us.toArray.map (levelJson levelParams)))]
+  | .app f a         => Json.mkObj [("app", Json.arr #[exprJson levelParams f, exprJson levelParams a])]
+  | .lam _ t b bi    => Json.mkObj [
+      ("lam", Json.arr #[binderInfoJson bi, exprJson levelParams t, exprJson levelParams b])]
   | .forallE _ t b bi => Json.mkObj [
-      ("forall", Json.arr #[binderInfoJson bi, exprJson t, exprJson b])]
+      ("forall", Json.arr #[binderInfoJson bi, exprJson levelParams t, exprJson levelParams b])]
   | .letE _ t v b nd => Json.mkObj [
-      ("let", Json.arr #[Json.bool nd, exprJson t, exprJson v, exprJson b])]
+      ("let", Json.arr #[
+        Json.bool nd, exprJson levelParams t, exprJson levelParams v, exprJson levelParams b])]
   | .lit l           => Json.mkObj [("literal", literalJson l)]
-  | .mdata _ e       => exprJson e
+  | .mdata _ e       => exprJson levelParams e
   | .proj n i e      => Json.mkObj [
-      ("projection", Json.arr #[nameJson n, i, exprJson e])]
+      ("projection", Json.arr #[nameJson n, i, exprJson levelParams e])]
+
+def safetyJson (info : ConstantInfo) : Json :=
+  if info.isPartial then Json.str "partial"
+  else if info.isUnsafe then Json.str "unsafe"
+  else Json.str "safe"
 
 /-- Elaboration result whose exact bytes bind a review to kernel-visible
 meaning. The theorem proof is excluded; definition and opaque bodies are not. -/
 def semanticJson (env : Environment) (c : Name) : Json :=
   match env.find? c with
-  | some (.defnInfo v) => Json.mkObj [("type", exprJson v.type), ("value", exprJson v.value)]
-  | some (.opaqueInfo v) => Json.mkObj [("type", exprJson v.type), ("value", exprJson v.value)]
+  | some info@(.defnInfo v) => Json.mkObj [
+      ("safety", safetyJson info),
+      ("type", exprJson v.levelParams v.type),
+      ("value", exprJson v.levelParams v.value)]
+  | some info@(.opaqueInfo v) => Json.mkObj [
+      ("safety", safetyJson info),
+      ("type", exprJson v.levelParams v.type),
+      ("value", exprJson v.levelParams v.value)]
   | some (.inductInfo v) => Json.mkObj [
-      ("type", exprJson v.type),
+      ("safety", safetyJson (.inductInfo v)),
+      ("type", exprJson v.levelParams v.type),
       ("constructors", Json.arr <| v.ctors.toArray.map fun ctor =>
         Json.mkObj [
           ("name", nameJson ctor),
           ("type", match env.find? ctor with
-            | some info => exprJson info.type
+            | some info => exprJson info.levelParams info.type
             | none => Json.null)])]
-  | some info => Json.mkObj [("type", exprJson info.type)]
+  | some info => Json.mkObj [
+      ("safety", safetyJson info),
+      ("type", exprJson info.levelParams info.type)]
   | none => Json.null
 
 /-- Constants that fix the *meaning* of `c`: its type always, and its value only
@@ -95,15 +117,16 @@ def meaningConstants (env : Environment) (c : Name) : Array Name :=
   | some info            => info.type.getUsedConstants
   | none                 => #[]
 
-/-- Fold generated companions -- constructors, projections, recursors, matchers,
-equation lemmas -- onto the declaration a reader sees in the source. -/
+/-- Fold only declarations that Lean's environment proves are generated
+companions onto the declaration a reader sees in the source. Name spelling is
+not evidence: users may deliberately write names such as `visible._helper`. -/
 partial def canonical (env : Environment) (c : Name) : Name :=
   match env.find? c with
   | some (.ctorInfo v) => v.induct
-  | some (.recInfo _)  => canonical env c.getPrefix
+  | some (.recInfo v)  => canonical env v.getMajorInduct
   | _ =>
     if let some info := env.getProjectionFnInfo? c then canonical env info.ctorName
-    else if isAuxRecursor env c || isNoConfusion env c || Meta.isMatcherCore env c || c.isInternalDetail then
+    else if isAuxRecursor env c || isNoConfusion env c || Meta.isMatcherCore env c then
       if c.getPrefix != Name.anonymous && env.contains c.getPrefix then canonical env c.getPrefix else c
     else c
 
@@ -218,6 +241,14 @@ def openedNamespaces (lines : List String) (line : Nat) : List Name :=
         |>.map String.toName
     else []
 
+/-- Slice the exact half-open source range recorded by Lean. Positions use
+Unicode columns, so convert them through `FileMap` before slicing UTF-8 bytes. -/
+def sourceSlice (text : String) (r : DeclarationRange) : String :=
+  let fileMap := text.toFileMap
+  let startPos := fileMap.ofPosition r.pos
+  let endPos := fileMap.ofPosition r.endPos
+  String.fromUTF8! (text.toUTF8.extract startPos.byteIdx endPos.byteIdx)
+
 /-- Capture a declaration from the same source snapshot the probe inspects.
 The surrounding source-tree guard rejects concurrent edits. -/
 def declarationSource (c : Name) : CommandElabM (Option String) := do
@@ -228,9 +259,7 @@ def declarationSource (c : Name) : CommandElabM (Option String) := do
   let sp ← getSrcSearchPath
   let some path ← sp.findWithExt "lean" mod | return none
   let text ← IO.FS.readFile path
-  let lines := text.splitOn "\n"
-  return some <| "\n".intercalate
-    (lines.drop (r.range.pos.line - 1) |>.take (r.range.endPos.line - r.range.pos.line + 1))
+  return some (sourceSlice text r.range)
 
 /-- The declaration's source up to its value: the statement as written, without
 the proof. Parsed with Lean's own parser rather than cut by pattern matching. -/
@@ -243,7 +272,7 @@ def statementSource (root : Name) : CommandElabM (Option String) := do
   let some path ← sp.findWithExt "lean" mod | return none
   let text ← IO.FS.readFile path
   let lines := text.splitOn "\n"
-  let snippet := "\n".intercalate (lines.drop (r.range.pos.line - 1) |>.take (r.range.endPos.line - r.range.pos.line + 1))
+  let snippet := sourceSlice text r.range
   -- `activateScoped` mutates the environment. Isolate those parser-only changes
   -- so one requested declaration cannot change how the next one is parsed.
   withEnv env do
@@ -257,7 +286,10 @@ def statementSource (root : Name) : CommandElabM (Option String) := do
       let val := (findKind? decl ``Parser.Command.declValSimple).orElse fun _ =>
         (findKind? decl ``Parser.Command.declValEqns).orElse fun _ =>
           findKind? decl ``Parser.Command.whereStructInst
-      let some v := val | return none
+      let some v := val | do
+        if kindOf env root == "axiom" then
+          return some snippet.trimAsciiEnd.toString
+        return none
       let some pos := v.getPos? | return none
       -- `pos` is a byte position: cut by bytes, not by characters, or every `∀`
       -- before the value pushes the cut past it.
