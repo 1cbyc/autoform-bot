@@ -155,6 +155,12 @@ def test_comment_stripping_preserves_comment_markers_inside_strings() -> None:
     )
 
 
+def test_comment_stripping_reads_slash_dash_dash_slash_as_a_docstring() -> None:
+    # Lean reads `/--` as a docstring opener, so `/--/ ... -/` is one comment.
+    assert strip_lean_comments("/--/ KEEPOUT -/\ndef d : Nat := 6") == "def d : Nat := 6"
+    assert strip_lean_comments("/-!/ KEEPOUT -/\ndef d : Nat := 6") == "def d : Nat := 6"
+
+
 def test_permalink_pins_the_commit(tmp_path: Path) -> None:
     linker = SourceLinker(
         index=_index(tmp_path),

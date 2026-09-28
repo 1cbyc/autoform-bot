@@ -308,7 +308,9 @@ def _without_lean_comments(text: str) -> str:
         if pair == "/-":
             block_depth = 1
             out.append(" ")
-            index += 2
+            # `/--` and `/-!` open a docstring whose body starts after the
+            # marker, so `/--/ text -/` is closed only by the final `-/`.
+            index += 3 if text[index + 2 : index + 3] in {"-", "!"} else 2
             continue
         if context.kind == "interpolation":
             if text[index] == "{":
