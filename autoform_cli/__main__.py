@@ -401,7 +401,7 @@ def _skeleton(args: argparse.Namespace) -> int:
             file=stream,
         )
         for issue in report.unresolved:
-            print(f"error: {issue}", file=stream)
+            print(f"error: {issue.message}", file=stream)
     elif args.json:
         print(report.to_json())
     else:

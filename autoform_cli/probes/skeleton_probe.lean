@@ -385,10 +385,14 @@ def skeleton
     if let some mod := moduleOf env c then
       if !boundaryModules.contains mod then boundaryModules := boundaryModules.push mod
   let mut boundaryModuleFiles : Array Json := #[]
+  -- `.olean` bytes embed checkout paths. Exact source bytes plus the reported
+  -- Lean version provide a stable identity and still rotate on every edit.
+  let sourceSearchPath ← getSrcSearchPath
   for mod in boundaryModules.qsort Name.lt do
-    let path ← findOLean mod
+    let some path ← sourceSearchPath.findModuleWithExt "lean" mod
+      | throwError "source unavailable for boundary module {{mod}}"
     boundaryModuleFiles := boundaryModuleFiles.push <| Json.arr #[
-      Json.str (toString mod), Json.str "olean", Json.str path.toString]
+      Json.str (toString mod), Json.str "lean", Json.str path.toString]
   let mut items : Array Json := #[]
   for c in trusted.qsort Name.lt do
     let deps := (edges.find? (·.1 == c)).map (·.2) |>.getD #[]

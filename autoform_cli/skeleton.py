@@ -58,7 +58,7 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
-SKELETON_SCHEMA = "autoform-skeleton/v2"
+SKELETON_SCHEMA = "autoform-skeleton/v3"
 SEMANTIC_SCHEMA = "autoform-lean-expr/v3"
 
 #: Every line the probe wants read back starts with this marker, so Lean's own
@@ -331,17 +331,52 @@ class NodeSkeleton:
 
 
 @dataclass(frozen=True, slots=True)
+class UnresolvedTarget:
+    """One selected blueprint declaration for which no skeleton was produced."""
+
+    node_id: str
+    declaration: str
+    reason: str
+
+    @property
+    def message(self) -> str:
+        return f"{self.node_id}: {self.declaration}: {self.reason}"
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "declaration": self.declaration,
+            "node_id": self.node_id,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class SkeletonReport:
     """Every skeleton the blueprint names, in article order."""
 
+    blueprint_hash: str
+    targets: tuple[tuple[str, tuple[str, ...]], ...]
+    selection: str
+    selected_nodes: tuple[str, ...]
     nodes: tuple[NodeSkeleton, ...]
-    unresolved: tuple[str, ...]
+    unresolved: tuple[UnresolvedTarget, ...]
     schema: str = SKELETON_SCHEMA
     semantic_schema: str = SEMANTIC_SCHEMA
 
     @property
     def clean(self) -> bool:
-        return not self.unresolved
+        expected = {
+            (node_id, declaration)
+            for node_id, declarations in self.targets
+            if node_id in self.selected_nodes
+            for declaration in declarations
+        }
+        actual = {
+            (node.node_id, declaration.name)
+            for node in self.nodes
+            for declaration in node.declarations
+        }
+        return not self.unresolved and actual == expected
 
     def node(self, node_id: str) -> NodeSkeleton | None:
         """Return the skeleton record of one article, if it has one."""
@@ -356,10 +391,21 @@ class SkeletonReport:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "blueprint_hash": self.blueprint_hash,
             "nodes": [node.as_dict() for node in self.nodes],
             "schema": self.schema,
+            "selection": {
+                "mode": self.selection,
+                "node_count": len(self.selected_nodes),
+                "nodes": list(self.selected_nodes),
+            },
             "semantic_schema": self.semantic_schema,
-            "unresolved": list(self.unresolved),
+            "target_count": len(self.targets),
+            "targets": [
+                {"declarations": list(declarations), "node_id": node_id}
+                for node_id, declarations in self.targets
+            ],
+            "unresolved": [issue.as_dict() for issue in self.unresolved],
         }
 
     def to_json(self) -> str:
@@ -377,20 +423,120 @@ def load_skeleton_report(path: str | Path) -> SkeletonReport:
         not isinstance(data, dict)
         or data.get("schema") != SKELETON_SCHEMA
         or data.get("semantic_schema") != SEMANTIC_SCHEMA
-        or data.keys() != {"nodes", "schema", "semantic_schema", "unresolved"}
+        or data.keys()
+        != {
+            "blueprint_hash",
+            "nodes",
+            "schema",
+            "selection",
+            "semantic_schema",
+            "target_count",
+            "targets",
+            "unresolved",
+        }
     ):
         raise SkeletonError([f"{path} is not an {SKELETON_SCHEMA} report"])
-    raw_nodes = data["nodes"]
-    unresolved = data["unresolved"]
-    if not isinstance(raw_nodes, list) or not isinstance(unresolved, list) or not all(
-        isinstance(issue, str) for issue in unresolved
+    blueprint_hash = data["blueprint_hash"]
+    if not isinstance(blueprint_hash, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", blueprint_hash
     ):
+        raise SkeletonError([f"{path} contains an invalid blueprint hash"])
+    targets = _report_targets(data["targets"])
+    if type(data["target_count"]) is not int or data["target_count"] != len(targets):
+        raise SkeletonError([f"{path} contains an invalid target count"])
+    selection = data["selection"]
+    if not isinstance(selection, dict) or selection.keys() != {"mode", "node_count", "nodes"}:
+        raise SkeletonError([f"{path} contains malformed skeleton selection data"])
+    mode = selection["mode"]
+    if mode not in {"all", "filtered"}:
+        raise SkeletonError([f"{path} contains an invalid skeleton selection mode"])
+    selected_nodes = _report_string_tuple(selection["nodes"], "selected articles")
+    if type(selection["node_count"]) is not int or selection["node_count"] != len(
+        selected_nodes
+    ):
+        raise SkeletonError([f"{path} contains an invalid selected article count"])
+    target_ids = tuple(node_id for node_id, _ in targets)
+    if tuple(sorted(selected_nodes)) != selected_nodes or not set(selected_nodes) <= set(target_ids):
+        raise SkeletonError([f"{path} contains an invalid skeleton article selection"])
+    if mode == "all" and selected_nodes != target_ids:
+        raise SkeletonError([f"{path} contains an incomplete all-article selection"])
+    if mode == "filtered" and not selected_nodes:
+        raise SkeletonError([f"{path} contains an empty filtered article selection"])
+    raw_nodes = data["nodes"]
+    unresolved = _report_unresolved(data["unresolved"])
+    if not isinstance(raw_nodes, list):
         raise SkeletonError([f"{path} contains malformed skeleton report data"])
     nodes = tuple(_node_from_dict(node) for node in raw_nodes)
     if len({node.node_id for node in nodes}) != len(nodes):
         raise SkeletonError([f"{path} contains duplicate skeleton article ids"])
-    report = SkeletonReport(nodes=nodes, unresolved=tuple(unresolved))
+    if tuple(node.node_id for node in nodes) != selected_nodes:
+        raise SkeletonError([f"{path} does not contain exactly its selected articles"])
+    declarations_by_node = dict(targets)
+    actual_targets: set[tuple[str, str]] = set()
+    for node in nodes:
+        expected = declarations_by_node[node.node_id]
+        actual = tuple(declaration.name for declaration in node.declarations)
+        if not set(actual) <= set(expected):
+            raise SkeletonError([f"{path} contains an untargeted declaration for {node.node_id}"])
+        actual_targets.update((node.node_id, declaration) for declaration in actual)
+    expected_targets = {
+        (node_id, declaration)
+        for node_id, declarations in targets
+        if node_id in selected_nodes
+        for declaration in declarations
+    }
+    unresolved_targets = {(issue.node_id, issue.declaration) for issue in unresolved}
+    if unresolved_targets != expected_targets - actual_targets:
+        raise SkeletonError([f"{path} contains mismatched unresolved declarations"])
+    report = SkeletonReport(
+        blueprint_hash=blueprint_hash,
+        targets=targets,
+        selection=mode,
+        selected_nodes=selected_nodes,
+        nodes=nodes,
+        unresolved=unresolved,
+    )
     return report
+
+
+def _report_targets(value: object) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if not isinstance(value, list):
+        raise SkeletonError(["malformed targets in skeleton report"])
+    targets: list[tuple[str, tuple[str, ...]]] = []
+    for item in value:
+        if not isinstance(item, dict) or item.keys() != {"declarations", "node_id"}:
+            raise SkeletonError(["malformed target in skeleton report"])
+        node_id = _report_string(item["node_id"], "target article id")
+        declarations = _report_string_tuple(
+            item["declarations"], f"target declarations for {node_id}"
+        )
+        if not declarations:
+            raise SkeletonError([f"empty target declarations for {node_id} in skeleton report"])
+        targets.append((node_id, declarations))
+    target_ids = tuple(node_id for node_id, _ in targets)
+    if tuple(sorted(target_ids)) != target_ids or len(set(target_ids)) != len(target_ids):
+        raise SkeletonError(["invalid target article order in skeleton report"])
+    return tuple(targets)
+
+
+def _report_unresolved(value: object) -> tuple[UnresolvedTarget, ...]:
+    if not isinstance(value, list):
+        raise SkeletonError(["malformed unresolved declarations in skeleton report"])
+    unresolved: list[UnresolvedTarget] = []
+    for item in value:
+        if not isinstance(item, dict) or item.keys() != {"declaration", "node_id", "reason"}:
+            raise SkeletonError(["malformed unresolved declaration in skeleton report"])
+        unresolved.append(
+            UnresolvedTarget(
+                node_id=_report_string(item["node_id"], "unresolved article id"),
+                declaration=_report_string(item["declaration"], "unresolved declaration"),
+                reason=_report_string(item["reason"], "unresolved reason"),
+            )
+        )
+    keys = tuple((issue.node_id, issue.declaration) for issue in unresolved)
+    if len(set(keys)) != len(keys) or tuple(sorted(keys)) != keys:
+        raise SkeletonError(["invalid unresolved declaration order in skeleton report"])
+    return tuple(unresolved)
 
 
 _NODE_REPORT_FIELDS = frozenset(
@@ -710,6 +856,15 @@ def _graph_snapshot(graph: Graph) -> tuple[tuple[str, str, str], ...]:
         )
         for node in sorted(graph.nodes.values(), key=lambda item: item.id)
     )
+
+
+def _blueprint_hash(graph: Graph) -> str:
+    """Identify the exact, path-independent blueprint snapshot behind a report."""
+
+    material = json.dumps(
+        _graph_snapshot(graph), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return _sha256_id(material.encode("utf-8"))
 
 
 def _remember_descendants(
@@ -1615,7 +1770,7 @@ def _module_file_entries(value: object, *, context: str) -> tuple[tuple[str, str
             not isinstance(item, list)
             or len(item) != 3
             or not all(isinstance(part, str) and part for part in item)
-            or item[1] != "olean"
+            or item[1] != "lean"
         ):
             raise SkeletonError([f"invalid assumed module files for {context}"])
         entries.append((item[0], item[1], item[2]))
@@ -1635,6 +1790,8 @@ def _hash_module_files(
     cache: dict[tuple[str, str], str],
     snapshot_started_ns: int | None = None,
 ) -> tuple[tuple[str, str, str], ...]:
+    """Hash boundary source bytes without allowing their checkout paths into the digest."""
+
     identities: list[tuple[str, str, str]] = []
     for module, file_kind, raw_path in _module_file_entries(value, context="probe output"):
         path = Path(raw_path)
@@ -1758,27 +1915,65 @@ def extract_graph_skeletons(
 ) -> SkeletonReport:
     """Extract skeletons for an already loaded graph."""
 
-    selected = [graph.nodes[node_id] for node_id in sorted(graph.nodes) if graph.nodes[node_id].lean]
+    targets: list[tuple[Node, tuple[str, ...]]] = []
+    target_issues: list[str] = []
+    for node_id in sorted(graph.nodes):
+        node = graph.nodes[node_id]
+        if not node.lean:
+            continue
+        names = tuple(declaration_names(node.lean))
+        if not names:
+            target_issues.append(f"{node.id}: lean target list contains no declarations")
+        elif len(names) != len(set(names)):
+            duplicates = sorted({name for name in names if names.count(name) > 1})
+            target_issues.append(
+                f"{node.id}: duplicate Lean declaration target(s): {', '.join(duplicates)}"
+            )
+        else:
+            targets.append((node, names))
+    if target_issues:
+        raise SkeletonError(target_issues)
+    target_ids = {node.id for node, _ in targets}
+    selected = targets
+    selection = "all"
     if node_ids is not None:
+        if not node_ids:
+            raise SkeletonError(["no articles selected"])
+        if len(node_ids) != len(set(node_ids)):
+            raise SkeletonError(["duplicate article selection"])
         wanted = set(node_ids)
         unknown = sorted(wanted - set(graph.nodes))
         if unknown:
             raise SkeletonError([f"unknown article: {node_id}" for node_id in unknown])
-        selected = [node for node in selected if node.id in wanted]
-    passages = {node.id: source_passage(node, graph.blueprint_dir) for node in selected}
+        untargeted = sorted(wanted - target_ids)
+        if untargeted:
+            raise SkeletonError(
+                [f"{node_id}: article has no Lean declaration targets" for node_id in untargeted]
+            )
+        selected = [(node, names) for node, names in selected if node.id in wanted]
+        selection = "filtered"
+    passages = {node.id: source_passage(node, graph.blueprint_dir) for node, _ in selected}
 
-    unresolved: list[str] = []
+    unresolved: list[UnresolvedTarget] = []
     imports: set[str] = set()
     roots: list[str] = []
-    for node in selected:
-        for name in declaration_names(node.lean or ""):
+    for node, names in selected:
+        for name in names:
             location = index.find(name)
             module = None if location is None else module_of(lean_root / location.path, libraries)
             if location is None:
-                unresolved.append(f"{node.id}: declaration not found in the Lean sources: {name}")
+                unresolved.append(
+                    UnresolvedTarget(node.id, name, "declaration not found in the Lean sources")
+                )
                 continue
             if module is None:
-                unresolved.append(f"{node.id}: {name} is in {location.path.as_posix()}, which no library target builds")
+                unresolved.append(
+                    UnresolvedTarget(
+                        node.id,
+                        name,
+                        f"source {location.path.as_posix()} is not built by any library target",
+                    )
+                )
                 continue
             imports.add(module)
             if name not in roots:
@@ -1797,17 +1992,23 @@ def extract_graph_skeletons(
 
     nodes: list[NodeSkeleton] = []
     module_hashes: dict[tuple[str, str], str] = {}
-    for node in selected:
+    for node, names in selected:
         declarations: list[DeclarationSkeleton] = []
-        for name in declaration_names(node.lean or ""):
+        for name in names:
             if name not in roots:
                 continue
             record = records.get(name)
             if record is None:
-                unresolved.append(f"{node.id}: the probe returned nothing for {name}")
+                unresolved.append(UnresolvedTarget(node.id, name, "the probe returned no record"))
                 continue
             if not record.get("found"):
-                unresolved.append(f"{node.id}: {name} is not in the built environment; run `lake build`")
+                unresolved.append(
+                    UnresolvedTarget(
+                        node.id,
+                        name,
+                        "not in the built environment; run `lake build`",
+                    )
+                )
                 continue
             declarations.append(
                 _declaration(
@@ -1829,7 +2030,19 @@ def extract_graph_skeletons(
                 passage_locator=locator,
             )
         )
-    return SkeletonReport(nodes=tuple(nodes), unresolved=tuple(sorted(set(unresolved))))
+    return SkeletonReport(
+        blueprint_hash=_blueprint_hash(graph),
+        targets=tuple((node.id, names) for node, names in targets),
+        selection=selection,
+        selected_nodes=tuple(node.id for node, _ in selected),
+        nodes=tuple(nodes),
+        unresolved=tuple(
+            sorted(
+                set(unresolved),
+                key=lambda issue: (issue.node_id, issue.declaration, issue.reason),
+            )
+        ),
+    )
 
 
 _TRAILING_VALUE = re.compile(r"(?::=\s*(?:by)?|\bwhere)\s*\Z")
@@ -2083,7 +2296,7 @@ def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> s
             out.append(f"== {node.node_id} · no skeleton")
             out.append("")
     for issue in report.unresolved:
-        out.append(f"error: {issue}")
+        out.append(f"error: {issue.message}")
     return "\n".join(out).rstrip("\n") + "\n"
 
 

@@ -22,6 +22,7 @@ from autoform_cli.skeleton import (
     SKELETON_SCHEMA,
     SkeletonReport,
     SkeletonError,
+    UnresolvedTarget,
     _install_output,
     _join_readers,
     _remove_output,
@@ -169,7 +170,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             trusted=[non_ambiguous, observation, eligible],
             assumed=["Mathlib.Fake"],
             assumed_semantics=[["Mathlib.Fake", _semantic({"type": {"sort": {"zero": None}}})]],
-            boundary_modules=[["Mathlib.Fake", "olean", "Skel/Defs.lean"]],
+            boundary_modules=[["Mathlib.Fake", "lean", "Skel/Defs.lean"]],
             axioms=["sorryAx"],
             axiom_semantics=[["sorryAx", _semantic({"type": {"sort": {"zero": None}}})]],
         ),
@@ -696,15 +697,35 @@ def test_skeleton_hash_uses_elaborated_semantics_not_source_formatting(tmp_path:
     assert hidden_assumption.hash != declaration.hash
 
 
-def test_assumed_module_identity_rejects_a_concurrent_rebuild(tmp_path: Path) -> None:
-    artifact = tmp_path / "External.olean"
+def test_assumed_module_identity_is_path_independent_and_rejects_a_concurrent_edit(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "first" / "External.lean"
+    other = tmp_path / "second" / "External.lean"
+    artifact.parent.mkdir()
+    other.parent.mkdir()
     artifact.write_bytes(b"old")
+    other.write_bytes(b"old")
+    first = _hash_module_files(
+        [["External", "lean", str(artifact)]], lean_root=tmp_path, cache={}
+    )
+    second = _hash_module_files(
+        [["External", "lean", str(other)]], lean_root=tmp_path, cache={}
+    )
+    assert first == second
+
+    other.write_bytes(b"different source")
+    changed = _hash_module_files(
+        [["External", "lean", str(other)]], lean_root=tmp_path, cache={}
+    )
+    assert changed != first
+
     started = time.time_ns()
     artifact.write_bytes(b"new")
 
     with pytest.raises(SkeletonError, match="changed during skeleton extraction"):
         _hash_module_files(
-            [["External", "olean", str(artifact)]],
+            [["External", "lean", str(artifact)]],
             lean_root=tmp_path,
             cache={},
             snapshot_started_ns=started,
@@ -763,9 +784,9 @@ def test_extraction_reports_names_the_sources_and_the_environment_lack(tmp_path:
     )
 
     assert not report.clean
-    assert report.unresolved == (
-        "basics/ghost: Skel.ghost is not in the built environment; run `lake build`",
-        "basics/phantom: declaration not found in the Lean sources: Skel.doesNotExist",
+    assert tuple(issue.message for issue in report.unresolved) == (
+        "basics/ghost: Skel.ghost: not in the built environment; run `lake build`",
+        "basics/phantom: Skel.doesNotExist: declaration not found in the Lean sources",
     )
     assert [node.node_id for node in report.nodes] == ["basics/determined", "basics/ghost", "basics/phantom"]
     assert report.nodes[1].declarations == ()
@@ -780,7 +801,9 @@ def test_extraction_never_runs_lean_when_nothing_resolves(tmp_path: Path) -> Non
 
     report = extract_skeletons(blueprint, lean_root=project, runner=runner)
 
-    assert report.unresolved == ("basics/phantom: declaration not found in the Lean sources: Skel.doesNotExist",)
+    assert tuple(issue.message for issue in report.unresolved) == (
+        "basics/phantom: Skel.doesNotExist: declaration not found in the Lean sources",
+    )
 
 
 def test_default_extraction_rejects_sources_changed_during_probe(tmp_path: Path, monkeypatch) -> None:
@@ -881,6 +904,85 @@ def test_node_selection_rejects_unknown_articles(tmp_path: Path) -> None:
     assert caught.value.issues == ("unknown article: basics/nope",)
 
 
+@pytest.mark.parametrize("targets", [", ,", "Skel.observation_determined, Skel.observation_determined"])
+def test_extraction_rejects_empty_or_duplicate_declaration_targets(
+    tmp_path: Path, targets: str
+) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": targets})
+
+    def runner(probe: str, lean_root: Path) -> str:
+        raise AssertionError("invalid targets must be rejected before running Lean")
+
+    with pytest.raises(SkeletonError, match="lean target list|duplicate Lean declaration"):
+        extract_skeletons(blueprint, lean_root=project, runner=runner)
+
+
+def test_node_selection_rejects_an_article_without_declarations(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    article = blueprint / "roadmap" / "basics" / "notes.md"
+    article.write_text("# Notes\n\nNo formal declaration.\n", encoding="utf-8")
+
+    with pytest.raises(SkeletonError, match="article has no Lean declaration targets"):
+        extract_skeletons(
+            blueprint,
+            lean_root=project,
+            runner=lambda p, r: "",
+            node_ids=("basics/notes",),
+        )
+
+
+def test_report_distinguishes_full_and_filtered_blueprint_scope(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(
+        tmp_path,
+        lean={
+            "first": "Skel.observation_determined",
+            "second": "Skel.observation_determined",
+        },
+    )
+
+    def runner(probe: str, root: Path) -> str:
+        return _fake_probe_output()
+
+    full = extract_skeletons(blueprint, lean_root=project, runner=runner)
+    filtered = extract_skeletons(
+        blueprint,
+        lean_root=project,
+        runner=runner,
+        node_ids=("basics/first",),
+    )
+
+    assert full.blueprint_hash == filtered.blueprint_hash
+    assert full.targets == filtered.targets
+    assert full.selection == "all"
+    assert full.selected_nodes == ("basics/first", "basics/second")
+    assert filtered.selection == "filtered"
+    assert filtered.selected_nodes == ("basics/first",)
+    assert full.to_json() != filtered.to_json()
+
+
+def test_report_is_identical_across_checkout_roots(tmp_path: Path) -> None:
+    reports = []
+    for name in ("first", "second"):
+        checkout = tmp_path / name
+        checkout.mkdir()
+        project = _project(checkout)
+        blueprint = _blueprint(
+            checkout, lean={"determined": "Skel.observation_determined"}
+        )
+        reports.append(
+            extract_skeletons(
+                blueprint,
+                lean_root=project,
+                runner=lambda probe, root: _fake_probe_output(),
+            )
+        )
+
+    assert reports[0].to_json() == reports[1].to_json()
+
+
 def test_report_round_trips_through_json_deterministically(tmp_path: Path) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
@@ -899,10 +1001,39 @@ def test_report_round_trips_through_json_deterministically(tmp_path: Path) -> No
     with pytest.raises(SkeletonError):
         load_skeleton_report(path)
 
-    legacy = report.as_dict()
-    legacy["schema"] = "autoform-skeleton/v1"
-    path.write_text(json.dumps(legacy), encoding="utf-8")
-    with pytest.raises(SkeletonError):
+    for schema in ("autoform-skeleton/v1", "autoform-skeleton/v2"):
+        legacy = report.as_dict()
+        legacy["schema"] = schema
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        with pytest.raises(SkeletonError):
+            load_skeleton_report(path)
+
+
+def test_report_loader_rejects_scope_tampering(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
+    path = tmp_path / "skeleton.json"
+
+    payload = report.as_dict()
+    payload["target_count"] = 0
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SkeletonError, match="target count"):
+        load_skeleton_report(path)
+
+    payload = report.as_dict()
+    payload["nodes"][0] = replace(report.nodes[0], declarations=()).as_dict()
+    payload["unresolved"] = [
+        {"declaration": "made.up", "node_id": "basics/determined", "reason": "missing"}
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SkeletonError, match="mismatched unresolved declarations"):
+        load_skeleton_report(path)
+
+    payload = report.as_dict()
+    payload["targets"][0]["declarations"].append("Skel.observation_determined")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SkeletonError, match="duplicate target declarations"):
         load_skeleton_report(path)
 
 
@@ -980,7 +1111,7 @@ def test_cli_writes_the_artifact_and_fails_on_unresolved_names(tmp_path: Path, c
     out = capsys.readouterr().out
     assert out.splitlines() == [
         f"{output}: 1 skeleton(s) for 2 article(s)",
-        "error: basics/phantom: declaration not found in the Lean sources: Skel.doesNotExist",
+        "error: basics/phantom: Skel.doesNotExist: declaration not found in the Lean sources",
     ]
     assert load_skeleton_report(output).nodes[0].node_id == "basics/determined"
 
@@ -1758,7 +1889,12 @@ def test_packet_publication_refuses_an_incomplete_report(tmp_path: Path) -> None
         lean_root=project,
         runner=lambda probe, root: _fake_probe_output(),
     )
-    incomplete = replace(report, unresolved=("missing declaration",))
+    incomplete = replace(
+        report,
+        unresolved=(
+            UnresolvedTarget("basics/determined", "Skel.observation_determined", "missing"),
+        ),
+    )
     packets = tmp_path / "packets"
 
     with pytest.raises(SkeletonError, match="incomplete skeleton report"):
@@ -1838,9 +1974,7 @@ def test_packet_publication_refuses_unmanaged_or_symlink_output(tmp_path: Path) 
 
     fake_managed = tmp_path / "fake-managed"
     fake_managed.mkdir()
-    (fake_managed / PACKET_MANIFEST).write_text(
-        SkeletonReport(nodes=(), unresolved=()).to_json(), encoding="utf-8"
-    )
+    (fake_managed / PACKET_MANIFEST).write_text(report.to_json(), encoding="utf-8")
     valuable = fake_managed / "valuable.txt"
     valuable.write_text("keep me\n", encoding="utf-8")
     with pytest.raises(SkeletonError, match="non-Autoform packet output"):
@@ -1856,6 +1990,7 @@ def test_packet_filenames_cannot_collide_by_case_or_with_article_packet(tmp_path
     declaration = node.declarations[0]
     report = replace(
         report,
+        targets=((node.node_id, ("Foo.x", "foo.x", "article")),),
         nodes=(
             replace(
                 node,

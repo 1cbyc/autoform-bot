@@ -308,21 +308,23 @@ declaration the reader sees in the source, so a structure appears once, as its
 `structure` block. Names outside the project are the trusted base and are not
 expanded. The command exits nonzero when a `lean:` name is absent from the
 sources or from the built environment, and it writes nothing into the vault;
-`--output` records the `autoform-skeleton/v2` report, which contains no
+`--output` records the `autoform-skeleton/v3` report, which contains no
 timestamp or absolute path, for a later render or review to consume. The
-report quotes each trusted definition's source and records theorem
+report identifies the exact blueprint, its complete target set, and whether
+the extraction covered all targets or an explicit `--node` selection. It
+quotes each trusted definition's source and records theorem
 dependencies by elaborated signature, so it stands on its own without ever
 copying a theorem proof.
 
 Every skeleton carries a full SHA-256 **hash** of its meaning. It is derived
 from canonical elaborated expressions for the root, every trusted declaration,
 each direct external assumption, and each axiom, together with the dependency
-edges, Lean version, and compiled-module identities for the transitive external
+edges, Lean version, and source identities for the transitive external
 boundary. Local source spelling and comments do not enter the semantic hash,
 while macro expansion, synthesized instance bodies, types, and definition
 bodies do. Compiler-generated matcher and recursor bodies stay in that hash
 even though they are folded out of the human reading list. Because external
-modules are bound as compiled artifacts, an unrelated change in one of those
+modules are bound as exact source files, an unrelated change in one of those
 modules may conservatively rotate the hash.
 An article with several `lean:` names has one hash over all of them, printed as
 the article skeleton. The hash is how packets and reports are compared across
