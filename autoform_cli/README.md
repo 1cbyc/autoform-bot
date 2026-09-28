@@ -285,11 +285,13 @@ declaration is the reading list a person needs to agree that the Lean says what
 the article claims: the elaborated signature, then every project declaration
 the *statement* rests on, transitively, quoted from the sources in dependency
 order. A definition contributes its body as well as its type, because the body
-is part of its meaning; a theorem met along the way contributes only its type.
-Proofs are never entered. The proof beneath a skeleton may be orders of
-magnitude longer, and it is the kernel's to check, not the reader's. Each
-skeleton also reports the axioms the declaration finally rests on, so a `sorry`
-shows up as `sorryAx` beside the statement rather than under it, and the
+is part of its meaning; a theorem met along the way contributes only its type
+to the packet. Proof bodies are never emitted. Lean's axiom analysis does
+inspect proof metadata, so changing a proof can change the reported trust
+context. The proof beneath a skeleton may be orders of magnitude longer, and it
+is the kernel's to check, not the reader's. Each skeleton also reports the
+axioms the declaration finally rests on, so a `sorry` shows up as `sorryAx`
+beside the statement, and the
 non-core constants it assumes from Mathlib or another dependency, listed by
 name so a reader can see that a statement uses the library's notion of a limit
 rather than a homemade one.
@@ -299,8 +301,7 @@ command that runs Lean: it writes a small probe and runs it with
 `lake env lean` against the built project. Before the probe, Lake must confirm
 without rebuilding that every imported module matches its exact source inputs;
 a missing `lake-manifest.json`, stale artifacts, or a source tree that changes
-during extraction makes the command fail. A lexical closure would
-miss what
+during extraction makes the command fail. A lexical closure would miss what
 `open`, notation, implicit instances, and auto-bound variables bring in, and
 every miss silently shrinks the surface a reader is told to trust. Constructors,
 projections, recursors, matchers, and equation lemmas are folded onto the
@@ -316,26 +317,31 @@ quotes each trusted definition's source and records theorem
 dependencies by elaborated signature, so it stands on its own without ever
 copying a theorem proof.
 
-Every skeleton carries a full SHA-256 **hash** of its meaning. It is derived
-from canonical elaborated expressions for the root, every trusted declaration,
-each direct external assumption, and each axiom, together with the dependency
-edges, Lean version, and source identities for the transitive external
-boundary. Local source spelling and comments do not enter the semantic hash,
-while macro expansion, synthesized instance bodies, types, and definition
-bodies do. Compiler-generated matcher and recursor bodies stay in that hash
-even though they are folded out of the human reading list. Because external
-modules are bound as exact source files, an unrelated change in one of those
-modules may conservatively rotate the hash.
-An article with several `lean:` names has one hash over all of them, printed as
-the article skeleton. The hash is how packets and reports are compared across
-builds, and testimony written about a packet can name the skeleton it was
-written about.
+Run skeleton extraction only in a trusted checkout or an operating-system
+sandbox. Lake evaluates `lakefile.lean`, and the generated probe imports project
+code whose initializers, macros, and metaprograms may perform arbitrary IO and
+can forge probe output. The timeout and output cap bound the direct batch
+command; on POSIX, Autoform also terminates its process group. They are resource
+controls, not a security or authenticity boundary.
 
-Reports and packet manifests also carry an evidence hash over the exact
-proof-free text shown to a reviewer. Semantic hashes survive presentation-only
-edits; evidence hashes ensure an approval is attached to the bytes that were
-actually reviewed. An article review hash additionally binds the joint packet
-to the cited passage and its locator.
+Every skeleton carries a full SHA-256 **drift hash**. It is derived from
+canonical elaborated expressions for the root, every trusted declaration, each
+direct external assumption, and each axiom, together with the dependency edges,
+Lean version, and source identities for the transitive external boundary. Local
+source spelling and comments do not enter the hash, while macro expansion,
+synthesized instance bodies, types, and definition bodies do. Proof axioms,
+toolchain changes, and unrelated edits in an external source module may also
+rotate it. Compiler-generated matcher and recursor bodies stay in the hash even
+though they are folded out of the human reading list.
+An article with several `lean:` names has one hash over all of them, printed as
+the article skeleton. It compares reports across builds; it is not a stable
+statement identifier, reviewer authentication, or an approval key.
+
+Reports and packet manifests also carry an evidence hash over the exact packet
+shown to a reviewer. It identifies those bytes but does not authenticate who
+reviewed them. An article review hash additionally binds the joint packet to the
+cited passage and its locator. All three are advisory provenance checksums when
+candidate code controls the checkout.
 
 `--packets DIR` writes one comment-stripped packet per skeleton, with a
 manifest mapping packets to articles and hashes. The destination must be empty
@@ -344,6 +350,12 @@ tree, so removed declarations cannot leave stale packets behind. A concurrent
 change detected before commit aborts publication instead of being overwritten.
 If the isolated old tree changes later, Autoform preserves it at a reported
 recovery path instead of deleting it.
+
+An unresolved selected declaration makes the report incomplete and prevents
+all packet and passage publication; `--output` alone can still record that
+diagnostic report. Output destinations must be disjoint and non-symlinked, and
+their parent filesystems must support the temporary files, hard links, and
+atomic renames used for guarded replacement.
 
 A packet holds only what a blind auditor may see: the signature, the statement
 as written, and the source of every project definition it rests on, with every
@@ -362,8 +374,8 @@ non-Markdown file inside the blueprint with a `#L<start>-L<end>` fragment, for
 example `../../../sources/lebl-ra/ch-real-nums.tex#L693-L714`, names the exact
 text the statement came from. `--passages DIR` writes those passages beside
 the packets, one per article, in a separate, disjoint managed directory. It
-requires `--packets`. Each article directory
-also holds `article.lean`, the joint packet of every declaration the article
+requires `--packets`. Each article directory also holds `article.lean`, the
+joint packet of every declaration the article
 names, because a source theorem is often formalized by several declarations
 together and each alone is honestly incomplete. A judge of faithfulness is
 given the article packet and its passage; an auditor asked what one

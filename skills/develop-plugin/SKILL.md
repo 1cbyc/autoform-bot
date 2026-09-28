@@ -1,18 +1,17 @@
 ---
 name: develop-plugin
 description: >-
-  Develop or maintain AutoformBot's CLI, servers, skills, manifests, tests,
-  bundled example, or local installation. Use for plugin defects seen in
-  consumer Lean projects; not for their mathematics.
+  Develop AutoformBot's CLI, servers, skills, manifests, tests, example, or
+  installation for consumer-project defects.
 ---
 
 # Develop Autoform from consumer nudges
 
-Treat Autoform as an example-based plugin installed in an independent
-formalization repository. Use the Cabannes thesis as an executable consumer example.
+Treat Autoform as an example-based plugin installed in an
+independent formalization repository. Use the Cabannes thesis as an executable consumer example.
 
 Inspect the worktree, state a consumer scenario, and observe installed behavior.
-For a refactor, name the invariant. Trace needed layers.
+Name a refactor's invariant.
 
 Treat user nudges during real work as product evidence. Distill reusable ones
 into the owning skill as a trigger, decision rule, and action.

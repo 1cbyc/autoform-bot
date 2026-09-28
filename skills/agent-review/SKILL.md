@@ -27,12 +27,18 @@ correctness without showing how it was checked. If required sources are absent,
 return insufficient evidence rather than guessing.
 
 Regenerate skeleton evidence from the exact candidate after its Lean build.
+Do that only in a trusted checkout or an operating-system sandbox: the command
+evaluates Lake configuration and project Lean metaprograms, and its resource
+bounds are not a security boundary.
 Treat a stale-build refusal as insufficient evidence; never approve a current
-source excerpt paired with an older compiled declaration. Bind any approval to
-the skeleton's elaborated-semantic hash, not its displayed source formatting.
-Also record the evidence hash for the exact proof-free packet that was read.
-For a source-faithfulness verdict, record the article review hash that binds
-the joint packet to the cited passage and locator.
+source excerpt paired with an older compiled declaration. Record the skeleton
+hash as a drift checksum for the elaborated declaration and trust context, and
+the evidence hash for the exact packet that was read. For a
+source-faithfulness verdict, record the article review hash that binds the joint
+packet to the cited passage and locator. These hashes are provenance evidence,
+not reviewer authentication or an approval key. Candidate code runs during
+extraction and can forge process output, so treat its report as advisory when
+the checkout is not trusted.
 
 Report findings first, ordered by severity and tied to files or nodes. Then give
 the rubric scores, weighted verdict, commands run, unresolved questions, and a
