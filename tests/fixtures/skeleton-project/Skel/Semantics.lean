@@ -17,6 +17,12 @@ theorem usesOpaque : opaqueWitness = opaqueWitness := rfl
 
 def selectedProposition : Prop := Vendor.Choice.proposition
 
+def usesExternalDetail : Nat := Vendor.visible._helper
+
+def usesExternalMatch : Nat → Nat := Vendor.matchBody
+
+def usesExternalPrivate : Nat := Vendor.usesPrivate
+
 def «quoted.helper» : Nat := 1
 
 theorem usesQuoted : «quoted.helper» = 1 := rfl

@@ -15,7 +15,7 @@ import pytest
 import psutil
 
 from autoform_cli.__main__ import main
-from autoform_cli.lean import Declaration, SourceIndex
+from autoform_cli.lean import Declaration, SourceIndex, index_project
 from autoform_cli.skeleton import (
     PACKET_MANIFEST,
     PROBE_MARKER,
@@ -24,6 +24,7 @@ from autoform_cli.skeleton import (
     SkeletonReport,
     SkeletonError,
     UnresolvedTarget,
+    _declaration,
     _install_output,
     _join_readers,
     _remove_output,
@@ -1732,6 +1733,79 @@ def test_private_dependency_safety_uses_source_coordinates(tmp_path: Path) -> No
 
     with pytest.raises(SkeletonError, match=error):
         extract_skeletons(partial_blueprint, lean_root=project)
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_external_internal_detail_rotates_the_declaration_hash(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    build = subprocess.run(
+        ["lake", "build", "Skel.Semantics"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+
+    roots = (
+        "Skel.Semantics.usesExternalDetail",
+        "Skel.Semantics.usesExternalMatch",
+        "Skel.Semantics.usesExternalPrivate",
+    )
+
+    def records() -> dict[str, dict[str, object]]:
+        probe = render_probe(
+            imports=("Skel.Semantics",),
+            roots=roots,
+            project_roots=("Skel.Semantics",),
+        )
+        return parse_probe_output(run_probe(probe, project))
+
+    def declaration(record: dict[str, object]):
+        return _declaration(
+            record,
+            libraries=lean_libraries(project),
+            lean_root=project,
+            index=index_project(project),
+            module_hashes={},
+            snapshot_started_ns=None,
+        )
+
+    before = records()
+    detail = before["Skel.Semantics.usesExternalDetail"]
+    assert detail["assumed"] == ["Vendor.visible._helper"]
+    assert [item[0] for item in detail["boundary_modules"]] == ["Skel.Vendor"]
+    detail_hash = declaration(detail).hash
+
+    matched = before["Skel.Semantics.usesExternalMatch"]
+    assert matched["assumed"] == ["Vendor.matchBody"]
+    match_semantic = json.loads(dict(matched["assumed_semantics"])["Vendor.matchBody"])
+    assert len(match_semantic["generated"]) == 1
+
+    private = before["Skel.Semantics.usesExternalPrivate"]
+    assert private["assumed"] == ["Vendor.usesPrivate"]
+    assert all("privateHelper" not in name for name in private["assumed"])
+
+    source = project / "Skel" / "Vendor.lean"
+    text = source.read_text(encoding="utf-8")
+    changed_text = text.replace("def visible._helper : Nat := 1", "def visible._helper : Nat := 2")
+    assert changed_text != text
+    source.write_text(changed_text, encoding="utf-8")
+    rebuild = subprocess.run(
+        ["lake", "build", "Skel.Semantics"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert rebuild.returncode == 0, rebuild.stderr
+
+    changed_detail = records()["Skel.Semantics.usesExternalDetail"]
+    assert changed_detail["semantic"] == detail["semantic"]
+    assert changed_detail["assumed_semantics"] != detail["assumed_semantics"]
+    assert declaration(changed_detail).hash != detail_hash
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")

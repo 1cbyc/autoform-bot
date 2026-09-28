@@ -337,7 +337,7 @@ def skeleton
         if !trusted.contains d && d != root then
           trusted := trusted.push d
           work := work.push d
-      else if !isCore d && !d.isInternalDetail && !assumed.contains d then
+      else if !isCore d && !assumed.contains d then
         assumed := assumed.push d
     edges := edges.push (c, localDeps.qsort Name.lt)
   let axioms ← collectAxioms root
@@ -350,7 +350,7 @@ def skeleton
         if !trusted.contains d && d != root then
           trusted := trusted.push d
           work := work.push d
-      else if !isCore d && !d.isInternalDetail && !assumed.contains d then
+      else if !isCore d && !assumed.contains d then
         assumed := assumed.push d
   while h : work.size > 0 do
     let c := work[work.size - 1]
@@ -362,7 +362,7 @@ def skeleton
         if !trusted.contains d && d != root then
           trusted := trusted.push d
           work := work.push d
-      else if !isCore d && !d.isInternalDetail && !assumed.contains d then
+      else if !isCore d && !assumed.contains d then
         assumed := assumed.push d
     edges := edges.push (c, localDeps.qsort Name.lt)
   let sortedAssumed := assumed.qsort Name.lt
@@ -376,7 +376,7 @@ def skeleton
     let c := boundaryWork[boundaryWork.size - 1]
     boundaryWork := boundaryWork.pop
     for d in ← expand c do
-      if !isLocal d && !isCore d && !d.isInternalDetail && !boundaryClosure.contains d then
+      if !isLocal d && !isCore d && !boundaryClosure.contains d then
         boundaryClosure := boundaryClosure.push d
         boundaryWork := boundaryWork.push d
   let sortedBoundaryClosure := boundaryClosure.qsort Name.lt
