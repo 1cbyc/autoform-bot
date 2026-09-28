@@ -29,6 +29,7 @@ same sources produce the same JSON, and nothing here writes into the vault.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -1012,6 +1013,85 @@ def _terminate_process_tree(
             pass
 
 
+class _CommandSignalled(BaseException):
+    """A termination signal arrived while a bounded command was running."""
+
+
+_GUARDED_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP")
+_ACTIVE_SIGNAL_GUARD: _SignalGuard | None = None
+
+
+class _SignalGuard:
+    """Route termination signals through the running command's cleanup.
+
+    A signal that arrives while no started command is registered is deferred, so
+    none can land between spawning a process group and remembering it; repeats
+    during cleanup are swallowed.  On exit the previous handlers are restored and
+    the first signal is re-delivered to them, so a default disposition still ends
+    the process with the conventional status.
+    """
+
+    def __init__(self) -> None:
+        self.previous: dict[int, object] = {}
+        self.received: int | None = None
+        self.armed = False
+
+    def _handle(self, signum: int, frame: object) -> None:
+        if self.received is None:
+            self.received = signum
+            if self.armed:
+                self.armed = False
+                raise _CommandSignalled(signum)
+
+    def arm(self) -> None:
+        """Let the next signal interrupt the command that was just registered."""
+
+        if not self.previous:
+            return
+        if self.received is not None:
+            raise _CommandSignalled(self.received)
+        self.armed = True
+
+    def disarm(self) -> None:
+        self.armed = False
+
+    def __enter__(self) -> _SignalGuard:
+        global _ACTIVE_SIGNAL_GUARD
+        for name in _GUARDED_SIGNALS:
+            signum = getattr(signal, name)
+            previous = signal.getsignal(signum)
+            if previous in (signal.SIG_IGN, None):
+                continue
+            self.previous[signum] = previous
+            signal.signal(signum, self._handle)
+        _ACTIVE_SIGNAL_GUARD = self
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        global _ACTIVE_SIGNAL_GUARD
+        _ACTIVE_SIGNAL_GUARD = None
+        self.armed = False
+        for signum, previous in self.previous.items():
+            signal.signal(signum, previous)  # type: ignore[arg-type]
+        if self.received is None:
+            return False
+        signal.raise_signal(self.received)
+        if isinstance(exc, _CommandSignalled):
+            name = signal.Signals(self.received).name
+            raise SkeletonError([f"interrupted by {name}"]) from None
+        return False
+
+
+def _signal_guard() -> contextlib.AbstractContextManager[_SignalGuard]:
+    """Guard signals in the main POSIX thread; reuse an enclosing guard."""
+
+    if os.name != "posix" or threading.current_thread() is not threading.main_thread():
+        return contextlib.nullcontext(_SignalGuard())
+    if _ACTIVE_SIGNAL_GUARD is not None:
+        return contextlib.nullcontext(_ACTIVE_SIGNAL_GUARD)
+    return _SignalGuard()
+
+
 def _run_bounded_command(
     command: list[str],
     *,
@@ -1023,6 +1103,31 @@ def _run_bounded_command(
 ) -> subprocess.CompletedProcess[str]:
     """Run one command with bounded output, time, and descendant lifetime."""
 
+    with _signal_guard() as guard:
+        try:
+            return _run_registered_command(
+                command,
+                cwd=cwd,
+                timeout=timeout,
+                context=context,
+                env=env,
+                output_limit=output_limit,
+                guard=guard,
+            )
+        finally:
+            guard.disarm()
+
+
+def _run_registered_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: float,
+    context: str,
+    env: dict[str, str] | None = None,
+    output_limit: int,
+    guard: _SignalGuard,
+) -> subprocess.CompletedProcess[str]:
     if timeout <= 0:
         raise SkeletonError([f"{context} timed out"])
     if output_limit < 1:
@@ -1086,6 +1191,7 @@ def _run_bounded_command(
             )
         except OSError as exc:
             raise SkeletonError([f"{context} failed: {exc}"]) from exc
+        guard.arm()
         assert process.stdout is not None and process.stderr is not None
         for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
             reader = threading.Thread(target=drain, args=(name, stream), daemon=True)
@@ -1434,7 +1540,7 @@ def run_probe(probe: str, lean_root: Path, *, timeout: float = DEFAULT_PROBE_TIM
     )
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
-    with tempfile.TemporaryDirectory(prefix="autoform-skeleton-") as scratch:
+    with _signal_guard(), tempfile.TemporaryDirectory(prefix="autoform-skeleton-") as scratch:
         source = Path(scratch) / "AutoformSkeletonProbe.lean"
         source.write_text(probe, encoding="utf-8")
         result = _run_bounded_command(

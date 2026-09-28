@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -417,6 +418,59 @@ def test_bounded_command_interruption_kills_the_process(tmp_path: Path, monkeypa
         time.sleep(0.01)
     assert not psutil.pid_exists(pid)
     assert interrupted.type is KeyboardInterrupt
+
+
+@pytest.mark.skipif(os.name != "posix", reason="termination signals are POSIX-specific")
+@pytest.mark.parametrize(
+    "signals",
+    [(signal.SIGTERM,), (signal.SIGHUP,), (signal.SIGINT, signal.SIGINT)],
+    ids=["term", "hup", "double-int"],
+)
+def test_bounded_command_termination_signal_kills_the_process_group(
+    tmp_path: Path, signals: tuple[int, ...]
+) -> None:
+    pids = tmp_path / "pids"
+    program = (
+        "import os, pathlib, subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"pathlib.Path({str(pids)!r}).write_text(f'{{os.getpid()}} {{child.pid}}'); "
+        "time.sleep(60)"
+    )
+    driver = (
+        "import sys; from pathlib import Path; "
+        "from autoform_cli.skeleton import _run_bounded_command; "
+        "_run_bounded_command(sys.argv[1:], cwd=Path.cwd(), timeout=60, context='test command')"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    cli = subprocess.Popen(
+        [sys.executable, "-c", driver, sys.executable, "-c", program], cwd=tmp_path, env=env
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not pids.exists() or len(pids.read_text(encoding="utf-8").split()) < 2:
+            assert time.monotonic() < deadline and cli.poll() is None
+            time.sleep(0.05)
+        for signum in signals:
+            os.kill(cli.pid, signum)
+        assert cli.wait(timeout=15) == -signals[0]
+    finally:
+        if cli.poll() is None:
+            cli.kill()
+    deadline = time.monotonic() + 5
+    survivors = [int(pid) for pid in pids.read_text(encoding="utf-8").split()]
+    while survivors and time.monotonic() < deadline:
+        survivors = [pid for pid in survivors if _pid_is_live(pid)]
+        time.sleep(0.01)
+    assert not survivors
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        process = psutil.Process(pid)
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
 
 
 def test_bounded_command_cleanup_reserves_time_and_reuses_final_deadline(
