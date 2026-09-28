@@ -1997,6 +1997,26 @@ def test_external_private_axiom_binds_its_module(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_structure_field_order_rotates_the_declaration_hash(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build_semantics(project)
+    root = "Skel.Semantics.usesFieldOrder"
+    _, before = _probe_declaration(project, root)
+
+    # Swapping fields keeps the constructor type and the projection name; only
+    # the projection body says which field `first` selects.
+    _replace_source(
+        project / "Skel" / "Semantics.lean",
+        "  first : Nat\n  second : Nat\n",
+        "  second : Nat\n  first : Nat\n",
+    )
+    _build_semantics(project)
+    _, changed = _probe_declaration(project, root)
+
+    assert changed.hash != before.hash
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
 def test_boundary_module_identity_is_checkout_path_independent(tmp_path: Path) -> None:
     roots = ("Skel.Semantics.usesVendorMacro", "Skel.Semantics.usesVendorModule")
     (tmp_path / "first").mkdir()

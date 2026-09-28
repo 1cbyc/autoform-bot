@@ -38,6 +38,12 @@ def usesVendorModule : Nat := Vendor.moduleValue
 
 theorem usesVendorPrivateAxiom : True := Vendor.usesHiddenAxiom
 
+structure FieldPair where
+  first : Nat
+  second : Nat
+
+def usesFieldOrder : Nat := (FieldPair.mk 1 2).first
+
 def «quoted.helper» : Nat := 1
 
 theorem usesQuoted : «quoted.helper» = 1 := rfl

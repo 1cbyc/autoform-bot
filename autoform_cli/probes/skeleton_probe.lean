@@ -108,12 +108,16 @@ def semanticJson (env : Environment) (c : Name) : Json :=
   | none => Json.null
 
 /-- Constants that fix the *meaning* of `c`: its type always, and its value only
-when `c` is a definition. A theorem's proof is never part of its meaning. -/
+when `c` is a definition. A theorem's proof is never part of its meaning. A
+structure's projections fix which field each name selects, so they belong to
+the structure: constructor binder names are not serialized. -/
 def meaningConstants (env : Environment) (c : Name) : Array Name :=
   match env.find? c with
   | some (.defnInfo v)   => v.type.getUsedConstants ++ v.value.getUsedConstants
   | some (.opaqueInfo v) => v.type.getUsedConstants ++ v.value.getUsedConstants
-  | some (.inductInfo v) => v.type.getUsedConstants ++ v.ctors.toArray
+  | some (.inductInfo v) =>
+    v.type.getUsedConstants ++ v.ctors.toArray ++
+      ((getStructureInfo? env c).map (·.fieldInfo.map (·.projFn))).getD #[]
   | some info            => info.type.getUsedConstants
   | none                 => #[]
 
