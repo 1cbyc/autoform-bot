@@ -30,12 +30,10 @@ _DECLARATION = re.compile(
     r"(?P<remainder>.+)$"
 )
 _IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
-_MANAGED_OUTPUT_SCHEMAS = frozenset(
-    {
-        ("packets", "autoform-skeleton-packets/v1"),
-        ("passages", "autoform-skeleton-passages/v1"),
-    }
-)
+#: Schemas of the skeleton command's packet and passage manifests.
+PACKET_SCHEMA = "autoform-skeleton-packets/v1"
+PASSAGE_SCHEMA = "autoform-skeleton-passages/v1"
+_MANAGED_OUTPUT_SCHEMAS = frozenset({("packets", PACKET_SCHEMA), ("passages", PASSAGE_SCHEMA)})
 
 
 @dataclass(frozen=True, slots=True)

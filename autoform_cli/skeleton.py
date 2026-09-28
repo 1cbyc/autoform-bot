@@ -53,7 +53,14 @@ from pathlib import Path
 import psutil
 
 from .graph import Graph, GraphValidationError, Node, load_graph
-from .lean import SourceIndex, declaration_names, index_project, strip_lean_comments
+from .lean import (
+    PACKET_SCHEMA,
+    PASSAGE_SCHEMA,
+    SourceIndex,
+    declaration_names,
+    index_project,
+    strip_lean_comments,
+)
 
 try:  # Python 3.11+
     import tomllib
@@ -2484,8 +2491,6 @@ def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> s
 PACKET_MANIFEST = "manifest.json"
 #: The joint packet of an article's declarations, what a faithfulness judge reads.
 ARTICLE_PACKET = "article.lean"
-_PACKET_SCHEMA = "autoform-skeleton-packets/v1"
-_PASSAGE_SCHEMA = "autoform-skeleton-passages/v1"
 
 
 def _output_identity(path: Path) -> tuple[int, int, str] | None:
@@ -2550,7 +2555,7 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"]) from exc
     if not isinstance(payload, dict):
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])
-    expected_schema = _PACKET_SCHEMA if kind == "packets" else _PASSAGE_SCHEMA
+    expected_schema = PACKET_SCHEMA if kind == "packets" else PASSAGE_SCHEMA
     entries = payload.get(kind)
     if (
         payload.get("kind") != kind
@@ -3040,7 +3045,7 @@ def write_packets(
                 manifest.append(entry)
         (packet_stage / PACKET_MANIFEST).write_text(
             json.dumps(
-                {"kind": "packets", "packets": manifest, "schema": _PACKET_SCHEMA},
+                {"kind": "packets", "packets": manifest, "schema": PACKET_SCHEMA},
                 indent=2,
                 sort_keys=True,
             )
@@ -3053,7 +3058,7 @@ def write_packets(
                     {
                         "kind": "passages",
                         "passages": passage_manifest,
-                        "schema": _PASSAGE_SCHEMA,
+                        "schema": PASSAGE_SCHEMA,
                     },
                     indent=2,
                     sort_keys=True,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -268,6 +269,12 @@ def test_probe_reports_a_failed_freshness_check_apart_from_stale_artifacts(
 
     assert "stale" not in str(refused.value)
     assert "permission denied" in str(refused.value)
+
+
+def test_probe_semantic_schema_matches_the_python_reader() -> None:
+    probe = render_probe(imports=("Skel.Main",), roots=("Skel.x",), project_roots=("Skel",))
+
+    assert re.findall(r'^def semanticSchema := "([^"]*)"$', probe, re.MULTILINE) == [SEMANTIC_SCHEMA]
 
 
 def test_bounded_command_rejects_excess_output(tmp_path: Path) -> None:
