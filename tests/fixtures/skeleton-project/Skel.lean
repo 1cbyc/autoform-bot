@@ -4,3 +4,6 @@ import Skel.Uses
 import Skel.Semantics
 import Skel.ScopedA
 import Skel.AxiomUse
+import Skel.Kinds
+import Skel.Partial
+import Skel.PublicPartial

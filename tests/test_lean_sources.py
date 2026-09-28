@@ -81,18 +81,6 @@ def test_attributes_and_modifiers_do_not_hide_a_declaration(tmp_path: Path) -> N
     assert _index(tmp_path).find("Outer.Inner.gamma") is not None
 
 
-def test_records_declaration_safety_modifiers(tmp_path: Path) -> None:
-    index = _index(
-        tmp_path,
-        "def safe : Nat := 1\nunsafe def unsafeValue : Nat := 1\n"
-        "partial def partialValue (n : Nat) : Nat := partialValue n\n",
-    )
-
-    assert index.find("safe").safety == "safe"
-    assert index.find("unsafeValue").safety == "unsafe"
-    assert index.find("partialValue").safety == "partial"
-
-
 def test_commented_out_code_is_not_indexed(tmp_path: Path) -> None:
     index = _index(tmp_path)
 
@@ -135,10 +123,6 @@ def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
     index = _index(tmp_path, "instance : Inhabited Nat := ⟨0⟩\n")
 
     assert index.declarations == {}
-    (declaration,) = index.find_in(Path("Project/Basic.lean"), 1, 1)
-    assert declaration.name == ""
-    assert declaration.keyword == "instance"
-    assert declaration.safety == "safe"
 
 
 def test_declaration_names_splits_a_list() -> None:

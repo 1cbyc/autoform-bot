@@ -20,7 +20,7 @@ namespace AutoformSkeleton
 
 /-- The probe-to-Python contract for elaborated declaration material. Bump this
 when the canonical expression encoding below changes. -/
-def semanticSchema := "autoform-lean-expr/v3"
+def semanticSchema := "autoform-lean-expr/v4"
 
 /-- Preserve the structure of a Lean name. `Name.toString` is deliberately not
 used: quoted components may themselves contain dots. -/
@@ -76,9 +76,14 @@ partial def exprJson (levelParams : List Name) : Expr → Json
   | .proj n i e      => Json.mkObj [
       ("projection", Json.arr #[nameJson n, i, exprJson levelParams e])]
 
-def safetyJson (info : ConstantInfo) : Json :=
+/-- Safety as the environment records it. The kernel face of a `partial def` is a
+safe `opaque` whose compiled implementation is the `_unsafe_rec` companion; the
+companion alone is not evidence, since ordinary recursive definitions have one. -/
+def safetyJson (env : Environment) (c : Name) (info : ConstantInfo) : Json :=
   if info.isPartial then Json.str "partial"
   else if info.isUnsafe then Json.str "unsafe"
+  else if (info matches .opaqueInfo _) && env.contains (Compiler.mkUnsafeRecName c) then
+    Json.str "partial"
   else Json.str "safe"
 
 /-- Elaboration result whose exact bytes bind a review to kernel-visible
@@ -86,15 +91,15 @@ meaning. The theorem proof is excluded; definition and opaque bodies are not. -/
 def semanticJson (env : Environment) (c : Name) : Json :=
   match env.find? c with
   | some info@(.defnInfo v) => Json.mkObj [
-      ("safety", safetyJson info),
+      ("safety", safetyJson env c info),
       ("type", exprJson v.levelParams v.type),
       ("value", exprJson v.levelParams v.value)]
   | some info@(.opaqueInfo v) => Json.mkObj [
-      ("safety", safetyJson info),
+      ("safety", safetyJson env c info),
       ("type", exprJson v.levelParams v.type),
       ("value", exprJson v.levelParams v.value)]
   | some (.inductInfo v) => Json.mkObj [
-      ("safety", safetyJson (.inductInfo v)),
+      ("safety", safetyJson env c (.inductInfo v)),
       ("type", exprJson v.levelParams v.type),
       ("constructors", Json.arr <| v.ctors.toArray.map fun ctor =>
         Json.mkObj [
@@ -103,7 +108,7 @@ def semanticJson (env : Environment) (c : Name) : Json :=
             | some info => exprJson info.levelParams info.type
             | none => Json.null)])]
   | some info => Json.mkObj [
-      ("safety", safetyJson info),
+      ("safety", safetyJson env c info),
       ("type", exprJson info.levelParams info.type)]
   | none => Json.null
 
@@ -232,11 +237,14 @@ def signatureOf (c : Name) : CommandElabM String := do
 partial def findKind? (stx : Syntax) (k : SyntaxNodeKind) : Option Syntax :=
   if stx.getKind == k then some stx else stx.getArgs.findSome? (findKind? · k)
 
-/-- The namespaces the file opens above `line`, from its `open …` commands. Their
-scoped notation (`#s`, `n !`, `∑ x ∈ s, f x`) must be active for the statement to
-parse; Lean records what a declaration means, not how its file was set up. -/
-def openedNamespaces (lines : List String) (line : Nat) : List Name :=
-  (lines.take (line - 1)).flatMap fun l =>
+/-- The namespaces the file opens above `pos`, from its `open …` commands,
+including a same-line `open … in` prefix. Their scoped notation (`#s`, `n !`,
+`∑ x ∈ s, f x`) must be active for the statement to parse; Lean records what a
+declaration means, not how its file was set up. Names are returned as written;
+the caller resolves them against the enclosing namespaces. -/
+def openedNamespaces (lines : List String) (pos : Position) : List Name :=
+  let current := ((lines[pos.line - 1]?.getD "").take pos.column).toString
+  (lines.take (pos.line - 1) ++ [current]).flatMap fun l =>
     let l := l.trimAsciiStart.toString
     if l.startsWith "open " then
       ((l.drop 5).toString.splitOn " ")
@@ -265,6 +273,23 @@ def declarationSource (c : Name) : CommandElabM (Option String) := do
   let text ← IO.FS.readFile path
   return some (sourceSlice text r.range)
 
+/-- Lean generates companions such as `f._unary`, `f._f` and `S.x._default`
+without a source range. Their kernel material is bound separately; for reading,
+show the declaration they were generated from, unless that is a theorem or
+axiom, whose source would carry a proof. -/
+partial def companionSource (c : Name) : CommandElabM (Option String) := do
+  let env ← getEnv
+  let parent := c.getPrefix
+  if (← findDeclarationRanges? c).isSome || !env.contains parent then return none
+  if (← findDeclarationRanges? parent).isNone then
+    return ← if c.isInternalDetail then companionSource parent else pure none
+  -- A field's companions (`S.x._default`, `S.p._autoParam`) read best in the
+  -- structure that declares the field.
+  let shown := canonical env parent
+  let kind := kindOf env shown
+  if kind == "theorem" || kind == "axiom" then return none
+  declarationSource shown
+
 /-- The declaration's source up to its value: the statement as written, without
 the proof. Parsed with Lean's own parser rather than cut by pattern matching. -/
 def statementSource (root : Name) : CommandElabM (Option String) := do
@@ -277,11 +302,25 @@ def statementSource (root : Name) : CommandElabM (Option String) := do
   let text ← IO.FS.readFile path
   let lines := text.splitOn "\n"
   let snippet := sourceSlice text r.range
+  let kind := kindOf env root
+  -- A type declaration has no value to strip: all of it is the statement.
+  if kind == "structure" || kind == "class" || kind == "inductive" then
+    return some snippet.trimAsciiEnd.toString
+  -- The declaration sits inside the namespaces its name lives in, and `open X`
+  -- written there may refer to any of them, as in `namespace A` … `open B`.
+  let mut scopes : Array Name := #[]
+  let mut ns := (privateToUserName root).getPrefix
+  while ns != Name.anonymous do
+    scopes := scopes.push ns
+    ns := ns.getPrefix
   -- `activateScoped` mutates the environment. Isolate those parser-only changes
   -- so one requested declaration cannot change how the next one is parsed.
   withEnv env do
-    for ns in openedNamespaces lines r.range.pos.line do
-      if env.isNamespace ns then activateScoped ns
+    for scope in scopes do
+      if env.isNamespace scope then activateScoped scope
+    for opened in openedNamespaces lines r.range.pos do
+      for scope in scopes.push Name.anonymous do
+        if env.isNamespace (scope ++ opened) then activateScoped (scope ++ opened)
     let parserEnv ← getEnv
     match Parser.runParserCategory parserEnv `command snippet with
     | .error _ => return none
@@ -291,7 +330,7 @@ def statementSource (root : Name) : CommandElabM (Option String) := do
         (findKind? decl ``Parser.Command.declValEqns).orElse fun _ =>
           findKind? decl ``Parser.Command.whereStructInst
       let some v := val | do
-        if kindOf env root == "axiom" then
+        if kind == "axiom" || kind == "opaque" then
           return some snippet.trimAsciiEnd.toString
         return none
       let some pos := v.getPos? | return none
@@ -411,7 +450,9 @@ def skeleton
     let source ← if kind == "theorem" || kind == "axiom" then
       pure Json.null
     else
-      match ← declarationSource c with | some s => pure (Json.str s) | none => pure Json.null
+      match ← declarationSource c with
+      | some s => pure (Json.str s)
+      | none => match ← companionSource c with | some s => pure (Json.str s) | none => pure Json.null
     items := items.push <| Json.mkObj [
       ("name", Json.str (toString c)),
       ("source_name", Json.str (toString (privateToUserName c))),

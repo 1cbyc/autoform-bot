@@ -68,7 +68,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
 SKELETON_SCHEMA = "autoform-skeleton/v3"
-SEMANTIC_SCHEMA = "autoform-lean-expr/v3"
+SEMANTIC_SCHEMA = "autoform-lean-expr/v4"
 
 #: Every line the probe wants read back starts with this marker, so Lean's own
 #: informational output can never be mistaken for a result.
@@ -665,15 +665,20 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
     source = _report_optional_string(item.get("source"), f"source for {name}")
     if kind in {"theorem", "axiom"} and source is not None:
         raise SkeletonError([f"proof-bearing source is forbidden for {kind} {name}"])
-    if kind not in {"theorem", "axiom"} and (source is None or not source.strip()):
-        raise SkeletonError([f"required source is missing for {kind} {name}"])
+    start_line = _report_optional_int(item.get("start_line"), f"start line for {name}")
+    entries = [(name, kind, source, start_line)]
+    entries += [(value.name, value.kind, value.source, value.start_line) for value in trusted]
+    ranged = {entry[0] for entry in entries if entry[3] is not None}
+    for entry_name, entry_kind, entry_source, entry_start in entries:
+        if _source_required(entry_name, entry_kind, entry_source, entry_start is not None, ranged):
+            raise SkeletonError([f"required source is missing for {entry_kind} {entry_name}"])
     statement = _report_string(item.get("statement"), f"statement for {name}")
     declaration = DeclarationSkeleton(
         name=name,
         kind=kind,
         module=_report_string(item.get("module"), f"module for {name}"),
         path=_report_optional_string(item.get("path"), f"path for {name}"),
-        start_line=_report_optional_int(item.get("start_line"), f"start line for {name}"),
+        start_line=start_line,
         end_line=_report_optional_int(item.get("end_line"), f"end line for {name}"),
         signature=_report_string(item.get("signature"), f"signature for {name}"),
         semantic=semantic,
@@ -710,8 +715,6 @@ def _trusted_from_dict(item: object, *, root: str) -> TrustedDeclaration:
     source = _report_optional_string(item.get("source"), f"source for {name}")
     if kind in {"theorem", "axiom"} and source is not None:
         raise SkeletonError([f"proof-bearing source is forbidden for {kind} {name}"])
-    if kind not in {"theorem", "axiom"} and (source is None or not source.strip()):
-        raise SkeletonError([f"required source is missing for {kind} {name}"])
     trusted = TrustedDeclaration(
         name=name,
         kind=kind,
@@ -1666,8 +1669,9 @@ def _validate_probe_record(record: dict[str, object], *, root: str) -> None:
     _require_nonempty_string(record.get("signature"), field="signature", context=root)
     _require_range(record.get("range"), context=root)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=root)
-    if _statement(record.get("statement_source")) is None:
-        raise SkeletonError([f"the skeleton probe omitted required statement_source for {root}"])
+    statement = record.get("statement_source")
+    if statement is not None and not isinstance(statement, str):
+        raise SkeletonError([f"the skeleton probe emitted an invalid statement_source field for {root}"])
     for field in ("depends", "assumed", "axioms"):
         _require_string_list(record.get(field), field=field, context=root)
     _require_semantic_pairs(
@@ -1737,8 +1741,60 @@ def _require_probe_source(value: object, *, kind: str, context: str) -> None:
         raise SkeletonError([f"the skeleton probe emitted an invalid source field for {context}"])
     if kind in {"theorem", "axiom"} and value is not None:
         raise SkeletonError([f"the skeleton probe emitted proof-bearing source for {context}"])
-    if kind not in {"theorem", "axiom"} and (not isinstance(value, str) or not value.strip()):
-        raise SkeletonError([f"the skeleton probe omitted required source for {context}"])
+
+
+def _probe_record_issue(record: dict[str, object]) -> str | None:
+    """Why a validated probe record cannot yield a skeleton, confined to its node.
+
+    A statement that does not parse in its file context (for example, one that
+    uses `local notation`) or a declaration whose source cannot be located
+    leaves nothing faithful to show a reviewer. That is a gap in this node's
+    evidence, not in the probe run, so other nodes still extract.
+    """
+
+    root = str(record["root"])
+    if _statement(record.get("statement_source")) is None:
+        return (
+            "the skeleton probe omitted required statement_source: the statement "
+            "does not parse in its file context (for example, it uses local notation)"
+        )
+    trusted = record["trusted"]
+    assert isinstance(trusted, list)
+    entries = [(root, root, record)]
+    entries += [(str(item["name"]), f"{root} trusted declaration {item['name']}", item) for item in trusted]
+    ranged = {name for name, _, item in entries if item.get("range") is not None}
+    for name, context, item in entries:
+        if _source_required(name, str(item["kind"]), item.get("source"), item.get("range") is not None, ranged):
+            return f"the skeleton probe omitted required source for {context}"
+    return None
+
+
+def _source_required(name: str, kind: str, source: object, has_range: bool, ranged: set[str]) -> bool:
+    """Whether a declaration lacks the source text a reviewer must be shown.
+
+    Lean generates companions such as `f._unary`, `f._f`, `root._auto_1` and
+    `S.x._default` without a source range. Their elaborated material is still
+    bound by the hash, and the declaration they come from carries the source.
+    """
+
+    if kind in {"theorem", "axiom"} or (isinstance(source, str) and source.strip()):
+        return False
+    return has_range or not (_internal_detail(name) or _name_parent(name) in ranged)
+
+
+def _internal_detail(name: str) -> bool:
+    """Mirror Lean's `Name.isInternalDetail` on a probe-emitted name."""
+
+    parts = _lean_name_parts(name)
+    return any(part.startswith("_") or (part.isdigit() and not quoted) for part, quoted in parts) or bool(
+        re.fullmatch(r"(?:eq|match|proof|omega)_[0-9_]*", parts[-1][0])
+    )
+
+
+def _name_parent(name: str) -> str | None:
+    last, quoted = _lean_name_parts(name)[-1]
+    length = len(last) + (2 if quoted else 0)
+    return name[: -length - 1] if len(name) > length else None
 
 
 def _require_range(value: object, *, context: str) -> None:
@@ -1862,53 +1918,18 @@ def _semantic_pairs(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
-def _semantic_safety(semantic: str) -> str:
-    """Return safety from already-validated semantic material."""
+def _check_local_safety(source_name: str, semantic: str) -> None:
+    """Reject partial declarations by the Lean environment's own record.
+
+    The source text is not consulted: `partial` may sit on its own line, come
+    from a macro, or mark a `where` helper, and generated names are not indexed.
+    """
 
     payload = json.loads(semantic)
-    return str(payload["root"]["safety"])
-
-
-def _check_local_safety(
-    name: str,
-    source_name: str,
-    semantic: str,
-    index: SourceIndex,
-    *,
-    path: str | None,
-    start_line: int | None,
-    end_line: int | None,
-) -> None:
-    """Reject partial declarations and cross-check source and environment safety."""
-
-    declaration = index.find(source_name)
-    rewritten = source_name != name
-    if rewritten:
-        declaration = None
-        if path is not None and start_line is not None and end_line is not None:
-            matches = index.find_in(path, start_line, end_line)
-            named = tuple(candidate for candidate in matches if candidate.name == source_name)
-            declaration = named[0] if len(named) == 1 else None
-    elif declaration is None and path is not None and start_line is not None and end_line is not None:
-        matches = index.find_in(path, start_line, end_line)
-        if len(matches) == 1 and not matches[0].name:
-            declaration = matches[0]
-    if declaration is None:
-        if rewritten:
-            raise SkeletonError(
-                [f"cannot verify source safety for local declaration {name}"]
-            )
-        return
-    if declaration.safety == "partial":
+    materials = [payload["root"], *(entry["material"] for entry in payload["generated"])]
+    if any(isinstance(material, dict) and material.get("safety") == "partial" for material in materials):
         raise SkeletonError(
-            [
-                f"partial declaration {declaration.name} cannot be included "
-                "in a trusted skeleton"
-            ]
-        )
-    if declaration.safety != _semantic_safety(semantic):
-        raise SkeletonError(
-            [f"source and Lean environment disagree about declaration safety for {name}"]
+            [f"partial declaration {source_name} cannot be included in a trusted skeleton"]
         )
 
 
@@ -2184,6 +2205,10 @@ def extract_graph_skeletons(
                     )
                 )
                 continue
+            issue = _probe_record_issue(record)
+            if issue is not None:
+                unresolved.append(UnresolvedTarget(node.id, name, issue))
+                continue
             declarations.append(
                 _declaration(
                     record,
@@ -2294,15 +2319,7 @@ def _declaration(
     module = str(record.get("module") or "")
     start, end = _range(record.get("range"))
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
-    _check_local_safety(
-        name,
-        name,
-        semantic,
-        index,
-        path=path,
-        start_line=start,
-        end_line=end,
-    )
+    _check_local_safety(name, semantic)
     declaration = DeclarationSkeleton(
         name=name,
         kind=str(record.get("kind") or "unknown"),
@@ -2344,15 +2361,7 @@ def _trusted(
     module = str(item.get("module") or "")
     start, end = _range(item.get("range"))
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
-    _check_local_safety(
-        name,
-        source_name,
-        semantic,
-        index,
-        path=path,
-        start_line=start,
-        end_line=end,
-    )
+    _check_local_safety(source_name, semantic)
     trusted = TrustedDeclaration(
         name=name,
         kind=str(item.get("kind") or "unknown"),

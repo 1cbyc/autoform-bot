@@ -17,7 +17,7 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 _NAMESPACE = re.compile(r"^\s*namespace\s+(.+)$")
@@ -25,9 +25,8 @@ _SECTION = re.compile(r"^\s*section\b\s*(\S*)")
 _END = re.compile(r"^\s*end\b\s*(\S*)")
 _DECLARATION = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)*"
-    r"(?P<modifiers>(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*)"
-    r"(?P<keyword>theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+"
-    r"(?P<remainder>.+)$"
+    r"(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*"
+    r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+(.+)$"
 )
 _IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
 #: Schemas of the skeleton command's packet and passage manifests.
@@ -44,7 +43,6 @@ class Declaration:
     path: Path
     line: int
     keyword: str
-    safety: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,38 +52,18 @@ class SourceIndex:
     root: Path
     declarations: dict[str, Declaration]
     source_digest: str
-    locations: dict[tuple[Path, int], tuple[Declaration, ...]] = field(default_factory=dict)
 
     def find(self, name: str) -> Declaration | None:
         return self.declarations.get(name)
-
-    def find_in(
-        self, path: str | Path, start_line: int, end_line: int
-    ) -> tuple[Declaration, ...]:
-        """Find declarations in a source range when Lean rewrites their names."""
-
-        source_path = Path(path)
-        return tuple(
-            declaration
-            for (candidate_path, line), declarations in self.locations.items()
-            if candidate_path == source_path and start_line <= line <= end_line
-            for declaration in declarations
-        )
 
 
 def index_project(root: str | Path) -> SourceIndex:
     """Scan ``*.lean`` beneath *root* and index declarations by full name."""
     root_path = Path(root).expanduser().resolve()
     declarations: dict[str, Declaration] = {}
-    locations: dict[tuple[Path, int], list[Declaration]] = {}
     digest = hashlib.sha256()
     if not root_path.is_dir():
-        return SourceIndex(
-            root=root_path,
-            declarations=declarations,
-            locations={},
-            source_digest=digest.hexdigest(),
-        )
+        return SourceIndex(root=root_path, declarations=declarations, source_digest=digest.hexdigest())
 
     paths: list[Path] = []
     for directory, names, files in os.walk(root_path):
@@ -111,15 +89,8 @@ def index_project(root: str | Path) -> SourceIndex:
         for declaration in _scan(text, relative):
             # First definition wins, so an earlier file is not masked by a later
             # one when a name is genuinely duplicated across namespaces.
-            if declaration.name:
-                declarations.setdefault(declaration.name, declaration)
-            locations.setdefault((declaration.path, declaration.line), []).append(declaration)
-    return SourceIndex(
-        root=root_path,
-        declarations=declarations,
-        locations={key: tuple(value) for key, value in locations.items()},
-        source_digest=digest.hexdigest(),
-    )
+            declarations.setdefault(declaration.name, declaration)
+    return SourceIndex(root=root_path, declarations=declarations, source_digest=digest.hexdigest())
 
 
 def _is_managed_output(path: Path) -> bool:
@@ -168,14 +139,12 @@ def _scan(text: str, relative: Path) -> list[Declaration]:
 
         declaration_match = _DECLARATION.match(line)
         if declaration_match:
-            keyword = declaration_match.group("keyword")
-            name = _name_token(declaration_match.group("remainder"))
-            if name is None and keyword != "instance":
+            keyword = declaration_match.group(1)
+            name = _name_token(declaration_match.group(2))
+            if name is None:
                 continue
-            qualified = "" if name is None else ".".join([*namespaces, name])
-            modifiers = declaration_match.group("modifiers").split()
-            safety = "partial" if "partial" in modifiers else "unsafe" if "unsafe" in modifiers else "safe"
-            found.append(Declaration(qualified, relative, number, keyword, safety))
+            qualified = ".".join([*namespaces, name])
+            found.append(Declaration(qualified, relative, number, keyword))
     return found
 
 

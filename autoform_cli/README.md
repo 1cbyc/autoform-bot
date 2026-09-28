@@ -311,8 +311,16 @@ declaration the reader sees in the source, so a structure appears once, as its
 `structure` block. Only companions that Lean's environment records as generated
 are folded; a name such as `f.eq_1` or `f._helper` is not. Names outside the
 project are the trusted base and are not
-expanded. The command exits nonzero when a `lean:` name is absent from the
-sources or from the built environment, and it writes nothing into the vault;
+expanded. Compiler-generated companions without a source range, such as
+`f._unary`, `f._f`, and `S.x._default`, are bound by their elaborated material
+and shown with the declaration they were generated from. A `partial def`
+anywhere in the trusted closure is refused, as recorded by the Lean
+environment rather than by the source text: its kernel face is an opaque
+constant, so the body a reader would see is not what Lean checks. The command
+exits nonzero when a `lean:` name is absent from the sources or from the built
+environment, or when its statement cannot be cut from the source (for example,
+a theorem that uses `local notation`); that name is unresolved for its article
+only, other articles still extract, and it writes nothing into the vault;
 `--output` records the `autoform-skeleton/v3` report, which contains no
 timestamp or absolute path, for a later render or review to consume. The
 report identifies the exact blueprint, its complete target set, and whether
@@ -368,8 +376,8 @@ comment and docstring removed, so that a reader who is asked what the Lean
 literally asserts cannot read the author's intent into it.
 
 Each theorem's packet also carries the statement *as written*, cut before its
-value by Lean's parser with the file's opened namespaces in scope so that
-scoped notation parses, beside the elaborated signature: the printed form
+value by Lean's parser with its enclosing namespaces and the file's opened
+namespaces in scope so that scoped notation parses, beside the elaborated signature: the printed form
 shows binders that `variable` and `include` inject and the type every cast
 lands in, the written form shows what the pretty-printer elides, and neither
 can hide what the other shows.

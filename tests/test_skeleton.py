@@ -17,7 +17,7 @@ import pytest
 import psutil
 
 from autoform_cli.__main__ import main
-from autoform_cli.lean import Declaration, SourceIndex, index_project
+from autoform_cli.lean import index_project
 from autoform_cli.skeleton import (
     PACKET_MANIFEST,
     PROBE_MARKER,
@@ -36,6 +36,7 @@ from autoform_cli.skeleton import (
     _stage_output,
     _hash_module_files,
     _check_local_safety,
+    _probe_record_issue,
     extract_skeletons,
     format_report,
     lean_libraries,
@@ -618,8 +619,8 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
     trusted = record["trusted"]
     assert isinstance(trusted, list) and isinstance(trusted[0], dict)
     trusted[0]["source"] = None
-    with pytest.raises(SkeletonError, match="omitted required source"):
-        parse_probe_output(PROBE_MARKER + json.dumps(record))
+    (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+    assert "omitted required source" in str(_probe_record_issue(parsed))
 
     record = _fake_found_record()
     record["source"] = "theorem t : True := by trivial"
@@ -627,9 +628,66 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
         parse_probe_output(PROBE_MARKER + json.dumps(record))
 
     record = _fake_found_record()
-    record["statement_source"] = None
-    with pytest.raises(SkeletonError, match="omitted required statement_source"):
+    record["statement_source"] = 7
+    with pytest.raises(SkeletonError, match="invalid statement_source"):
         parse_probe_output(PROBE_MARKER + json.dumps(record))
+
+    record = _fake_found_record()
+    record["statement_source"] = None
+    (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+    assert "omitted required statement_source" in str(_probe_record_issue(parsed))
+
+
+def test_generated_companions_without_a_source_range_need_no_source() -> None:
+    record = _fake_found_record()
+    trusted = record["trusted"]
+    assert isinstance(trusted, list) and isinstance(trusted[0], dict)
+    base = trusted[0]
+    assert base["name"] == "Skel.NonAmbiguous" and base["range"] is not None
+
+    def rangeless(name: str) -> dict[str, object]:
+        return dict(base, name=name, source_name=name, range=None, source=None)
+
+    # Lean's internal-detail spellings, or any name under a declaration with a range.
+    companions = ["Skel.NonAmbiguous._unary", "Skel.Other.eq_1", "Skel.NonAmbiguous.generated"]
+    record["trusted"] = [*trusted, *(rangeless(name) for name in companions)]
+    (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+    assert _probe_record_issue(parsed) is None
+
+    record["trusted"] = [*trusted, rangeless("Skel.Unplaced.helper")]
+    (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+    assert _probe_record_issue(parsed) == (
+        "the skeleton probe omitted required source for "
+        "Skel.observation_determined trusted declaration Skel.Unplaced.helper"
+    )
+
+
+def test_unrecoverable_statement_fails_only_its_node(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(
+        tmp_path,
+        lean={"determined": "Skel.observation_determined", "supervision": "Skel.supervision_nonAmbiguous"},
+    )
+    record = _fake_found_record()
+    trusted = record["trusted"]
+    assert isinstance(trusted, list) and isinstance(trusted[0], dict)
+    companion = dict(trusted[0], name="Skel.NonAmbiguous._unary", source_name="Skel.NonAmbiguous._unary")
+    record["trusted"] = [*trusted, dict(companion, range=None, source=None)]
+    unparsable = dict(record, root="Skel.supervision_nonAmbiguous", statement_source=None)
+    output = "\n".join(PROBE_MARKER + json.dumps(item) for item in (record, unparsable))
+
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda probe, root: output)
+
+    by_node = {node.node_id.rsplit("/", 1)[-1]: node for node in report.nodes}
+    (determined,) = by_node["determined"].declarations
+    assert "Skel.NonAmbiguous._unary" in [item.name for item in determined.trusted]
+    assert by_node["supervision"].declarations == ()
+    (issue,) = report.unresolved
+    assert issue.declaration == "Skel.supervision_nonAmbiguous"
+    assert "omitted required statement_source" in issue.reason
+    assert not report.clean
+    path = write_skeleton_report(report, tmp_path / "report.json")
+    assert load_skeleton_report(path) == report
 
 
 # --------------------------------------------------------------------------- #
@@ -757,77 +815,22 @@ def test_extraction_orders_the_skeleton_and_locates_every_source(tmp_path: Path)
     assert declaration.declaration_lines == 4
 
 
-@pytest.mark.parametrize("candidate_count", [0, 2])
-def test_local_safety_fails_closed_for_unmatched_source_coordinates(
-    tmp_path: Path, candidate_count: int
-) -> None:
-    path = Path("Project.lean")
-    declaration = Declaration("sourceName", path, 1, "def", "safe")
-    candidates = tuple(declaration for _ in range(candidate_count))
-    index = SourceIndex(
-        root=tmp_path,
-        declarations={},
-        locations={(path, 1): candidates} if candidates else {},
-        source_digest="",
-    )
+@pytest.mark.parametrize("safety", ["safe", "unsafe"])
+def test_local_safety_trusts_the_environment_without_source_lookup(safety: str) -> None:
+    # A generated or rewritten name has no source index entry; that is no reason to refuse it.
+    semantic = json.dumps({"generated": [], "root": {"safety": safety, "type": {}, "value": {}}})
 
-    with pytest.raises(SkeletonError, match="cannot verify source safety"):
-        _check_local_safety(
-            "environmentName",
-            "sourceName",
-            _semantic({"type": {}, "value": {}}),
-            index,
-            path=path.as_posix(),
-            start_line=1,
-            end_line=1,
-        )
+    _check_local_safety("_private.Project.0.Project.value._proof_1", semantic)
 
 
-@pytest.mark.parametrize("candidate_name", ["sourceName", ""])
-def test_local_safety_accepts_exact_or_anonymous_coordinate_match(
-    tmp_path: Path, candidate_name: str
-) -> None:
-    path = Path("Project.lean")
-    candidate = Declaration(candidate_name, path, 1, "instance", "safe")
-    locations = {(path, 1): (Declaration("other", path, 1, "def", "safe"), candidate)}
-    if not candidate_name:
-        locations = {(path, 1): (candidate,)}
-    index = SourceIndex(
-        root=tmp_path,
-        declarations={"sourceName": candidate} if candidate_name else {},
-        locations=locations,
-        source_digest="",
-    )
+def test_local_safety_rejects_partial_material_including_generated_companions() -> None:
+    with pytest.raises(SkeletonError, match="partial declaration spin cannot be included"):
+        _check_local_safety("spin", _semantic({"type": {}, "value": {}}).replace('"safe"', '"partial"'))
 
-    _check_local_safety(
-        "environmentName" if candidate_name else "sourceName",
-        "sourceName",
-        _semantic({"type": {}, "value": {}}),
-        index,
-        path=path.as_posix(),
-        start_line=1,
-        end_line=1,
-    )
-
-
-def test_local_safety_leaves_other_generated_declarations_to_lean(tmp_path: Path) -> None:
-    path = Path("Project.lean")
-    index = SourceIndex(
-        root=tmp_path,
-        declarations={"Box": Declaration("Box", path, 1, "structure", "safe")},
-        locations={(path, 1): (Declaration("Box", path, 1, "structure", "safe"),)},
-        source_digest="",
-    )
-
-    _check_local_safety(
-        "instDecidableEqBox",
-        "instDecidableEqBox",
-        _semantic({"type": {}, "value": {}}),
-        index,
-        path=path.as_posix(),
-        start_line=1,
-        end_line=1,
-    )
+    companion = {"name": {"str": [None, "go"]}, "material": {"safety": "partial", "type": {}}}
+    semantic = json.dumps({"generated": [companion], "root": {"safety": "safe", "type": {}, "value": {}}})
+    with pytest.raises(SkeletonError, match="partial declaration outer cannot be included"):
+        _check_local_safety("outer", semantic)
 
 
 def test_skeleton_hash_uses_elaborated_semantics_not_source_formatting(tmp_path: Path) -> None:
@@ -1778,7 +1781,7 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
-def test_private_dependency_safety_uses_source_coordinates(tmp_path: Path) -> None:
+def test_private_dependency_safety_uses_the_lean_environment(tmp_path: Path) -> None:
     project = _project(tmp_path)
     build = subprocess.run(
         ["lake", "build", "Skel.Semantics"],
@@ -1828,6 +1831,105 @@ def test_private_dependency_safety_uses_source_coordinates(tmp_path: Path) -> No
 
     with pytest.raises(SkeletonError, match=error):
         extract_skeletons(partial_blueprint, lean_root=project)
+
+
+def _build(project: Path, *targets: str) -> None:
+    build = subprocess.run(
+        ["lake", "build", *targets], cwd=project, capture_output=True, text=True, timeout=600, check=False
+    )
+    assert build.returncode == 0, build.stderr
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_type_and_value_less_roots_show_their_whole_declaration(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Kinds")
+    roots = {
+        "pair": "Skel.Kinds.Pair",
+        "color": "Skel.Kinds.Color",
+        "zero": "Skel.Kinds.HasZ",
+        "seed": "Skel.Kinds.opaqueSeed",
+        "scoped": "Skel.Kinds.Scoped.usesOwnScope",
+    }
+
+    report = extract_skeletons(_blueprint(tmp_path, lean=roots), lean_root=project)
+
+    assert report.clean
+    assert {d.name: d.statement for node in report.nodes for d in node.declarations} == {
+        "Skel.Kinds.Pair": "structure Pair where\n  a : Nat\n  b : Nat",
+        "Skel.Kinds.Color": "inductive Color where\n  | red\n  | green",
+        "Skel.Kinds.HasZ": "class HasZ (α : Type) where\n  z : α",
+        "Skel.Kinds.opaqueSeed": "opaque opaqueSeed : Nat",
+        # Notation scoped to the namespace the theorem sits in is active there.
+        "Skel.Kinds.Scoped.usesOwnScope": "theorem usesOwnScope : 𝟚 = 2",
+    }
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_local_notation_statement_fails_only_its_node(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Kinds")
+    roots = {"local": "Skel.Kinds.usesLocalNotation", "plain": "Skel.Kinds.plain"}
+
+    report = extract_skeletons(_blueprint(tmp_path, lean=roots), lean_root=project)
+
+    assert [d.name for node in report.nodes for d in node.declarations] == ["Skel.Kinds.plain"]
+    (issue,) = report.unresolved
+    assert issue.declaration == "Skel.Kinds.usesLocalNotation"
+    assert "omitted required statement_source" in issue.reason
+
+    # The source index cannot see a declaration behind `open … in`; ask the probe.
+    probe = render_probe(imports=("Skel.Kinds",), roots=("Skel.Kinds.usesSameLineOpen",), project_roots=("Skel",))
+    (record,) = parse_probe_output(run_probe(probe, project)).values()
+    assert record["statement_source"] == "theorem usesSameLineOpen : 𝟚 = 2"
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_generated_companions_extract_with_their_parent_source(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Kinds", "Skel.Partial")
+    roots = {
+        "wf": "Skel.Kinds.usesWf",
+        "structural": "Skel.Kinds.usesStructural",
+        "auto": "Skel.Kinds.usesAutoParam",
+        "default": "Skel.Kinds.usesDefault",
+        "private": "Skel.Kinds.usesNestedProof",
+        "mutual": "Skel.Partial.usesMutual",
+    }
+
+    report = extract_skeletons(_blueprint(tmp_path, lean=roots), lean_root=project)
+
+    assert report.clean
+    trusted = {item.name: item for node in report.nodes for d in node.declarations for item in d.trusted}
+    for name in ("Skel.Kinds.wf._unary", "Skel.Kinds.fact._f", "Skel.Partial.Inner.ev._f"):
+        assert trusted[name].start_line is None
+        assert trusted[name].source == trusted[name.rsplit(".", 1)[0]].source
+    assert str(trusted["Skel.Kinds.Cfg.x._default"].source).startswith("structure Cfg where")
+    # The parent is a theorem, so its source would show a proof.
+    assert trusted["Skel.Kinds.usesAutoParam._auto_1"].source is None
+    assert any(name.endswith("nestedProof._proof_1") for name in trusted)
+    # Ordinary, well-founded and structural recursion have `_unsafe_rec`
+    # companions too; only a `partial def` is partial.
+    for name in ("Skel.Kinds.wf", "Skel.Kinds.wf._unary", "Skel.Kinds.fact", "Skel.Partial.Inner.ev"):
+        assert json.loads(trusted[name].semantic)["root"]["safety"] == "safe"
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_partial_dependencies_are_rejected_however_they_are_written(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Partial", "Skel.PublicPartial")
+    cases = {
+        "Skel.Partial.usesWhere": "Skel.Partial.outer.go",
+        "Skel.Partial.usesOwnLine": "Skel.Partial.ownLine",
+        "Skel.Partial.usesAfterMutual": "Skel.Partial.Inner.afterMutual",
+        "Skel.Partial.usesMacro": "Skel.Partial.fromMacro",
+        "Skel.PublicPartial.usesPublic": "Skel.PublicPartial.spin",
+    }
+
+    for root, dependency in cases.items():
+        blueprint = _blueprint(tmp_path / root, lean={"partial": root})
+        with pytest.raises(SkeletonError, match=f"partial declaration {dependency} cannot be included"):
+            extract_skeletons(blueprint, lean_root=project)
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
