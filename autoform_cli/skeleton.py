@@ -300,12 +300,12 @@ class DeclarationSkeleton:
         return "\n".join(lines) + "\n"
 
     def as_dict(self) -> dict[str, object]:
+        """The report record, naming what the report's shared tables state once."""
+
         return {
             "assumed": list(self.assumed),
-            "assumed_semantics": [list(item) for item in self.assumed_semantics],
-            "boundary_modules": [list(item) for item in self.boundary_modules],
+            "boundary_modules": list(dict.fromkeys(module for module, _, _ in self.boundary_modules)),
             "axioms": list(self.axioms),
-            "axiom_semantics": [list(item) for item in self.axiom_semantics],
             "declaration_lines": self.declaration_lines,
             "end_line": self.end_line,
             "evidence_hash": self.evidence_hash,
@@ -326,7 +326,7 @@ class DeclarationSkeleton:
             "start_line": self.start_line,
             "statement": self.statement,
             "statement_comments": [list(item) for item in self.statement_comments],
-            "trusted": [item.as_dict() for item in self.trusted],
+            "trusted": [item.name for item in self.trusted],
         }
 
 
@@ -468,8 +468,25 @@ class SkeletonReport:
         return () if node is None else node.declarations
 
     def as_dict(self) -> dict[str, object]:
+        # Roots in one project share most of what they trust; each shared
+        # item is stated once here and named by every declaration that uses it.
+        trusted: dict[str, object] = {}
+        semantics: dict[str, object] = {}
+        modules: dict[str, object] = {}
+        for node in self.nodes:
+            for declaration in node.declarations:
+                for item in declaration.trusted:
+                    _share(trusted, item.name, item.as_dict(), table_name="trusted declaration")
+                for name, semantic in (*declaration.assumed_semantics, *declaration.axiom_semantics):
+                    _share(semantics, name, semantic, table_name="semantic material")
+                files: dict[str, list[list[str]]] = {}
+                for module, kind, digest in declaration.boundary_modules:
+                    files.setdefault(module, []).append([kind, digest])
+                for module, identity in files.items():
+                    _share(modules, module, identity, table_name="module identity")
         return {
             "blueprint_hash": self.blueprint_hash,
+            "boundary_modules": modules,
             "nodes": [node.as_dict() for node in self.nodes],
             "schema": self.schema,
             "selection": {
@@ -478,16 +495,23 @@ class SkeletonReport:
                 "nodes": list(self.selected_nodes),
             },
             "semantic_schema": self.semantic_schema,
+            "semantics": semantics,
             "target_count": len(self.targets),
             "targets": [
                 {"declarations": list(declarations), "node_id": node_id}
                 for node_id, declarations in self.targets
             ],
+            "trusted": trusted,
             "unresolved": [issue.as_dict() for issue in self.unresolved],
         }
 
     def to_json(self) -> str:
         return json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _share(table: dict[str, object], name: str, value: object, *, table_name: str) -> None:
+    if table.setdefault(name, value) != value:
+        raise ValueError(f"conflicting {table_name} for {name} in one skeleton report")
 
 
 def load_skeleton_report(path: str | Path) -> SkeletonReport:
@@ -504,12 +528,15 @@ def load_skeleton_report(path: str | Path) -> SkeletonReport:
         or data.keys()
         != {
             "blueprint_hash",
+            "boundary_modules",
             "nodes",
             "schema",
             "selection",
             "semantic_schema",
+            "semantics",
             "target_count",
             "targets",
+            "trusted",
             "unresolved",
         }
     ):
@@ -545,7 +572,13 @@ def load_skeleton_report(path: str | Path) -> SkeletonReport:
     if not isinstance(raw_nodes, list):
         raise SkeletonError([f"{path} contains malformed skeleton report data"])
     declarations_by_node = dict(targets)
-    nodes = tuple(_node_from_dict(node, targets=declarations_by_node) for node in raw_nodes)
+    tables = _report_tables(data)
+    used: dict[str, set[str]] = {table: set() for table in tables}
+    nodes = tuple(
+        _node_from_dict(node, targets=declarations_by_node, tables=tables, used=used) for node in raw_nodes
+    )
+    if any(used[table] != tables[table].keys() for table in tables):
+        raise SkeletonError([f"{path} contains unreferenced shared entries"])
     if len({node.node_id for node in nodes}) != len(nodes):
         raise SkeletonError([f"{path} contains duplicate skeleton article ids"])
     if tuple(node.node_id for node in nodes) != selected_nodes:
@@ -633,8 +666,6 @@ _DECLARATION_REPORT_FIELDS = frozenset(
     {
         "assumed",
         "boundary_modules",
-        "assumed_semantics",
-        "axiom_semantics",
         "axioms",
         "declaration_lines",
         "depends",
@@ -678,7 +709,44 @@ _TRUSTED_REPORT_FIELDS = frozenset(
 )
 
 
-def _node_from_dict(item: object, *, targets: dict[str, tuple[str, ...]]) -> NodeSkeleton:
+def _report_tables(data: dict[str, object]) -> dict[str, dict[str, object]]:
+    """Read the shared tables that report declarations refer to by name."""
+
+    tables: dict[str, dict[str, object]] = {}
+    for table in ("boundary_modules", "semantics", "trusted"):
+        value = data[table]
+        if not isinstance(value, dict):
+            raise SkeletonError([f"malformed shared {table} table in skeleton report"])
+        tables[table] = value
+    tables["trusted"] = {
+        name: _trusted_from_dict(item, root=name) for name, item in tables["trusted"].items()
+    }
+    for name, trusted in tables["trusted"].items():
+        if not isinstance(trusted, TrustedDeclaration) or trusted.name != name:
+            raise SkeletonError([f"mismatched shared trusted declaration {name} in skeleton report"])
+    for name, semantic in tables["semantics"].items():
+        _validate_semantic_material(_report_string(semantic, f"semantic material for {name}"), context=name)
+    tables["boundary_modules"] = {
+        module: _report_module_identities(
+            [[module, *file] if isinstance(file, list) else file for file in files]
+            if isinstance(files, list)
+            else files,
+            context=module,
+        )
+        for module, files in tables["boundary_modules"].items()
+    }
+    if not all(tables["boundary_modules"].values()):
+        raise SkeletonError(["empty shared module identity in skeleton report"])
+    return tables
+
+
+def _node_from_dict(
+    item: object,
+    *,
+    targets: dict[str, tuple[str, ...]],
+    tables: dict[str, dict[str, object]],
+    used: dict[str, set[str]],
+) -> NodeSkeleton:
     if not isinstance(item, dict) or item.keys() != _NODE_REPORT_FIELDS:
         raise SkeletonError(["malformed article in skeleton report"])
     node_id = _report_string(item.get("node_id"), "article id")
@@ -686,7 +754,7 @@ def _node_from_dict(item: object, *, targets: dict[str, tuple[str, ...]]) -> Nod
     raw_declarations = item.get("declarations")
     if not isinstance(raw_declarations, list):
         raise SkeletonError([f"malformed declarations for {node_id} in skeleton report"])
-    declarations = tuple(_declaration_from_dict(value) for value in raw_declarations)
+    declarations = tuple(_declaration_from_dict(value, tables=tables, used=used) for value in raw_declarations)
     if len({declaration.name for declaration in declarations}) != len(declarations):
         raise SkeletonError([f"duplicate declarations for {node_id} in skeleton report"])
     passage = _report_optional_string(item.get("passage"), f"passage for {node_id}")
@@ -710,30 +778,38 @@ def _node_from_dict(item: object, *, targets: dict[str, tuple[str, ...]]) -> Nod
     return node
 
 
-def _declaration_from_dict(item: object) -> DeclarationSkeleton:
+def _declaration_from_dict(
+    item: object, *, tables: dict[str, dict[str, object]], used: dict[str, set[str]]
+) -> DeclarationSkeleton:
     if not isinstance(item, dict) or item.keys() != _DECLARATION_REPORT_FIELDS:
         raise SkeletonError(["malformed declaration in skeleton report"])
     name = _report_string(item.get("name"), "declaration name")
     kind = _report_kind(item.get("kind"), name)
     semantic = _report_string(item.get("semantic"), f"semantic material for {name}")
     _validate_semantic_material(semantic, context=name, kind=kind)
-    assumed = _report_string_tuple(item.get("assumed"), f"assumptions for {name}")
-    assumed_semantics = _semantic_pairs(item.get("assumed_semantics"))
-    boundary_modules = _report_module_identities(item.get("boundary_modules"), context=name)
-    axioms = _report_string_tuple(item.get("axioms"), f"axioms for {name}")
-    axiom_semantics = _semantic_pairs(item.get("axiom_semantics"))
-    if tuple(key for key, _ in assumed_semantics) != assumed:
-        raise SkeletonError([f"mismatched assumption semantics for {name}"])
-    if tuple(key for key, _ in axiom_semantics) != axioms:
-        raise SkeletonError([f"mismatched axiom semantics for {name}"])
+
+    def shared(field: str, table: str, what: str) -> list[tuple[str, object]]:
+        names = _report_string_tuple(item.get(field), f"{field} for {name}")
+        if not set(names) <= tables[table].keys():
+            raise SkeletonError([f"mismatched {what} for {name}"])
+        used[table].update(names)
+        return [(key, tables[table][key]) for key in names]
+
+    assumed_semantics = tuple((key, str(value)) for key, value in shared("assumed", "semantics", "assumption semantics"))
+    assumed = tuple(key for key, _ in assumed_semantics)
+    axiom_semantics = tuple((key, str(value)) for key, value in shared("axioms", "semantics", "axiom semantics"))
+    axioms = tuple(key for key, _ in axiom_semantics)
+    boundary_modules = tuple(
+        entry
+        for _, entries in shared("boundary_modules", "boundary_modules", "boundary module identities")
+        if isinstance(entries, tuple)
+        for entry in entries
+    )
     if assumed and not boundary_modules:
         raise SkeletonError([f"missing boundary module identities for {name}"])
-    raw_trusted = item.get("trusted")
-    if not isinstance(raw_trusted, list):
-        raise SkeletonError([f"malformed trusted declarations for {name}"])
-    trusted = tuple(_trusted_from_dict(value, root=name) for value in raw_trusted)
-    if len({value.name for value in trusted}) != len(trusted):
-        raise SkeletonError([f"duplicate trusted declarations for {name}"])
+    trusted = tuple(
+        value for _, value in shared("trusted", "trusted", "trusted declarations") if isinstance(value, TrustedDeclaration)
+    )
     source = _report_optional_string(item.get("source"), f"source for {name}")
     if kind in {"theorem", "axiom"} and source is not None:
         raise SkeletonError([f"proof-bearing source is forbidden for {kind} {name}"])
@@ -1775,6 +1851,7 @@ def parse_probe_output(
     """Return strictly validated probe records, keyed by requested root name."""
 
     records: dict[str, dict[str, object]] = {}
+    tables: dict[str, dict[str, object]] = {table: {} for table in _PROBE_TABLES}
     expected = None if expected_roots is None else set(expected_roots)
     for line in text.splitlines():
         if not line.startswith(PROBE_MARKER):
@@ -1783,6 +1860,9 @@ def parse_probe_output(
             record = json.loads(line[len(PROBE_MARKER) :])
         except json.JSONDecodeError as exc:
             raise SkeletonError([f"the skeleton probe emitted invalid JSON: {exc}"]) from exc
+        if isinstance(record, dict) and "table" in record:
+            _read_probe_table(record, tables)
+            continue
         if not isinstance(record, dict) or not isinstance(record.get("root"), str) or not record["root"]:
             raise SkeletonError(["the skeleton probe emitted a record without a root name"])
         root = record["root"]
@@ -1790,12 +1870,70 @@ def parse_probe_output(
             raise SkeletonError([f"the skeleton probe emitted duplicate records for {root}"])
         if expected is not None and root not in expected:
             raise SkeletonError([f"the skeleton probe emitted an unrequested root: {root}"])
-        _validate_probe_record(record, root=root)
         records[root] = record
+    # Shared entries are validated once, however many roots name them.
+    checked: set[int] = set()
+    for root, record in records.items():
+        records[root] = _resolve_probe_record(record, tables, root=root)
+        _validate_probe_record(records[root], root=root, checked=checked)
     return records
 
 
-def _validate_probe_record(record: dict[str, object], *, root: str) -> None:
+#: What a probe table entry's value must be: a trusted declaration's record,
+#: an external constant's semantic material, or a module's compiled files.
+_PROBE_TABLES: dict[str, type] = {"module": list, "semantic": str, "trusted": dict}
+
+
+def _read_probe_table(record: dict[str, object], tables: dict[str, dict[str, object]]) -> None:
+    table, name, value = record.get("table"), record.get("name"), record.get("value")
+    if (
+        record.keys() != {"name", "table", "value"}
+        or not isinstance(table, str)
+        or table not in _PROBE_TABLES
+        or not isinstance(name, str)
+        or not name
+        or not isinstance(value, _PROBE_TABLES[table])
+        or (isinstance(value, dict) and value.get("name") != name)
+    ):
+        raise SkeletonError(["the skeleton probe emitted a malformed shared table entry"])
+    if name in tables[table]:
+        raise SkeletonError([f"the skeleton probe emitted duplicate {table} entries for {name}"])
+    tables[table][name] = value
+
+
+def _resolve_probe_record(
+    record: dict[str, object], tables: dict[str, dict[str, object]], *, root: str
+) -> dict[str, object]:
+    """Replace a root record's names with the shared entries they refer to."""
+
+    if record.get("found") is not True:
+        return record
+    if record.keys() != _FOUND_RECORD_FIELDS - {"assumed_semantics", "axiom_semantics"}:
+        raise SkeletonError([f"the skeleton probe emitted invalid fields for {root}"])
+
+    def entries(field: str, table: str) -> list[tuple[str, object]]:
+        names = record[field]
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise SkeletonError([f"the skeleton probe emitted an invalid {field} field for {root}"])
+        missing = [name for name in names if name not in tables[table]]
+        if missing:
+            raise SkeletonError([f"the skeleton probe emitted no {table} entry for {missing[0]} ({root})"])
+        return [(name, tables[table][name]) for name in names]
+
+    resolved = dict(record)
+    resolved["trusted"] = [item for _, item in entries("trusted", "trusted")]
+    resolved["assumed_semantics"] = [[name, value] for name, value in entries("assumed", "semantic")]
+    resolved["axiom_semantics"] = [[name, value] for name, value in entries("axioms", "semantic")]
+    resolved["boundary_modules"] = [
+        [module, *file] if isinstance(file, list) else file
+        for module, files in entries("boundary_modules", "module")
+        if isinstance(files, list)
+        for file in files
+    ]
+    return resolved
+
+
+def _validate_probe_record(record: dict[str, object], *, root: str, checked: set[int] | None = None) -> None:
     found = record.get("found")
     if type(found) is not bool:
         raise SkeletonError([f"the skeleton probe emitted a non-boolean found field for {root}"])
@@ -1839,7 +1977,10 @@ def _validate_probe_record(record: dict[str, object], *, root: str) -> None:
         raise SkeletonError([f"the skeleton probe emitted an invalid trusted field for {root}"])
     seen: set[str] = set()
     for item in trusted:
-        _validate_trusted_record(item, root=root)
+        if checked is None or id(item) not in checked:
+            _validate_trusted_record(item, root=root)
+            if checked is not None:
+                checked.add(id(item))
         name = item["name"]
         if name in seen:
             raise SkeletonError([f"the skeleton probe emitted duplicate trusted declaration {name} for {root}"])

@@ -327,7 +327,12 @@ report identifies the exact blueprint, its complete target set, and whether
 the extraction covered all targets or an explicit `--node` selection. It
 quotes each trusted definition's source and records theorem
 dependencies by elaborated signature, so it stands on its own without ever
-copying a theorem proof.
+copying a theorem proof. Declarations in one project share most of what they
+trust, so the report states each trusted declaration, each external
+constant's semantic material, and each boundary module's identity once, in the
+top-level `trusted`, `semantics`, and `boundary_modules` tables, and each
+declaration names the entries it uses; the probe's own output is shared the
+same way.
 
 Run skeleton extraction only in a trusted checkout or an operating-system
 sandbox. Lake evaluates `lakefile.lean`, and the generated probe imports project

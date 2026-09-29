@@ -515,6 +515,17 @@ def rangeJson (c : Name) : CommandElabM Json := do
 def emit (request : String) (fields : List (String × Json)) : CommandElabM Unit :=
   IO.println s!"{marker}{{(Json.mkObj (("root", Json.str request) :: fields)).compress}}"
 
+/-- Emit one entry of a table shared by every root, the first time a root
+needs it. Roots name their trusted declarations, external semantic material,
+and boundary modules, so what many roots share is stated once per run. -/
+def emitShared (emitted : IO.Ref (Std.HashSet (String × Name))) (table : String) (name : Name)
+    (value : CommandElabM Json) : CommandElabM Unit := do
+  unless (← emitted.get).contains (table, name) do
+    emitted.modify (·.insert (table, name))
+    let entry := Json.mkObj [
+      ("table", Json.str table), ("name", Json.str (toString name)), ("value", ← value)]
+    IO.println s!"{marker}{{entry.compress}}"
+
 /-- The modules that belong to the running toolchain. A name root is not
 enough: a dependency may name its own module `Lake.Foo`, and that module is
 external like any other. A module is core only when its root is a toolchain
@@ -534,6 +545,7 @@ def skeleton
     (coreModules : Std.HashSet Name)
     (expandCache : IO.Ref (Std.HashMap Name (Array Name)))
     (semanticCache : IO.Ref (Std.HashMap Name String))
+    (emitted : IO.Ref (Std.HashSet (String × Name)))
     (request : String) (root : Name) : CommandElabM Unit := do
   let env ← getEnv
   unless env.contains root do
@@ -610,7 +622,7 @@ def skeleton
   for c in sortedBoundaryClosure do
     if let some mod := moduleOf env c then
       if !boundaryModules.contains mod then boundaryModules := boundaryModules.push mod
-  let mut boundaryModuleFiles : Array Json := #[]
+  let mut boundaryModuleNames : Array Json := #[]
   -- Compiled artifacts, not source bytes, identify a boundary module: macros,
   -- options, and instances from outside its source change its elaborated
   -- meaning. Lean serializes module names rather than checkout paths, so the
@@ -618,39 +630,46 @@ def skeleton
   -- the artifact into `.olean`, `.olean.server`, and `.olean.private` (which
   -- holds private bodies and proofs); bind every part that exists.
   for mod in boundaryModules.qsort Name.lt do
-    let olean ← findOLean mod
-    unless ← olean.pathExists do
-      throwError "compiled artifact unavailable for boundary module {{mod}}"
-    for (kind, path) in [("olean", olean), ("olean.server", olean.addExtension "server"),
-        ("olean.private", olean.addExtension "private")] do
-      if kind == "olean" || (← path.pathExists) then
-        boundaryModuleFiles := boundaryModuleFiles.push <| Json.arr #[
-          Json.str (toString mod), Json.str kind, Json.str path.toString]
+    emitShared emitted "module" mod do
+      let olean ← findOLean mod
+      unless ← olean.pathExists do
+        throwError "compiled artifact unavailable for boundary module {{mod}}"
+      let mut files : Array Json := #[]
+      for (kind, path) in [("olean", olean), ("olean.server", olean.addExtension "server"),
+          ("olean.private", olean.addExtension "private")] do
+        if kind == "olean" || (← path.pathExists) then
+          files := files.push <| Json.arr #[Json.str kind, Json.str path.toString]
+      return Json.arr files
+    boundaryModuleNames := boundaryModuleNames.push (Json.str (toString mod))
   let mut items : Array Json := #[]
+  -- A trusted declaration's record does not depend on the root: its
+  -- dependencies are its own meaning's local constants.
   for c in trusted.qsort Name.lt do
-    let deps := (edges.find? (·.1 == c)).map (·.2) |>.getD #[]
-    let kind := kindOf env c
-    let (source, sourceComments) ← if kind == "theorem" || kind == "axiom" then
-      pure (Json.null, Json.null)
-    else
-      match ← declarationSource c with
-      | some (s, comments) => pure (Json.str s, comments)
-      | none => match ← companionSource c with
+    emitShared emitted "trusted" c do
+      let deps := (edges.find? (·.1 == c)).map (·.2) |>.getD #[]
+      let kind := kindOf env c
+      let (source, sourceComments) ← if kind == "theorem" || kind == "axiom" then
+        pure (Json.null, Json.null)
+      else
+        match ← declarationSource c with
         | some (s, comments) => pure (Json.str s, comments)
-        | none => pure (Json.null, Json.null)
-    items := items.push <| Json.mkObj [
-      ("name", Json.str (toString c)),
-      ("source_name", Json.str (toString (privateToUserName c))),
-      ("kind", Json.str kind),
-      ("module", Json.str (toString ((moduleOf env c).getD Name.anonymous))),
-      ("range", ← rangeJson c),
-      ("signature", Json.str (← signatureOf c)),
-      ("raw_signature", Json.str (← rawSignatureOf c)),
-      ("semantic_schema", Json.str semanticSchema),
-      ("semantic", Json.str (← cachedSemanticMaterial semanticCache env c)),
-      ("depends", Json.arr (deps.map fun d => Json.str (toString d))),
-      ("source", source),
-      ("source_comments", sourceComments)]
+        | none => match ← companionSource c with
+          | some (s, comments) => pure (Json.str s, comments)
+          | none => pure (Json.null, Json.null)
+      return Json.mkObj [
+        ("name", Json.str (toString c)),
+        ("source_name", Json.str (toString (privateToUserName c))),
+        ("kind", Json.str kind),
+        ("module", Json.str (toString ((moduleOf env c).getD Name.anonymous))),
+        ("range", ← rangeJson c),
+        ("signature", Json.str (← signatureOf c)),
+        ("raw_signature", Json.str (← rawSignatureOf c)),
+        ("semantic_schema", Json.str semanticSchema),
+        ("semantic", Json.str (← cachedSemanticMaterial semanticCache env c)),
+        ("depends", Json.arr (deps.map fun d => Json.str (toString d))),
+        ("source", source),
+        ("source_comments", sourceComments)]
+    items := items.push (Json.str (toString c))
   let rootDeps := (edges.find? (·.1 == root)).map (·.2) |>.getD #[]
   let (statement, statementComments) := match ← statementSource root with
     | some (s, comments) => (Json.str s, comments)
@@ -662,14 +681,9 @@ def skeleton
     match ← declarationSource root with
     | some (s, comments) => pure (Json.str s, comments)
     | none => pure (Json.null, Json.null)
-  let mut assumedSemantics : Array Json := #[]
-  for d in sortedAssumed do
-    assumedSemantics := assumedSemantics.push <| Json.arr #[
-      Json.str (toString d), Json.str (← cachedSemanticMaterial semanticCache env d)]
-  let mut axiomSemantics : Array Json := #[]
-  for d in sortedAxioms do
-    axiomSemantics := axiomSemantics.push <| Json.arr #[
-      Json.str (toString d), Json.str (← cachedSemanticMaterial semanticCache env d)]
+  for d in sortedAssumed ++ sortedAxioms do
+    emitShared emitted "semantic" d do
+      return Json.str (← cachedSemanticMaterial semanticCache env d)
   emit request <| [
     ("found", Json.bool true),
     ("statement_source", statement),
@@ -687,10 +701,8 @@ def skeleton
     ("depends", Json.arr (rootDeps.map fun d => Json.str (toString d))),
     ("trusted", Json.arr items),
     ("assumed", Json.arr (sortedAssumed.map fun d => Json.str (toString d))),
-    ("assumed_semantics", Json.arr assumedSemantics),
-    ("boundary_modules", Json.arr boundaryModuleFiles),
-    ("axioms", Json.arr (sortedAxioms.map fun d => Json.str (toString d))),
-    ("axiom_semantics", Json.arr axiomSemantics)]
+    ("boundary_modules", Json.arr boundaryModuleNames),
+    ("axioms", Json.arr (sortedAxioms.map fun d => Json.str (toString d)))]
 
 end AutoformSkeleton
 
@@ -699,6 +711,7 @@ run_cmd do
   let projectRoots : List Name := [{project_roots}]
   let expandCache : IO.Ref (Std.HashMap Name (Array Name)) ← IO.mkRef {{}}
   let semanticCache : IO.Ref (Std.HashMap Name String) ← IO.mkRef {{}}
+  let emitted : IO.Ref (Std.HashSet (String × Name)) ← IO.mkRef {{}}
   let coreModules ← AutoformSkeleton.toolchainModules (← getEnv)
   for (request, root) in [{roots}] do
-    AutoformSkeleton.skeleton projectRoots coreModules expandCache semanticCache request root
+    AutoformSkeleton.skeleton projectRoots coreModules expandCache semanticCache emitted request root

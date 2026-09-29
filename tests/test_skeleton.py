@@ -20,6 +20,7 @@ from autoform_cli.__main__ import main
 from autoform_cli.lean import PACKET_SCHEMA, PASSAGE_SCHEMA, index_project
 from autoform_cli.skeleton import (
     DeclarationSkeleton,
+    NodeSkeleton,
     PACKET_MANIFEST,
     PROBE_MARKER,
     SEMANTIC_SCHEMA,
@@ -104,6 +105,28 @@ def _record(root: str, **fields: object) -> str:
     return PROBE_MARKER + json.dumps({"root": root, **fields})
 
 
+def _probe_lines(record: dict[str, object]) -> str:
+    """Encode a resolved probe record as the probe prints it: shared entries, then the root."""
+
+    if record.get("found") is not True:
+        return _probe_lines(record)
+    entries: dict[tuple[str, str], object] = {}
+    wire = dict(record)
+    for item in wire["trusted"]:
+        entries["trusted", item["name"]] = item
+    wire["trusted"] = [item["name"] for item in wire["trusted"]]
+    for name, semantic in [*wire.pop("assumed_semantics"), *wire.pop("axiom_semantics")]:
+        entries["semantic", name] = semantic
+    for module, kind, path in wire["boundary_modules"]:
+        entries.setdefault(("module", module), []).append([kind, path])
+    wire["boundary_modules"] = list(dict.fromkeys(module for module, _, _ in wire["boundary_modules"]))
+    lines = [
+        PROBE_MARKER + json.dumps({"table": table, "name": name, "value": value})
+        for (table, name), value in entries.items()
+    ]
+    return "\n".join([*lines, PROBE_MARKER + json.dumps(wire)])
+
+
 def _semantic(payload: dict[str, object]) -> str:
     return json.dumps(
         {"generated": [], "root": {"safety": "safe", **payload}},
@@ -178,7 +201,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
     )
     records = [
         "some unrelated line from Lean",
-        _record(
+        _found_record(
             "Skel.observation_determined",
             found=True,
             kind="theorem",
@@ -210,9 +233,12 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
     return "\n".join(records)
 
 
+def _found_record(root: str, **fields: object) -> str:
+    return _probe_lines({"root": root, **fields})
+
+
 def _fake_found_record() -> dict[str, object]:
-    line = next(line for line in _fake_probe_output().splitlines() if line.startswith(PROBE_MARKER))
-    return json.loads(line[len(PROBE_MARKER) :])
+    return parse_probe_output(_fake_probe_output())["Skel.observation_determined"]
 
 
 # --------------------------------------------------------------------------- #
@@ -599,30 +625,49 @@ def test_parse_probe_output_rejects_wrong_types_duplicates_and_unrequested_roots
     with pytest.raises(SkeletonError, match="non-boolean found"):
         parse_probe_output(_record("Skel.ghost", found="false"))
 
-    line = next(line for line in _fake_probe_output().splitlines() if line.startswith(PROBE_MARKER))
+    output = _fake_probe_output()
+    line = output.splitlines()[-1]
     with pytest.raises(SkeletonError, match="duplicate records"):
-        parse_probe_output("\n".join([line, line]))
+        parse_probe_output("\n".join([output, line]))
     with pytest.raises(SkeletonError, match="unrequested root"):
-        parse_probe_output(line, expected_roots=("Skel.somewhere_else",))
+        parse_probe_output(output, expected_roots=("Skel.somewhere_else",))
+
+
+def test_parse_probe_output_resolves_shared_entries_strictly() -> None:
+    output = _fake_probe_output()
+    lines = output.splitlines()
+    table = next(line for line in lines if '"table": "trusted"' in line)
+    root = json.loads(lines[-1][len(PROBE_MARKER) :])
+    with pytest.raises(SkeletonError, match="duplicate trusted entries"):
+        parse_probe_output("\n".join([table, output]))
+    with pytest.raises(SkeletonError, match="no trusted entry for Skel.Eligible"):
+        parse_probe_output("\n".join(line for line in lines if '"name": "Skel.Eligible"' not in line))
+    with pytest.raises(SkeletonError, match="no module entry for Mathlib.Fake"):
+        parse_probe_output("\n".join(line for line in lines if '"table": "module"' not in line))
+    renamed = table.replace('"name": "Skel.NonAmbiguous"', '"name": "Skel.Renamed"', 1)
+    with pytest.raises(SkeletonError, match="malformed shared table entry"):
+        parse_probe_output(renamed)
+    with pytest.raises(SkeletonError, match="invalid fields"):
+        parse_probe_output(_record(**root, assumed_semantics=[]))
 
 
 def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
     record = _fake_found_record()
     record["semantic_schema"] = "unknown"
     with pytest.raises(SkeletonError, match="unsupported semantic schema"):
-        parse_probe_output(PROBE_MARKER + json.dumps(record))
+        parse_probe_output(_probe_lines(record))
 
     record = _fake_found_record()
     record["semantic"] = "not JSON"
     with pytest.raises(SkeletonError, match="invalid elaborated semantic material"):
-        parse_probe_output(PROBE_MARKER + json.dumps(record))
+        parse_probe_output(_probe_lines(record))
 
     record = _fake_found_record()
     semantic = json.loads(str(record["semantic"]))
     semantic["root"]["safety"] = "unknown"
     record["semantic"] = json.dumps(semantic)
     with pytest.raises(SkeletonError, match="invalid elaborated semantic material"):
-        parse_probe_output(PROBE_MARKER + json.dumps(record))
+        parse_probe_output(_probe_lines(record))
 
     record = _fake_found_record()
     semantic = json.loads(str(record["semantic"]))
@@ -631,36 +676,36 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
     ]
     record["semantic"] = json.dumps(semantic)
     with pytest.raises(SkeletonError, match="invalid elaborated semantic material"):
-        parse_probe_output(PROBE_MARKER + json.dumps(record))
+        parse_probe_output(_probe_lines(record))
 
     record = _fake_found_record()
     trusted = record["trusted"]
     assert isinstance(trusted, list) and isinstance(trusted[0], dict)
     trusted[0]["depends"] = [False]
     with pytest.raises(SkeletonError, match="invalid depends"):
-        parse_probe_output(PROBE_MARKER + json.dumps(record))
+        parse_probe_output(_probe_lines(record))
 
     record = _fake_found_record()
     trusted = record["trusted"]
     assert isinstance(trusted, list) and isinstance(trusted[0], dict)
     trusted[0]["source"] = trusted[0]["source_comments"] = None
-    (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+    (parsed,) = parse_probe_output(_probe_lines(record)).values()
     assert "omitted required source" in str(_probe_record_issue(parsed))
 
     record = _fake_found_record()
     record["source"] = "theorem t : True := by trivial"
     with pytest.raises(SkeletonError, match="proof-bearing source"):
-        parse_probe_output(PROBE_MARKER + json.dumps(record))
+        parse_probe_output(_probe_lines(record))
 
     record = _fake_found_record()
     record["statement_source"] = 7
     with pytest.raises(SkeletonError, match="invalid statement_source"):
-        parse_probe_output(PROBE_MARKER + json.dumps(record))
+        parse_probe_output(_probe_lines(record))
 
     # A statement Lean cannot parse is withheld from the packet, not refused.
     record = _fake_found_record()
     record["statement_source"] = record["statement_comments"] = None
-    (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+    (parsed,) = parse_probe_output(_probe_lines(record)).values()
     assert _probe_record_issue(parsed) is None
 
 
@@ -677,13 +722,13 @@ def test_generated_companions_without_a_source_range_need_no_source() -> None:
     # Lean's internal-detail spellings only.
     companions = ["Skel.NonAmbiguous._unary", "Skel.Other.eq_1"]
     record["trusted"] = [*trusted, *(rangeless(name) for name in companions)]
-    (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+    (parsed,) = parse_probe_output(_probe_lines(record)).values()
     assert _probe_record_issue(parsed) is None
 
     # An ordinary name needs its own source, even under a declaration with a range.
     for name in ("Skel.Unplaced.helper", "Skel.NonAmbiguous.generated"):
         record["trusted"] = [*trusted, rangeless(name)]
-        (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+        (parsed,) = parse_probe_output(_probe_lines(record)).values()
         assert _probe_record_issue(parsed) == (
             f"the skeleton probe omitted required source for Skel.observation_determined trusted declaration {name}"
         )
@@ -698,7 +743,7 @@ def test_unparsable_source_is_withheld_not_refused(tmp_path: Path) -> None:
     record["statement_source"] = record["statement_comments"] = None
     record["trusted"][2]["source_comments"] = None
 
-    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _probe_lines(record))
 
     assert report.clean and not report.unresolved
     (declaration,) = report.nodes[0].declarations
@@ -713,7 +758,7 @@ def test_unparsable_source_is_withheld_not_refused(tmp_path: Path) -> None:
     assert load_skeleton_report(path) == report
     # The flag cannot excuse source a report actually carries.
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["nodes"][0]["declarations"][0]["trusted"][2]["source_withheld"] = True
+    data["trusted"][data["nodes"][0]["declarations"][0]["trusted"][2]]["source_withheld"] = True
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(SkeletonError, match="invalid withheld source flag"):
         load_skeleton_report(path)
@@ -971,7 +1016,7 @@ def test_trusted_theorem_source_never_exposes_its_proof(tmp_path: Path) -> None:
             "source_comments": None,
         }
     )
-    output = PROBE_MARKER + json.dumps(record)
+    output = _probe_lines(record)
 
     report = extract_skeletons(blueprint, lean_root=project, runner=lambda probe, root: output)
     theorem = next(item for item in report.nodes[0].declarations[0].trusted if item.name == "Skel.eligible_of")
@@ -1017,7 +1062,7 @@ def test_article_with_an_unresolved_declaration_has_no_article_hash(tmp_path: Pa
     blueprint = _blueprint(
         tmp_path, lean={"mixed": "Skel.observation_determined Skel.doesNotExist"}
     )
-    output = PROBE_MARKER + json.dumps(_fake_found_record())
+    output = _probe_lines(_fake_found_record())
 
     report = extract_skeletons(blueprint, lean_root=project, runner=lambda probe, root: output)
 
@@ -1165,7 +1210,7 @@ def test_packets_drop_the_comments_lean_reports_and_keep_the_rest(tmp_path: Path
     record["trusted"] = [trusted, record["trusted"][1], record["trusted"][0]]
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
-    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _probe_lines(record))
 
     blind = report.nodes[0].blind_text()
     assert "KEEPOUT" not in blind and "def docOpened : Nat := 6" in blind
@@ -1192,11 +1237,11 @@ def test_packets_fail_closed_when_lean_cannot_locate_comments(tmp_path: Path) ->
     record["trusted"][2]["source_comments"] = []
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
-    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _probe_lines(record))
     assert "def claim : Prop := 2 + 2 =--\n  5" in report.nodes[0].blind_text()
 
     record["trusted"][2]["source_comments"] = None
-    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _probe_lines(record))
     assert "=--" not in report.nodes[0].blind_text()
     (claim,) = [item for item in report.nodes[0].declarations[0].trusted if item.name == "Skel.Eligible"]
     assert claim.source is None and claim.source_withheld
@@ -1210,7 +1255,7 @@ def test_probe_comment_ranges_must_cover_comments(tmp_path: Path, ranges: object
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
 
     with pytest.raises(SkeletonError, match="invalid statement_comments"):
-        extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+        extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _probe_lines(record))
 
 
 @pytest.mark.parametrize(
@@ -1390,6 +1435,52 @@ def test_report_round_trips_through_json_deterministically(tmp_path: Path) -> No
             load_skeleton_report(path)
 
 
+def test_report_states_shared_material_once(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(
+        tmp_path,
+        lean={"determined": "Skel.observation_determined", "supervision": "Skel.supervision_nonAmbiguous"},
+    )
+    second = _probe_lines({**_fake_found_record(), "root": "Skel.supervision_nonAmbiguous"}).splitlines()[-1]
+    output = _fake_probe_output() + "\n" + second
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: output)
+    assert report.clean
+
+    first = report.to_json()
+    data = json.loads(first)
+    assert sorted(data["trusted"]) == ["Skel.Eligible", "Skel.NonAmbiguous", "Skel.Observation"]
+    assert list(data["semantics"]) == ["Mathlib.Fake", "sorryAx"]
+    assert list(data["boundary_modules"]) == ["Mathlib.Fake"]
+    for node in data["nodes"]:
+        (declaration,) = node["declarations"]
+        assert declaration["trusted"] == ["Skel.Eligible", "Skel.NonAmbiguous", "Skel.Observation"]
+        assert declaration["boundary_modules"] == ["Mathlib.Fake"]
+    source = data["trusted"]["Skel.Eligible"]["source"]
+    assert first.count(json.dumps(source, ensure_ascii=False)) == 1
+    path = tmp_path / "skeleton.json"
+    path.write_text(first, encoding="utf-8")
+    assert load_skeleton_report(path) == report
+
+    for table, name in (("trusted", "Skel.Eligible"), ("semantics", "sorryAx"), ("boundary_modules", "Mathlib.Fake")):
+        payload = json.loads(first)
+        payload[table]["Skel.Unused"] = payload[table][name]
+        if table == "trusted":
+            payload[table]["Skel.Unused"] = dict(payload[table][name], name="Skel.Unused")
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(SkeletonError, match="unreferenced shared entries"):
+            load_skeleton_report(path)
+        del payload[table]["Skel.Unused"], payload[table][name]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(SkeletonError, match="mismatched"):
+            load_skeleton_report(path)
+
+    payload = json.loads(first)
+    payload["trusted"]["Skel.Eligible"]["name"] = "Skel.NonAmbiguous"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SkeletonError, match="mismatched shared trusted declaration"):
+        load_skeleton_report(path)
+
+
 def test_report_loader_rejects_scope_tampering(tmp_path: Path) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
@@ -1404,6 +1495,7 @@ def test_report_loader_rejects_scope_tampering(tmp_path: Path) -> None:
 
     payload = report.as_dict()
     payload["nodes"][0] = replace(report.nodes[0], declarations=(), complete=False).as_dict()
+    payload["trusted"] = payload["semantics"] = payload["boundary_modules"] = {}
     payload["unresolved"] = [
         {"declaration": "made.up", "node_id": "basics/determined", "reason": "missing"}
     ]
@@ -1451,7 +1543,7 @@ def test_report_loader_rejects_mismatched_hashes_and_trust_identities(tmp_path: 
         load_skeleton_report(path)
 
     payload = report.as_dict()
-    trusted = payload["nodes"][0]["declarations"][0]["trusted"][0]
+    trusted = payload["trusted"][payload["nodes"][0]["declarations"][0]["trusted"][0]]
     trusted["kind"] = "theorem"
     trusted["semantic"] = _semantic({"type": {"sort": {"zero": None}}})
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -2454,6 +2546,63 @@ def test_external_internal_detail_rotates_the_declaration_hash(tmp_path: Path) -
     assert changed_detail["semantic"] == detail["semantic"]
     assert changed_detail["assumed_semantics"] != detail["assumed_semantics"]
     assert declaration(changed_detail).hash != detail_hash
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_shared_probe_tables_keep_every_hash(tmp_path: Path) -> None:
+    # The probe states each trusted declaration, semantic material, and module
+    # once per run. Recorded before that change: every hash must survive it.
+    project = _project(tmp_path)
+    build = subprocess.run(["lake", "build"], cwd=project, capture_output=True, text=True, timeout=600, check=False)
+    assert build.returncode == 0, build.stderr
+    runs = {
+        "Skel": (
+            "Skel.observation_determined",
+            "Skel.supervision_nonAmbiguous",
+            "Skel.supervision",
+            "Skel.heavy_of_weight",
+            "Skel.heavy_of_notation",
+            "Skel.Kinds.usesWf",
+            "Skel.Kinds.usesStructural",
+            "Skel.Kinds.usesDefault",
+            "Skel.Semantics.usesFieldOrder",
+            "Skel.AxiomUse.result",
+        ),
+        "Skel.Semantics": (
+            "Skel.Semantics.selectedProposition",
+            "Skel.Semantics.usesExternalDetail",
+            "Skel.Semantics.usesExternalMatch",
+            "Skel.Semantics.usesExternalPrivate",
+            "Skel.Semantics.usesVendorMacro",
+            "Skel.Semantics.usesVendorWf",
+            "Skel.Semantics.usesVendorModule",
+            "Skel.Semantics.usesVendorPrivateAxiom",
+        ),
+    }
+    hashes: dict[str, list[object]] = {}
+    for project_root, roots in runs.items():
+        probe = render_probe(imports=("Skel",), roots=roots, project_roots=(project_root,))
+        output = run_probe(probe, project)
+        records = parse_probe_output(output, expected_roots=roots)
+        # Two roots here trust `Skel.NonAmbiguous`; its record is stated once.
+        assert output.count('"source_name":"Skel.NonAmbiguous"') == (project_root == "Skel")
+        declarations = []
+        for root in roots:
+            assert _probe_record_issue(records[root]) is None, root
+            declaration = _declaration(
+                records[root],
+                libraries=lean_libraries(project),
+                lean_root=project,
+                index=index_project(project),
+                module_hashes={},
+                snapshot_started_ns=None,
+            )
+            declarations.append(declaration)
+            hashes[f"{project_root}:{root}"] = [declaration.hash, declaration.evidence_hash]
+        node = NodeSkeleton(node_id=project_root, article_path="a.md", declarations=tuple(declarations))
+        hashes[project_root] = [node.hash, node.evidence_hash, node.review_hash]
+    digest = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
+    assert digest == "6ed0a2d73fd58e4c8a13a67bf3bf7f4ba3e27c2c156a080f3c689249d10f0df7", f"{digest}\n{json.dumps(hashes, indent=1)}"
 
 
 def _build_semantics(project: Path) -> None:
