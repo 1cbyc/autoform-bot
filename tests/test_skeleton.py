@@ -468,7 +468,11 @@ def test_bounded_command_interruption_kills_the_process(tmp_path: Path, monkeypa
 @pytest.mark.skipif(os.name != "posix", reason="termination signals are POSIX-specific")
 @pytest.mark.parametrize(
     "signals",
-    [(signal.SIGTERM,), (signal.SIGHUP,), (signal.SIGINT, signal.SIGINT)],
+    [
+        (signal.SIGTERM,),
+        (getattr(signal, "SIGHUP", signal.SIGTERM),),
+        (signal.SIGINT, signal.SIGINT),
+    ],
     ids=["term", "hup", "double-int"],
 )
 def test_bounded_command_termination_signal_kills_the_process_group(
