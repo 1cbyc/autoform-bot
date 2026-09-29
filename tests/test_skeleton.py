@@ -1040,6 +1040,8 @@ def test_assumed_module_identity_is_path_independent_and_rejects_a_concurrent_ed
 
     started = time.time_ns()
     artifact.write_bytes(b"new")
+    # A coarse filesystem clock can stamp a write in the same tick at or before `started`.
+    os.utime(artifact, ns=(started + 10**9, started + 10**9))
 
     with pytest.raises(SkeletonError, match="changed during skeleton extraction"):
         _hash_module_files(
@@ -1178,6 +1180,9 @@ def test_default_extraction_rejects_sources_changed_during_probe(tmp_path: Path,
     def changing_probe(probe: str, lean_root: Path) -> str:
         source = lean_root / "Skel" / "Defs.lean"
         source.write_text(source.read_text(encoding="utf-8") + "\n-- concurrent edit\n", encoding="utf-8")
+        # A coarse filesystem clock can stamp this write at or before the snapshot it follows.
+        later = time.time_ns() + 10**9
+        os.utime(source, ns=(later, later))
         return _fake_probe_output()
 
     monkeypatch.setattr("autoform_cli.skeleton.run_probe", changing_probe)
