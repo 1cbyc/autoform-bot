@@ -37,7 +37,7 @@ from autoform_cli.skeleton import (
     _replace_outputs,
     _stage_output,
     _hash_module_files,
-    _check_local_safety,
+    _local_safety_issue,
     _without_comments,
     _probe_record_issue,
     extract_skeletons,
@@ -849,17 +849,18 @@ def test_local_safety_trusts_the_environment_without_source_lookup(safety: str) 
     # A generated or rewritten name has no source index entry; that is no reason to refuse it.
     semantic = json.dumps({"generated": [], "root": {"safety": safety, "type": {}, "value": {}}})
 
-    _check_local_safety("_private.Project.0.Project.value._proof_1", semantic)
+    assert _local_safety_issue("_private.Project.0.Project.value._proof_1", semantic) is None
 
 
 def test_local_safety_rejects_partial_material_including_generated_companions() -> None:
-    with pytest.raises(SkeletonError, match="partial declaration spin cannot be included"):
-        _check_local_safety("spin", _semantic({"type": {}, "value": {}}).replace('"safe"', '"partial"'))
+    issue = _local_safety_issue("spin", _semantic({"type": {}, "value": {}}).replace('"safe"', '"partial"'))
+    assert issue == "partial declaration spin cannot be included in a trusted skeleton"
 
     companion = {"name": {"str": [None, "go"]}, "material": {"safety": "partial", "type": {}}}
     semantic = json.dumps({"generated": [companion], "root": {"safety": "safe", "type": {}, "value": {}}})
-    with pytest.raises(SkeletonError, match="partial declaration outer cannot be included"):
-        _check_local_safety("outer", semantic)
+    assert _local_safety_issue("outer", semantic) == (
+        "partial declaration outer cannot be included in a trusted skeleton"
+    )
 
 
 def test_skeleton_hash_uses_elaborated_semantics_not_source_formatting(tmp_path: Path) -> None:
@@ -1967,8 +1968,9 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
         tmp_path / "partial",
         lean={"partial": "Skel.Semantics.partialValue"},
     )
-    with pytest.raises(SkeletonError, match="partial declaration .* cannot be included"):
-        extract_skeletons(partial_blueprint, lean_root=project)
+    _assert_partial_refused(
+        extract_skeletons(partial_blueprint, lean_root=project), "Skel.Semantics.partialValue"
+    )
 
     ordinary_blueprint = _blueprint(
         tmp_path / "ordinary",
@@ -2165,9 +2167,9 @@ def test_private_dependency_safety_uses_the_lean_environment(tmp_path: Path) -> 
         tmp_path / "private-partial",
         lean={"partial": "Skel.Semantics.usesPrivatePartial"},
     )
-    error = "partial declaration Skel.Semantics.privatePartialValue cannot be included"
-    with pytest.raises(SkeletonError, match=error):
-        extract_skeletons(partial_blueprint, lean_root=project)
+    _assert_partial_refused(
+        extract_skeletons(partial_blueprint, lean_root=project), "Skel.Semantics.privatePartialValue"
+    )
 
     source = project / "Skel" / "Semantics.lean"
     before = source.read_text(encoding="utf-8")
@@ -2187,8 +2189,18 @@ def test_private_dependency_safety_uses_the_lean_environment(tmp_path: Path) -> 
     )
     assert rebuild.returncode == 0, rebuild.stderr
 
-    with pytest.raises(SkeletonError, match=error):
-        extract_skeletons(partial_blueprint, lean_root=project)
+    _assert_partial_refused(
+        extract_skeletons(partial_blueprint, lean_root=project), "Skel.Semantics.privatePartialValue"
+    )
+
+
+def _assert_partial_refused(report, dependency: str) -> None:
+    """A partial root or dependency leaves its article with no trusted skeleton."""
+
+    assert not report.clean
+    assert all(not node.declarations and not node.complete for node in report.nodes)
+    reason = f"partial declaration {dependency} cannot be included in a trusted skeleton"
+    assert [issue.reason for issue in report.unresolved] == [reason]
 
 
 def _build(project: Path, *targets: str) -> None:
@@ -2338,8 +2350,37 @@ def test_partial_dependencies_are_rejected_however_they_are_written(tmp_path: Pa
 
     for root, dependency in cases.items():
         blueprint = _blueprint(tmp_path / root, lean={"partial": root})
-        with pytest.raises(SkeletonError, match=f"partial declaration {dependency} cannot be included"):
-            extract_skeletons(blueprint, lean_root=project)
+        _assert_partial_refused(extract_skeletons(blueprint, lean_root=project), dependency)
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_a_partial_dependency_refuses_only_its_own_article(tmp_path: Path, capsys) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Partial")
+    blueprint = _blueprint(
+        tmp_path,
+        lean={"ordinary": "Skel.Partial.usesMutual", "partial": "Skel.Partial.usesOwnLine"},
+    )
+
+    report = extract_skeletons(blueprint, lean_root=project)
+
+    ordinary, refused = report.nodes
+    assert ordinary.node_id == "basics/ordinary" and ordinary.complete
+    assert [item.name for item in ordinary.declarations] == ["Skel.Partial.usesMutual"]
+    assert refused.node_id == "basics/partial" and refused.declarations == () and refused.hash is None
+    assert not report.clean
+    assert [issue.message for issue in report.unresolved] == [
+        "basics/partial: Skel.Partial.usesOwnLine: partial declaration Skel.Partial.ownLine "
+        "cannot be included in a trusted skeleton"
+    ]
+
+    packets = tmp_path / "packets"
+    arguments = ["skeleton", str(blueprint), "--lean-root", str(project), "--json"]
+    assert main([*arguments, "--packets", str(packets)]) == 1
+    captured = capsys.readouterr()
+    assert "refusing to publish review packets" in captured.err
+    assert json.loads(captured.out)["unresolved"] == [issue.as_dict() for issue in report.unresolved]
+    assert not packets.exists()
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")

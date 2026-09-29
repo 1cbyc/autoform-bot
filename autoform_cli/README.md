@@ -316,11 +316,11 @@ expanded. Compiler-generated companions without a source range, such as
 and shown with the declaration they were generated from. Any other
 declaration without its own source, such as one a metaprogram adds under an
 existing name, is refused rather than shown as its parent. A `partial def`
-anywhere in the trusted closure is refused, as recorded by the Lean
+anywhere in a declaration's trusted closure is refused, as recorded by the Lean
 environment rather than by the source text: its kernel face is an opaque
 constant, so the body a reader would see is not what Lean checks. The command
 exits nonzero when a `lean:` name is absent from the sources or from the built
-environment; that name is unresolved for its article only, other articles still extract, and it writes nothing into the vault;
+environment, or reaches a refused declaration; that name is unresolved for its article only, other articles still extract, and it writes nothing into the vault;
 `--output` records the `autoform-skeleton/v4` report, which contains no
 timestamp or absolute path, for a later render or review to consume. The
 report identifies the exact blueprint, its complete target set, and whether

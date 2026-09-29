@@ -1897,12 +1897,19 @@ def _probe_record_issue(record: dict[str, object]) -> str | None:
     show a reviewer. That is a gap in this node's evidence, not in the probe
     run, so other nodes still extract. Source Lean cannot read outside its file
     (for example, a statement that uses `local notation`) is only withheld: the
-    signatures and canonical kernel material still state its meaning.
+    signatures and canonical kernel material still state its meaning. A
+    partial root or trusted dependency has no kernel meaning to bind, so its
+    node is refused as well.
     """
 
     root = str(record["root"])
     trusted = record["trusted"]
     assert isinstance(trusted, list)
+    safety = [(root, record)] + [(str(item.get("source_name") or ""), item) for item in trusted]
+    for source_name, item in safety:
+        issue = _local_safety_issue(source_name, str(item["semantic"]))
+        if issue is not None:
+            return issue
     entries = [(root, root, record)]
     entries += [(str(item["name"]), f"{root} trusted declaration {item['name']}", item) for item in trusted]
     for name, context, item in entries:
@@ -2089,8 +2096,8 @@ def _semantic_pairs(value: object) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
-def _check_local_safety(source_name: str, semantic: str) -> None:
-    """Reject partial declarations by the Lean environment's own record.
+def _local_safety_issue(source_name: str, semantic: str) -> str | None:
+    """Refuse partial declarations by the Lean environment's own record.
 
     The source text is not consulted: `partial` may sit on its own line, come
     from a macro, or mark a `where` helper, and generated names are not indexed.
@@ -2099,7 +2106,8 @@ def _check_local_safety(source_name: str, semantic: str) -> None:
     payload = json.loads(semantic)
     materials = [payload["root"], *(entry["material"] for entry in payload["generated"])]
     if any(isinstance(material, dict) and material.get("safety") == "partial" for material in materials):
-        raise SkeletonError([f"partial declaration {source_name} cannot be included in a trusted skeleton"])
+        return f"partial declaration {source_name} cannot be included in a trusted skeleton"
+    return None
 
 
 def _require_semantic_pairs(
@@ -2529,7 +2537,6 @@ def _declaration(
     )
     start, end = _range(record.get("range"))
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
-    _check_local_safety(name, semantic)
     declaration = DeclarationSkeleton(
         name=name,
         kind=str(record.get("kind") or "unknown"),
@@ -2570,12 +2577,10 @@ def _trusted(
     index: SourceIndex,
 ) -> TrustedDeclaration:
     name = str(item.get("name") or "")
-    source_name = str(item.get("source_name") or "")
     semantic = str(item["semantic"])
     module = str(item.get("module") or "")
     start, end = _range(item.get("range"))
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
-    _check_local_safety(source_name, semantic)
     source, source_comments, source_withheld = _shown_source(
         _optional_probe_string(item.get("source")), item.get("source_comments"), name=name
     )
