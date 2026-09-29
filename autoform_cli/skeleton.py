@@ -93,6 +93,9 @@ DEFAULT_PROBE_TIMEOUT = 600.0
 #: project can take minutes on its own, so it does not share the probe's budget.
 DEFAULT_FRESHNESS_TIMEOUT = 600.0
 DEFAULT_PROBE_OUTPUT_LIMIT = 64 * 1024 * 1024
+#: The probe states shared subterms once; this bounds the characters of
+#: semantic material they may expand to in one run.
+_PROBE_MATERIAL_LIMIT = 512 * 1024 * 1024
 _PROCESS_TERMINATION_GRACE = 2.0
 #: Lake's exit status when ``--no-build`` finds a target that needs rebuilding.
 _LAKE_NO_BUILD_EXIT = 3
@@ -1879,17 +1882,79 @@ def parse_probe_output(
         if expected is not None and root not in expected:
             raise SkeletonError([f"the skeleton probe emitted an unrequested root: {root}"])
         records[root] = record
+    expand = _expand_probe_material(tables)
     # Shared entries are validated once, however many roots name them.
     checked: set[int] = set()
     for root, record in records.items():
-        records[root] = _resolve_probe_record(record, tables, root=root)
+        records[root] = _resolve_probe_record(record, tables, root=root, expand=expand)
         _validate_probe_record(records[root], root=root, checked=checked)
     return records
 
 
 #: What a probe table entry's value must be: a trusted declaration's record,
-#: an external constant's semantic material, or a module's compiled files.
-_PROBE_TABLES: dict[str, type] = {"module": list, "semantic": str, "trusted": dict}
+#: an external constant's semantic material, a module's compiled files, or a
+#: fragment of semantic material. Material is a list of text pieces and
+#: fragment numbers, which expands to its text.
+_PROBE_TABLES: dict[str, type] = {"fragment": list, "module": list, "semantic": list, "trusted": dict}
+
+
+def _expand_probe_material(tables: dict[str, dict[str, object]]) -> Callable[[object, str], str]:
+    """Replace the semantic material in ``tables`` with its text; return the expander.
+
+    A fragment refers only to earlier fragments, so expansion terminates; the
+    characters it produces across the run are bounded.
+    """
+
+    fragments: dict[int, list[object]] = {}
+    for name, pieces in tables.pop("fragment").items():
+        number = int(name) if name.isdecimal() and name.isascii() else -1
+        if str(number) != name or not isinstance(pieces, list) or not _material_pieces(pieces, below=number):
+            raise SkeletonError([f"the skeleton probe emitted a malformed fragment {name}"])
+        fragments[number] = pieces
+    remaining = _PROBE_MATERIAL_LIMIT
+
+    def expand(pieces: object, context: str) -> str:
+        nonlocal remaining
+        if (
+            not isinstance(pieces, list)
+            or not _material_pieces(pieces, below=None)
+            or not all(isinstance(piece, str) or piece in fragments for piece in pieces)
+        ):
+            raise SkeletonError([f"the skeleton probe emitted invalid semantic material for {context}"])
+        text: list[str] = []
+        stack = [iter(pieces)]
+        while stack:
+            piece = next(stack[-1], None)
+            if piece is None:
+                stack.pop()
+            elif isinstance(piece, str):
+                remaining -= len(piece)
+                if remaining < 0:
+                    raise SkeletonError(
+                        [f"the skeleton probe's semantic material exceeds {_PROBE_MATERIAL_LIMIT} characters"]
+                    )
+                text.append(piece)
+            elif isinstance(piece, int):
+                stack.append(iter(fragments[piece]))
+        return "".join(text)
+
+    semantics = tables["semantic"]
+    for name, pieces in semantics.items():
+        semantics[name] = expand(pieces, name)
+    for name, item in tables["trusted"].items():
+        if isinstance(item, dict) and "semantic" in item:
+            item["semantic"] = expand(item["semantic"], name)
+    return expand
+
+
+def _material_pieces(pieces: object, *, below: int | None) -> bool:
+    """Whether ``pieces`` is text and fragment numbers (each below ``below``)."""
+
+    return isinstance(pieces, list) and all(
+        isinstance(piece, str)
+        or (type(piece) is int and piece >= 0 and (below is None or piece < below))
+        for piece in pieces
+    )
 
 
 def _read_probe_table(record: dict[str, object], tables: dict[str, dict[str, object]]) -> None:
@@ -1910,7 +1975,11 @@ def _read_probe_table(record: dict[str, object], tables: dict[str, dict[str, obj
 
 
 def _resolve_probe_record(
-    record: dict[str, object], tables: dict[str, dict[str, object]], *, root: str
+    record: dict[str, object],
+    tables: dict[str, dict[str, object]],
+    *,
+    root: str,
+    expand: Callable[[object, str], str],
 ) -> dict[str, object]:
     """Replace a root record's names with the shared entries they refer to."""
 
@@ -1929,6 +1998,7 @@ def _resolve_probe_record(
         return [(name, tables[table][name]) for name in names]
 
     resolved = dict(record)
+    resolved["semantic"] = expand(record["semantic"], root)
     resolved["trusted"] = [item for _, item in entries("trusted", "trusted")]
     resolved["assumed_semantics"] = [[name, value] for name, value in entries("assumed", "semantic")]
     resolved["axiom_semantics"] = [[name, value] for name, value in entries("axioms", "semantic")]

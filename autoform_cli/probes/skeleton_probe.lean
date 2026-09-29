@@ -87,31 +87,120 @@ def safetyJson (env : Environment) (c : Name) (info : ConstantInfo) : Json :=
     Json.str "partial"
   else Json.str "safe"
 
+/-- Serialized material: literal text, or a fragment the probe states once per
+run, with the size of its text. Proof terms share subterms heavily, and their
+tree serialization would repeat each shared subterm in full. -/
+inductive Piece where
+  | lit (text : String)
+  | ref (id : Nat) (size : Nat)
+  deriving BEq, Hashable
+
+def Piece.size : Piece → Nat
+  | .lit text => text.utf8ByteSize
+  | .ref _ size => size
+
+/-- Expressions whose text is shorter than this stay inline. -/
+def fragmentThreshold : Nat := 256
+
+/-- Serialized material and expression fragments, shared across roots in one
+probe. The environment is immutable for the generated `run_cmd`, so `Name` is a
+complete material key. A fragment is keyed by its own pieces, which fix its
+text, so equal subterms share one fragment wherever they occur. -/
+structure SemanticCache where
+  materials : Std.HashMap Name Json := {{}}
+  fragmentIds : Std.HashMap (Array Piece) Piece := {{}}
+  fragments : Nat := 0
+
+/-- Pieces as the probe prints them: adjacent text merged into one string and
+each fragment as its number. Expanding the numbers gives `Json.compress`. -/
+def piecesJson (parts : Array Piece) : Json := Id.run do
+  let mut out : Array Json := #[]
+  let mut text := ""
+  for part in parts do
+    match part with
+    | .lit s => text := text ++ s
+    | .ref id _ =>
+      unless text.isEmpty do
+        out := out.push (Json.str text)
+      text := ""
+      out := out.push (toJson id)
+  unless text.isEmpty do
+    out := out.push (Json.str text)
+  return Json.arr out
+
+/-- Inline short text; state longer text once as a numbered fragment, which is
+emitted after the fragments it refers to. -/
+def sealPieces (cache : IO.Ref SemanticCache) (parts : Array Piece) : IO Piece := do
+  let size := parts.foldl (fun n part => n + part.size) 0
+  if size < fragmentThreshold then
+    -- Every part is shorter than the whole, so every part is literal.
+    return .lit (parts.foldl (fun text part => match part with
+      | .lit s => text ++ s
+      | .ref .. => text) "")
+  if let some piece := (← cache.get).fragmentIds[parts]? then
+    return piece
+  let id := (← cache.get).fragments
+  cache.modify fun c =>
+    {{ c with fragments := id + 1, fragmentIds := c.fragmentIds.insert parts (.ref id size) }}
+  let entry := Json.mkObj [
+    ("table", Json.str "fragment"), ("name", Json.str (toString id)), ("value", piecesJson parts)]
+  IO.println s!"{marker}{{entry.compress}}"
+  return .ref id size
+
+/-- `exprJson`, as pieces. `Json.compress` is compositional, so each node's
+text is its syntax around its children's text. -/
+partial def exprPieces (cache : IO.Ref SemanticCache) (lp : List Name) (e : Expr) : IO Piece := do
+  if let .mdata _ b := e then
+    return ← exprPieces cache lp b
+  let go := exprPieces cache lp
+  let text (j : Json) : Piece := .lit j.compress
+  let parts : Array Piece ← match e with
+    | .app f a => do
+      pure #[.lit "{{\"app\":[", ← go f, .lit ",", ← go a, .lit "]}}"]
+    | .lam _ t b bi => do
+      pure #[.lit "{{\"lam\":[", text (binderInfoJson bi), .lit ",", ← go t, .lit ",", ← go b,
+        .lit "]}}"]
+    | .forallE _ t b bi => do
+      pure #[.lit "{{\"forall\":[", text (binderInfoJson bi), .lit ",", ← go t, .lit ",", ← go b,
+        .lit "]}}"]
+    | .letE _ t v b nd => do
+      pure #[.lit "{{\"let\":[", text (Json.bool nd), .lit ",", ← go t, .lit ",", ← go v,
+        .lit ",", ← go b, .lit "]}}"]
+    | .proj n i b => do
+      pure #[.lit "{{\"projection\":[", text (nameJson n), .lit ",", text (i : Json), .lit ",",
+        ← go b, .lit "]}}"]
+    | _ => pure #[text (exprJson lp e)]
+  sealPieces cache parts
+
 /-- Elaboration result whose exact bytes bind a review to kernel-visible
-meaning. The theorem proof is excluded; definition and opaque bodies are not. -/
-def semanticJson (env : Environment) (c : Name) : Json :=
+meaning. The theorem proof is excluded; definition and opaque bodies are not.
+Object fields appear in `Json.mkObj`'s sorted order. -/
+def semanticParts (cache : IO.Ref SemanticCache) (env : Environment) (c : Name) :
+    IO (Array Piece) := do
+  let expr (lp : List Name) (e : Expr) := exprPieces cache lp e
+  let safety (info : ConstantInfo) : Piece := .lit (safetyJson env c info).compress
   match env.find? c with
-  | some info@(.defnInfo v) => Json.mkObj [
-      ("safety", safetyJson env c info),
-      ("type", exprJson v.levelParams v.type),
-      ("value", exprJson v.levelParams v.value)]
-  | some info@(.opaqueInfo v) => Json.mkObj [
-      ("safety", safetyJson env c info),
-      ("type", exprJson v.levelParams v.type),
-      ("value", exprJson v.levelParams v.value)]
-  | some (.inductInfo v) => Json.mkObj [
-      ("safety", safetyJson env c (.inductInfo v)),
-      ("type", exprJson v.levelParams v.type),
-      ("constructors", Json.arr <| v.ctors.toArray.map fun ctor =>
-        Json.mkObj [
-          ("name", nameJson ctor),
-          ("type", match env.find? ctor with
-            | some info => exprJson info.levelParams info.type
-            | none => Json.null)])]
-  | some info => Json.mkObj [
-      ("safety", safetyJson env c info),
-      ("type", exprJson info.levelParams info.type)]
-  | none => Json.null
+  | some info@(.defnInfo v) =>
+    return #[.lit "{{\"safety\":", safety info, .lit ",\"type\":", ← expr v.levelParams v.type,
+      .lit ",\"value\":", ← expr v.levelParams v.value, .lit "}}"]
+  | some info@(.opaqueInfo v) =>
+    return #[.lit "{{\"safety\":", safety info, .lit ",\"type\":", ← expr v.levelParams v.type,
+      .lit ",\"value\":", ← expr v.levelParams v.value, .lit "}}"]
+  | some (.inductInfo v) =>
+    let mut parts : Array Piece := #[.lit "{{\"constructors\":["]
+    for ctor in v.ctors, i in [0:v.ctors.length] do
+      parts := parts.push <| .lit <|
+        (if i == 0 then "" else ",") ++ "{{\"name\":" ++ (nameJson ctor).compress ++ ",\"type\":"
+      parts := parts.push <| ← match env.find? ctor with
+        | some info => expr info.levelParams info.type
+        | none => pure (.lit "null")
+      parts := parts.push (.lit "}}")
+    return parts ++ #[.lit "],\"safety\":", safety (.inductInfo v), .lit ",\"type\":",
+      ← expr v.levelParams v.type, .lit "}}"]
+  | some info =>
+    return #[.lit "{{\"safety\":", safety info, .lit ",\"type\":", ← expr info.levelParams info.type,
+      .lit "}}"]
+  | none => return #[.lit "null"]
 
 /-- Constants that fix the *meaning* of `c`: its type always, and its value only
 when `c` is a definition. A theorem's proof is never part of its meaning. A
@@ -142,8 +231,9 @@ partial def canonical (env : Environment) (c : Name) : Name :=
 
 /-- Kernel material for a source declaration and every generated companion
 whose implementation contributes to it. Generated names stay out of the human
-reading list, but their bodies must remain inside the semantic identity. -/
-def semanticMaterial (env : Environment) (c : Name) : String := Id.run do
+reading list, but their bodies must remain inside the semantic identity. The
+material is printed as pieces whose expansion is its `Json.compress` text. -/
+def semanticMaterial (cache : IO.Ref SemanticCache) (env : Environment) (c : Name) : IO Json := do
   let mut generated : Array Name := #[]
   let mut work : Array Name := #[c]
   let mut seen : Array Name := #[]
@@ -156,23 +246,21 @@ def semanticMaterial (env : Environment) (c : Name) : String := Id.run do
       if e != c && canonical env e == c && !generated.contains e then
         generated := generated.push e
         work := work.push e
-  let entries := generated.qsort Name.lt |>.map fun d => Json.mkObj [
-    ("name", nameJson d),
-    ("material", semanticJson env d)]
-  return (Json.mkObj [
-    ("root", semanticJson env c),
-    ("generated", Json.arr entries)]).compress
+  let mut parts : Array Piece := #[.lit "{{\"generated\":["]
+  for d in generated.qsort Name.lt, i in [0:generated.size] do
+    parts := parts.push (.lit ((if i == 0 then "" else ",") ++ "{{\"material\":"))
+    parts := parts ++ (← semanticParts cache env d)
+    parts := parts.push (.lit (",\"name\":" ++ (nameJson d).compress ++ "}}"))
+  parts := parts.push (.lit "],\"root\":")
+  parts := parts ++ (← semanticParts cache env c)
+  return piecesJson (parts.push (.lit "}}"))
 
-/-- Reuse canonical expression serialization across roots in one probe. The
-environment is immutable for the generated `run_cmd`, so `Name` is a complete
-cache key. -/
 def cachedSemanticMaterial
-    (cache : IO.Ref (Std.HashMap Name String))
-    (env : Environment) (c : Name) : CommandElabM String := do
-  if let some material := (← cache.get)[c]? then
+    (cache : IO.Ref SemanticCache) (env : Environment) (c : Name) : CommandElabM Json := do
+  if let some material := (← cache.get).materials[c]? then
     return material
-  let material := semanticMaterial env c
-  cache.modify (·.insert c material)
+  let material ← semanticMaterial cache env c
+  cache.modify fun s => {{ s with materials := s.materials.insert c material }}
   return material
 
 /-- Direct meaning-dependencies of a folded declaration. Generated companions
@@ -544,7 +632,7 @@ def skeleton
     (projectRoots : List Name)
     (coreModules : Std.HashSet Name)
     (expandCache : IO.Ref (Std.HashMap Name (Array Name)))
-    (semanticCache : IO.Ref (Std.HashMap Name String))
+    (semanticCache : IO.Ref SemanticCache)
     (emitted : IO.Ref (Std.HashSet (String × Name)))
     (request : String) (root : Name) : CommandElabM Unit := do
   let env ← getEnv
@@ -665,7 +753,7 @@ def skeleton
         ("signature", Json.str (← signatureOf c)),
         ("raw_signature", Json.str (← rawSignatureOf c)),
         ("semantic_schema", Json.str semanticSchema),
-        ("semantic", Json.str (← cachedSemanticMaterial semanticCache env c)),
+        ("semantic", ← cachedSemanticMaterial semanticCache env c),
         ("depends", Json.arr (deps.map fun d => Json.str (toString d))),
         ("source", source),
         ("source_comments", sourceComments)]
@@ -683,7 +771,7 @@ def skeleton
     | none => pure (Json.null, Json.null)
   for d in sortedAssumed ++ sortedAxioms do
     emitShared emitted "semantic" d do
-      return Json.str (← cachedSemanticMaterial semanticCache env d)
+      cachedSemanticMaterial semanticCache env d
   emit request <| [
     ("found", Json.bool true),
     ("statement_source", statement),
@@ -697,7 +785,7 @@ def skeleton
     ("signature", Json.str (← signatureOf root)),
     ("raw_signature", Json.str (← rawSignatureOf root)),
     ("semantic_schema", Json.str semanticSchema),
-    ("semantic", Json.str (← cachedSemanticMaterial semanticCache env root)),
+    ("semantic", ← cachedSemanticMaterial semanticCache env root),
     ("depends", Json.arr (rootDeps.map fun d => Json.str (toString d))),
     ("trusted", Json.arr items),
     ("assumed", Json.arr (sortedAssumed.map fun d => Json.str (toString d))),
@@ -710,7 +798,7 @@ set_option maxHeartbeats 0 in
 run_cmd do
   let projectRoots : List Name := [{project_roots}]
   let expandCache : IO.Ref (Std.HashMap Name (Array Name)) ← IO.mkRef {{}}
-  let semanticCache : IO.Ref (Std.HashMap Name String) ← IO.mkRef {{}}
+  let semanticCache : IO.Ref AutoformSkeleton.SemanticCache ← IO.mkRef {{}}
   let emitted : IO.Ref (Std.HashSet (String × Name)) ← IO.mkRef {{}}
   let coreModules ← AutoformSkeleton.toolchainModules (← getEnv)
   for (request, root) in [{roots}] do

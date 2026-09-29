@@ -332,7 +332,9 @@ trust, so the report states each trusted declaration, each external
 constant's semantic material, and each boundary module's identity once, in the
 top-level `trusted`, `semantics`, and `boundary_modules` tables, and each
 declaration names the entries it uses; the probe's own output is shared the
-same way.
+same way. The probe also states each elaborated subterm of 256 bytes or more
+once, since proof terms repeat large subterms heavily; the report keeps each
+material's full text.
 
 Run skeleton extraction only in a trusted checkout or an operating-system
 sandbox. Lake evaluates `lakefile.lean`, and the generated probe imports project

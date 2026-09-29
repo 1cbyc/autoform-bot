@@ -109,14 +109,14 @@ def _probe_lines(record: dict[str, object]) -> str:
     """Encode a resolved probe record as the probe prints it: shared entries, then the root."""
 
     if record.get("found") is not True:
-        return _probe_lines(record)
+        return PROBE_MARKER + json.dumps(record)
     entries: dict[tuple[str, str], object] = {}
-    wire = dict(record)
+    wire = dict(record, semantic=[record["semantic"]])
     for item in wire["trusted"]:
-        entries["trusted", item["name"]] = item
+        entries["trusted", item["name"]] = dict(item, semantic=[item["semantic"]])
     wire["trusted"] = [item["name"] for item in wire["trusted"]]
     for name, semantic in [*wire.pop("assumed_semantics"), *wire.pop("axiom_semantics")]:
-        entries["semantic", name] = semantic
+        entries["semantic", name] = [semantic]
     for module, kind, path in wire["boundary_modules"]:
         entries.setdefault(("module", module), []).append([kind, path])
     wire["boundary_modules"] = list(dict.fromkeys(module for module, _, _ in wire["boundary_modules"]))
@@ -651,6 +651,42 @@ def test_parse_probe_output_resolves_shared_entries_strictly() -> None:
         parse_probe_output(renamed)
     with pytest.raises(SkeletonError, match="invalid fields"):
         parse_probe_output(_record(**root, assumed_semantics=[]))
+
+
+def test_parse_probe_output_expands_fragments_strictly(monkeypatch) -> None:
+    output = _fake_probe_output()
+    *shared, last = output.splitlines()
+    root = json.loads(last[len(PROBE_MARKER) :])
+    (text,) = root["semantic"]
+
+    def probe(fragments: dict[str, object], semantic: list[object]) -> str:
+        lines = [
+            PROBE_MARKER + json.dumps({"table": "fragment", "name": name, "value": value})
+            for name, value in fragments.items()
+        ]
+        return "\n".join([*shared, *lines, PROBE_MARKER + json.dumps(dict(root, semantic=semantic))])
+
+    # Fragment 1 repeats fragment 0 where the text does not.
+    fragments = {"0": [text[:10]], "1": [0, text[10:20], 0]}
+    shared_text = [1, text[30:]]
+    reference = parse_probe_output(output)[root["root"]]
+    parsed = parse_probe_output(probe({"0": [text[:10]], "1": [0, text[10:30]]}, shared_text))
+    assert parsed[root["root"]] == reference
+    with pytest.raises(SkeletonError, match="invalid elaborated semantic material"):
+        parse_probe_output(probe(fragments, shared_text))
+    with pytest.raises(SkeletonError, match="malformed fragment 0"):
+        parse_probe_output(probe({"0": [1, "x"], "1": ["y"]}, [0]))
+    with pytest.raises(SkeletonError, match="malformed fragment 01"):
+        parse_probe_output(probe({"01": [text]}, [1]))
+    with pytest.raises(SkeletonError, match="malformed fragment 0"):
+        parse_probe_output(probe({"0": [True]}, [0]))
+    with pytest.raises(SkeletonError, match=f"invalid semantic material for {root['root']}"):
+        parse_probe_output(probe({}, [0]))
+    with pytest.raises(SkeletonError, match=f"invalid semantic material for {root['root']}"):
+        parse_probe_output(probe({}, text))  # type: ignore[arg-type]
+    monkeypatch.setattr("autoform_cli.skeleton._PROBE_MATERIAL_LIMIT", len(text) - 1)
+    with pytest.raises(SkeletonError, match="exceeds"):
+        parse_probe_output(probe({"0": [text[:10]], "1": [0, text[10:30]]}, shared_text))
 
 
 def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
@@ -2607,6 +2643,7 @@ def test_shared_probe_tables_keep_every_hash(tmp_path: Path) -> None:
         records = parse_probe_output(output, expected_roots=roots)
         # Two roots here trust `Skel.NonAmbiguous`; its record is stated once.
         assert output.count('"source_name":"Skel.NonAmbiguous"') == (project_root == "Skel")
+        assert '"table":"fragment"' in output
         declarations = []
         for root in roots:
             assert _probe_record_issue(records[root]) is None, root
