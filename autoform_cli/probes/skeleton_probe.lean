@@ -272,10 +272,12 @@ def expandedMeaning
     (env : Environment) (projectRoots : List Name) (c : Name) : CommandElabM (Array Name) := do
   if let some dependencies := (← cache.get)[c]? then
     return dependencies
+  -- `env.header` is slow to reach from the interpreted probe: read it once.
+  let moduleNames := env.header.moduleNames
   let isLocal (n : Name) : Bool :=
     match env.getModuleIdxFor? n with
     | some idx =>
-      let mod := env.header.moduleNames[idx.toNat]!
+      let mod := moduleNames[idx.toNat]!
       projectRoots.any (fun projectRoot => projectRoot.isPrefixOf mod)
     | none   => false
   let isClassProjection (e : Name) : Bool :=
@@ -639,12 +641,17 @@ def skeleton
   unless env.contains root do
     emit request [("found", Json.bool false)]
     return
+  -- `env.header` is slow to reach from the interpreted probe, so the module of
+  -- each dependency is looked up in names read once per root.
+  let moduleNames := env.header.moduleNames
+  let moduleOf (n : Name) : Option Name :=
+    (env.getModuleIdxFor? n).map fun idx => moduleNames[idx.toNat]!
   let isLocal (n : Name) : Bool :=
-    match moduleOf env n with
+    match moduleOf n with
     | some m => projectRoots.any (fun projectRoot => projectRoot.isPrefixOf m)
     | none   => false
   let isCore (n : Name) : Bool :=
-    match moduleOf env n with
+    match moduleOf n with
     | some m => coreModules.contains m
     | none   => true
   let expand (c : Name) : CommandElabM (Array Name) :=
@@ -694,21 +701,25 @@ def skeleton
   let sortedAssumed := assumed.qsort Name.lt
   let sortedAxioms := axioms.qsort Name.lt
   let mut boundaryClosure := sortedAssumed
+  -- Membership beside the array: a closure can hold thousands of constants.
+  let mut inBoundaryClosure : Std.HashSet Name := Std.HashSet.ofArray sortedAssumed
   for axiomName in sortedAxioms do
-    if !isCore axiomName && !boundaryClosure.contains axiomName then
+    if !isCore axiomName && !inBoundaryClosure.contains axiomName then
       boundaryClosure := boundaryClosure.push axiomName
+      inBoundaryClosure := inBoundaryClosure.insert axiomName
   let mut boundaryWork := boundaryClosure
   while h : boundaryWork.size > 0 do
     let c := boundaryWork[boundaryWork.size - 1]
     boundaryWork := boundaryWork.pop
     for d in ← expand c do
-      if !isLocal d && !isCore d && !boundaryClosure.contains d then
+      if !isLocal d && !isCore d && !inBoundaryClosure.contains d then
         boundaryClosure := boundaryClosure.push d
+        inBoundaryClosure := inBoundaryClosure.insert d
         boundaryWork := boundaryWork.push d
   let sortedBoundaryClosure := boundaryClosure.qsort Name.lt
   let mut boundaryModules : Array Name := #[]
   for c in sortedBoundaryClosure do
-    if let some mod := moduleOf env c then
+    if let some mod := moduleOf c then
       if !boundaryModules.contains mod then boundaryModules := boundaryModules.push mod
   let mut boundaryModuleNames : Array Json := #[]
   -- Compiled artifacts, not source bytes, identify a boundary module: macros,
@@ -748,7 +759,7 @@ def skeleton
         ("name", Json.str (toString c)),
         ("source_name", Json.str (toString (privateToUserName c))),
         ("kind", Json.str kind),
-        ("module", Json.str (toString ((moduleOf env c).getD Name.anonymous))),
+        ("module", Json.str (toString ((moduleOf c).getD Name.anonymous))),
         ("range", ← rangeJson c),
         ("signature", Json.str (← signatureOf c)),
         ("raw_signature", Json.str (← rawSignatureOf c)),
@@ -780,7 +791,7 @@ def skeleton
     ("source_comments", sourceComments),
     ("kind", Json.str rootKind),
     ("lean_version", Json.str Lean.versionString),
-    ("module", Json.str (toString ((moduleOf env root).getD Name.anonymous))),
+    ("module", Json.str (toString ((moduleOf root).getD Name.anonymous))),
     ("range", ← rangeJson root),
     ("signature", Json.str (← signatureOf root)),
     ("raw_signature", Json.str (← rawSignatureOf root)),
