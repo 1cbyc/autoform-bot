@@ -124,6 +124,10 @@ class SkeletonError(RuntimeError):
         super().__init__("; ".join(self.issues))
 
 
+class _CommandTimedOut(SkeletonError):
+    """A bounded command ran out of time; its caller knows which budget to raise."""
+
+
 #: Shown in place of source text Lean could not read apart from its file. The
 #: signatures and canonical kernel material above it still state the meaning.
 _NOT_SHOWN = "-- source not shown: Lean cannot read it reliably outside its file"
@@ -1354,7 +1358,7 @@ def _run_registered_command(
     guard: _SignalGuard,
 ) -> subprocess.CompletedProcess[str]:
     if timeout <= 0:
-        raise SkeletonError([f"{context} timed out"])
+        raise _CommandTimedOut([f"{context} timed out"])
     if output_limit < 1:
         raise ValueError("output_limit must be positive")
     popen_options: dict[str, object] = {}
@@ -1436,7 +1440,7 @@ def _run_registered_command(
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                failure = SkeletonError([f"{context} timed out after {timeout:g} seconds"])
+                failure = _CommandTimedOut([f"{context} timed out after {timeout:g} seconds"])
                 break
             overflow.wait(min(0.05, remaining))
         _remember_descendants(process, descendants)
@@ -1787,13 +1791,21 @@ def run_probe(
     with _signal_guard(), tempfile.TemporaryDirectory(prefix="autoform-skeleton-") as scratch:
         source = Path(scratch) / "AutoformSkeletonProbe.lean"
         source.write_text(probe, encoding="utf-8")
-        result = _run_bounded_command(
-            [lake, "env", "lean", str(source)],
-            cwd=lean_root,
-            timeout=max(0.0, deadline - time.monotonic()),
-            context="lake env lean",
-            env=env,
-        )
+        try:
+            result = _run_bounded_command(
+                [lake, "env", "lean", str(source)],
+                cwd=lean_root,
+                timeout=max(0.0, deadline - time.monotonic()),
+                context="lake env lean",
+                env=env,
+            )
+        except _CommandTimedOut as exc:
+            raise SkeletonError(
+                [
+                    f"lake env lean timed out after {timeout:g} seconds; "
+                    "rerun with --timeout <seconds> for large projects"
+                ]
+            ) from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         shadowed = _SHADOWED_CORE_MODULE.search(detail)

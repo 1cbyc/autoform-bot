@@ -601,6 +601,25 @@ def test_probe_freshness_and_execution_have_separate_budgets(tmp_path: Path, mon
     assert calls == [20, 9.0]
 
 
+def test_a_probe_timeout_names_the_flag_that_raises_it(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "lake-manifest.json").write_text("{}\n", encoding="utf-8")
+    bounded = _run_bounded_command
+
+    def slow_probe(command, **kwargs):
+        return bounded([sys.executable, "-c", "import time; time.sleep(30)"], **kwargs)
+
+    monkeypatch.setattr("autoform_cli.skeleton.shutil.which", lambda executable: "/bin/lake")
+    monkeypatch.setattr("autoform_cli.skeleton._check_artifacts_fresh", lambda *args, **kwargs: None)
+    monkeypatch.setattr("autoform_cli.skeleton._run_bounded_command", slow_probe)
+    probe = render_probe(imports=("Skel.Main",), roots=("Skel.x",), project_roots=("Skel",))
+
+    with pytest.raises(SkeletonError) as caught:
+        run_probe(probe, tmp_path, timeout=1)
+    assert caught.value.issues == (
+        "lake env lean timed out after 1 seconds; rerun with --timeout <seconds> for large projects",
+    )
+
+
 def test_probe_requires_an_existing_lake_manifest(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("autoform_cli.skeleton.shutil.which", lambda executable: "/bin/lake")
     probe = render_probe(imports=("Skel.Main",), roots=("Skel.x",), project_roots=("Skel",))
