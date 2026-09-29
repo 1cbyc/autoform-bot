@@ -346,6 +346,11 @@ build writes) for the transitive external boundary. Local source spelling and
 comments do not enter the hash, while macro expansion, synthesized instance
 bodies, types, and definition bodies do. Proof axioms, toolchain changes, and
 unrelated edits in an external module or its imports may also rotate it.
+Only modules whose `.olean` lies in the toolchain's own `lib/lean` count as
+core and stay outside the boundary; a dependency module named `Lake.Foo` is
+external like any other. A dependency library rooted at `Init`, `Lean`, or
+`Std` hides the toolchain's copy from the probe, so extraction stops with an
+error.
 Compiler-generated matcher and recursor bodies stay in the hash even though
 they are folded out of the human reading list.
 An article with several `lean:` names has one hash over all of them, printed as

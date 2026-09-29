@@ -77,7 +77,16 @@ PROBE_MARKER = "AUTOFORM_SKELETON "
 
 #: Module roots whose declarations are never listed as assumptions: they are
 #: the language itself, not mathematics a reader might want to double-check.
+#: The probe counts a module as core only when its `.olean` also resolves under
+#: the toolchain's own `lib/lean`; a dependency module named `Lake.Foo` is
+#: external and bound like any other.
 _CORE_MODULE_ROOTS = ("Init", "Lean", "Std", "Lake")
+
+#: Lean resolves a module by its root directory on the search path, so a
+#: dependency library rooted at `Std` hides the toolchain's `Std` from the probe.
+_SHADOWED_CORE_MODULE = re.compile(
+    r"object file '[^']*' of module ((?:" + "|".join(_CORE_MODULE_ROOTS) + r")(?:\.\S+)?) does not exist"
+)
 
 DEFAULT_PROBE_TIMEOUT = 600.0
 DEFAULT_PROBE_OUTPUT_LIMIT = 64 * 1024 * 1024
@@ -1666,6 +1675,16 @@ def run_probe(probe: str, lean_root: Path, *, timeout: float = DEFAULT_PROBE_TIM
         )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
+        shadowed = _SHADOWED_CORE_MODULE.search(detail)
+        if shadowed:
+            root = shadowed.group(1).split(".", 1)[0]
+            raise SkeletonError(
+                [
+                    f"the skeleton probe cannot load toolchain module {shadowed.group(1)}: a dependency "
+                    f"library probably provides modules under `{root}`, which hides the toolchain's own `{root}`; "
+                    f"rename that library's modules\n{detail}"
+                ]
+            )
         raise SkeletonError([f"the skeleton probe failed; is the project built with `lake build`?\n{detail}"])
     return result.stdout
 

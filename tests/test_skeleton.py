@@ -2366,8 +2366,8 @@ def _build_semantics(project: Path) -> None:
     assert build.returncode == 0, build.stderr
 
 
-def _probe_declaration(project: Path, root: str):
-    probe = render_probe(imports=("Skel.Semantics",), roots=(root,), project_roots=("Skel.Semantics",))
+def _probe_declaration(project: Path, root: str, *, module: str = "Skel.Semantics"):
+    probe = render_probe(imports=(module,), roots=(root,), project_roots=(module,))
     record = parse_probe_output(run_probe(probe, project))[root]
     declaration = _declaration(
         record,
@@ -2445,6 +2445,63 @@ def test_external_private_axiom_binds_its_module(tmp_path: Path) -> None:
 
     assert record["axioms"] == ["_private.Skel.VendorPrivAxiom.0.Vendor.hiddenAxiom"]
     assert [item[0] for item in record["boundary_modules"]] == ["Skel.VendorPrivAxiom"]
+
+
+def _project_with_core_named_dependency(tmp_path: Path, module: str) -> Path:
+    """Write a fixture copy that requires a package whose library is named ``module``."""
+
+    project = _project(tmp_path)
+    dependency = project / "dep"
+    (dependency / module.split(".")[0]).mkdir(parents=True)
+    shutil.copy(_FIXTURE / "lean-toolchain", dependency / "lean-toolchain")
+    (dependency / "lakefile.toml").write_text(
+        f'name = "dep"\n\n[[lean_lib]]\nname = "Dep"\nroots = ["{module}"]\n', encoding="utf-8"
+    )
+    (dependency / (module.replace(".", "/") + ".lean")).write_text(
+        f"namespace {module}\ndef magic : Nat := 1\nend {module}\n", encoding="utf-8"
+    )
+    with (project / "lakefile.toml").open("a", encoding="utf-8") as lakefile:
+        lakefile.write('\n[[require]]\nname = "dep"\npath = "dep"\n')
+    (project / "Skel" / "UsesDep.lean").write_text(
+        f"import {module}\nnamespace Skel.UsesDep\ndef val : Nat := {module}.magic\n"
+        "theorem root (h : val = 1) : val = 1 := h\nend Skel.UsesDep\n",
+        encoding="utf-8",
+    )
+    return project
+
+
+def _build_uses_dep(project: Path) -> None:
+    build = subprocess.run(
+        ["lake", "build", "Skel.UsesDep"], cwd=project, capture_output=True, text=True, timeout=600, check=False
+    )
+    assert build.returncode == 0, build.stderr
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_dependency_module_under_a_core_name_is_bound(tmp_path: Path) -> None:
+    project = _project_with_core_named_dependency(tmp_path, "Lake.Vendor")
+    _build_uses_dep(project)
+    root = "Skel.UsesDep.root"
+    record, before = _probe_declaration(project, root, module="Skel.UsesDep")
+
+    # Only the toolchain's own modules are core; a package may reuse the name.
+    assert record["assumed"] == ["Lake.Vendor.magic"]
+    assert [item[:2] for item in record["boundary_modules"]] == [["Lake.Vendor", "olean"]]
+
+    _replace_source(project / "dep" / "Lake" / "Vendor.lean", ":= 1", ":= 2")
+    _build_uses_dep(project)
+    _, changed = _probe_declaration(project, root, module="Skel.UsesDep")
+
+    assert changed.hash != before.hash
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_dependency_shadowing_a_toolchain_library_fails_closed(tmp_path: Path) -> None:
+    project = _project_with_core_named_dependency(tmp_path, "Std.Vendor")
+    _build_uses_dep(project)
+
+    with pytest.raises(SkeletonError, match="cannot load toolchain module Std\\..*hides the toolchain's own `Std`"):
+        _probe_declaration(project, "Skel.UsesDep.root", module="Skel.UsesDep")
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")

@@ -426,8 +426,23 @@ def rangeJson (c : Name) : CommandElabM Json := do
 def emit (request : String) (fields : List (String × Json)) : CommandElabM Unit :=
   IO.println s!"{marker}{{(Json.mkObj (("root", Json.str request) :: fields)).compress}}"
 
+/-- The modules that belong to the running toolchain. A name root is not
+enough: a dependency may name its own module `Lake.Foo`, and that module is
+external like any other. A module is core only when its root is a toolchain
+library and its `.olean` resolves under the toolchain's own `lib/lean`, the
+directory Lean itself seeds the search path with. -/
+def toolchainModules (env : Environment) : IO (Std.HashSet Name) := do
+  let libDir := (← IO.FS.realPath (← getLibDir (← getBuildDir))).components
+  let mut core : Std.HashSet Name := {{}}
+  for m in env.header.moduleNames do
+    if [{core_roots}].contains m.getRoot then
+      let olean ← try IO.FS.realPath (← findOLean m) catch _ => pure (System.FilePath.mk "")
+      if libDir.isPrefixOf olean.components then core := core.insert m
+  return core
+
 def skeleton
     (projectRoots : List Name)
+    (coreModules : Std.HashSet Name)
     (expandCache : IO.Ref (Std.HashMap Name (Array Name)))
     (semanticCache : IO.Ref (Std.HashMap Name String))
     (request : String) (root : Name) : CommandElabM Unit := do
@@ -441,7 +456,7 @@ def skeleton
     | none   => false
   let isCore (n : Name) : Bool :=
     match moduleOf env n with
-    | some m => [{core_roots}].contains m.getRoot
+    | some m => coreModules.contains m
     | none   => true
   let expand (c : Name) : CommandElabM (Array Name) :=
     expandedMeaning expandCache env projectRoots c
@@ -594,5 +609,6 @@ run_cmd do
   let projectRoots : List Name := [{project_roots}]
   let expandCache : IO.Ref (Std.HashMap Name (Array Name)) ← IO.mkRef {{}}
   let semanticCache : IO.Ref (Std.HashMap Name String) ← IO.mkRef {{}}
+  let coreModules ← AutoformSkeleton.toolchainModules (← getEnv)
   for (request, root) in [{roots}] do
-    AutoformSkeleton.skeleton projectRoots expandCache semanticCache request root
+    AutoformSkeleton.skeleton projectRoots coreModules expandCache semanticCache request root
