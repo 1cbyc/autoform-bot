@@ -311,6 +311,10 @@ class NodeSkeleton:
     #: This is the reference a faithfulness judge compares against.
     passage: str | None = None
     passage_locator: str | None = None
+    #: False when one of the article's declarations is unresolved; the
+    #: article then has no hash, since one over the rest would miss changes
+    #: to the missing declaration.
+    complete: bool = True
 
     def blind_text(self) -> str:
         """The article's declarations as one blind packet, for a faithfulness judge.
@@ -327,9 +331,11 @@ class NodeSkeleton:
         return "\n".join(parts)
 
     @property
-    def hash(self) -> str:
+    def hash(self) -> str | None:
         """One hash over all of an article's skeletons, printed as the article skeleton."""
 
+        if not self.complete:
+            return None
         if len(self.declarations) == 1:
             return self.declarations[0].hash
         joined = "\n".join(sorted(item.hash for item in self.declarations))
@@ -342,13 +348,15 @@ class NodeSkeleton:
         return _sha256_id(self.blind_text().encode("utf-8"))
 
     @property
-    def review_hash(self) -> str:
+    def review_hash(self) -> str | None:
         """Fingerprint the joint packet, its cited source passage, and its meaning.
 
         The meaning hash is bound too: a packet can read the same across a change
         of meaning, and a review recorded against this hash must not survive one.
         """
 
+        if self.hash is None:
+            return None
         material = {
             "hash": self.hash,
             "packet": self.evidence_hash,
@@ -506,12 +514,12 @@ def load_skeleton_report(path: str | Path) -> SkeletonReport:
     unresolved = _report_unresolved(data["unresolved"])
     if not isinstance(raw_nodes, list):
         raise SkeletonError([f"{path} contains malformed skeleton report data"])
-    nodes = tuple(_node_from_dict(node) for node in raw_nodes)
+    declarations_by_node = dict(targets)
+    nodes = tuple(_node_from_dict(node, targets=declarations_by_node) for node in raw_nodes)
     if len({node.node_id for node in nodes}) != len(nodes):
         raise SkeletonError([f"{path} contains duplicate skeleton article ids"])
     if tuple(node.node_id for node in nodes) != selected_nodes:
         raise SkeletonError([f"{path} does not contain exactly its selected articles"])
-    declarations_by_node = dict(targets)
     actual_targets: set[tuple[str, str]] = set()
     for node in nodes:
         expected = declarations_by_node[node.node_id]
@@ -637,7 +645,7 @@ _TRUSTED_REPORT_FIELDS = frozenset(
 )
 
 
-def _node_from_dict(item: object) -> NodeSkeleton:
+def _node_from_dict(item: object, *, targets: dict[str, tuple[str, ...]]) -> NodeSkeleton:
     if not isinstance(item, dict) or item.keys() != _NODE_REPORT_FIELDS:
         raise SkeletonError(["malformed article in skeleton report"])
     node_id = _report_string(item.get("node_id"), "article id")
@@ -658,6 +666,7 @@ def _node_from_dict(item: object) -> NodeSkeleton:
         declarations=declarations,
         passage=passage,
         passage_locator=locator,
+        complete={declaration.name for declaration in declarations} == set(targets.get(node_id, ())),
     )
     if item.get("hash") != node.hash:
         raise SkeletonError([f"invalid article hash for {node_id} in skeleton report"])
@@ -2368,6 +2377,7 @@ def extract_graph_skeletons(
                 declarations=tuple(declarations),
                 passage=passage,
                 passage_locator=locator,
+                complete={item.name for item in declarations} == set(names),
             )
         )
     return SkeletonReport(
@@ -2646,7 +2656,8 @@ def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> s
     out: list[str] = []
     for node in report.nodes:
         if len(node.declarations) > 1:
-            out.append(f"## {node.node_id} · article skeleton {node.hash}")
+            article = node.hash or "none: a declaration is unresolved"
+            out.append(f"## {node.node_id} · article skeleton {article}")
             out.append("")
         for declaration in node.declarations:
             out.append(f"== {node.node_id} · {declaration.kind} {declaration.name}")

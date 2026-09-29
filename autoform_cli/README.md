@@ -347,8 +347,10 @@ unrelated edits in an external module or its imports may also rotate it.
 Compiler-generated matcher and recursor bodies stay in the hash even though
 they are folded out of the human reading list.
 An article with several `lean:` names has one hash over all of them, printed as
-the article skeleton. It compares reports across builds; it is not a stable
-statement identifier, reviewer authentication, or an approval key.
+the article skeleton. If any of those names is unresolved, the report records
+the article's hash and review hash as null rather than hashing the rest. It
+compares reports across builds; it is not a stable statement identifier,
+reviewer authentication, or an approval key.
 
 Reports and packet manifests also carry an evidence hash over the exact packet
 shown to a reviewer. It identifies those bytes but does not authenticate who

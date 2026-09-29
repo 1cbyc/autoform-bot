@@ -994,6 +994,31 @@ def test_extraction_reports_names_the_sources_and_the_environment_lack(tmp_path:
     assert report.nodes[1].declarations == ()
 
 
+def test_article_with_an_unresolved_declaration_has_no_article_hash(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(
+        tmp_path, lean={"mixed": "Skel.observation_determined Skel.doesNotExist"}
+    )
+    output = PROBE_MARKER + json.dumps(_fake_found_record())
+
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda probe, root: output)
+
+    (node,) = report.nodes
+    assert [item.name for item in node.declarations] == ["Skel.observation_determined"]
+    # A hash over the resolved subset would not change when the missing
+    # declaration's meaning does, so the article gets none.
+    assert node.hash is None and node.review_hash is None
+    assert node.as_dict()["hash"] is None and node.as_dict()["review_hash"] is None
+    assert "None" not in format_report(report)
+    path = write_skeleton_report(report, tmp_path / "report.json")
+    assert load_skeleton_report(path) == report
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["nodes"][0]["hash"] = node.declarations[0].hash
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SkeletonError, match="invalid article hash"):
+        load_skeleton_report(path)
+
+
 def test_extraction_never_runs_lean_when_nothing_resolves(tmp_path: Path) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"phantom": "Skel.doesNotExist"})
@@ -1354,7 +1379,7 @@ def test_report_loader_rejects_scope_tampering(tmp_path: Path) -> None:
         load_skeleton_report(path)
 
     payload = report.as_dict()
-    payload["nodes"][0] = replace(report.nodes[0], declarations=()).as_dict()
+    payload["nodes"][0] = replace(report.nodes[0], declarations=(), complete=False).as_dict()
     payload["unresolved"] = [
         {"declaration": "made.up", "node_id": "basics/determined", "reason": "missing"}
     ]
