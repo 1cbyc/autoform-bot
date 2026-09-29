@@ -932,6 +932,15 @@ def test_assumed_module_identity_requires_compiled_parts_with_an_olean(tmp_path:
         with pytest.raises(SkeletonError, match="assumed module"):
             _hash_module_files(entries, lean_root=tmp_path, cache={})
 
+    parts = ("olean", "olean.server", "olean.private")
+    for kind in parts:
+        (tmp_path / f"External.{kind}").write_bytes(b"compiled")
+    entries = [["External", kind, f"External.{kind}"] for kind in parts]
+    identities = _hash_module_files(entries, lean_root=tmp_path, cache={})
+    assert [kind for _, kind, _ in identities] == list(parts)
+    # Equal bytes in different parts still hash apart.
+    assert len({digest for _, _, digest in identities}) == 3
+
 
 def test_trusted_theorem_source_never_exposes_its_proof(tmp_path: Path) -> None:
     project = _project(tmp_path)
@@ -1161,6 +1170,10 @@ def test_removing_comments_does_not_join_tokens_or_lines() -> None:
 
     assert _without_comments(inline, ((8, 25),)) == "Nat.succ" + " " * 17 + "0"
     assert _without_comments(multiline, ((3, 21),)) == "foo\n" + " " * 9 + "bar"
+    # Deleting the comment would turn `h x = hx` into the tautology `hx = hx`.
+    glued = "def g (h : Nat → Nat) (x hx : Nat) : Prop := h/- -/x = hx"
+    start = len(glued.encode("utf-8")) - len("/- -/x = hx")
+    assert _without_comments(glued, ((start, start + 5),)).endswith(":= h     x = hx")
 
 
 def test_packets_fail_closed_when_lean_cannot_locate_comments(tmp_path: Path) -> None:
@@ -1186,7 +1199,7 @@ def test_probe_comment_ranges_must_cover_comments(tmp_path: Path, ranges: object
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
 
-    with pytest.raises(SkeletonError):
+    with pytest.raises(SkeletonError, match="invalid statement_comments"):
         extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
 
 
