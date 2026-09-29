@@ -23,6 +23,7 @@ from autoform_cli.skeleton import (
     NodeSkeleton,
     PACKET_MANIFEST,
     PROBE_MARKER,
+    PROBE_OUTPUT_ENV,
     SEMANTIC_SCHEMA,
     SKELETON_SCHEMA,
     SkeletonReport,
@@ -618,6 +619,23 @@ def test_a_probe_timeout_names_the_flag_that_raises_it(tmp_path: Path, monkeypat
     assert caught.value.issues == (
         "lake env lean timed out after 1 seconds; rerun with --timeout <seconds> for large projects",
     )
+
+
+def test_probe_records_file_is_held_to_the_output_limit(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "lake-manifest.json").write_text("{}\n", encoding="utf-8")
+
+    def flooding_probe(command, *, env, **kwargs):
+        Path(env[PROBE_OUTPUT_ENV]).write_text("x" * 2048, encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr("autoform_cli.skeleton.shutil.which", lambda executable: "/bin/lake")
+    monkeypatch.setattr("autoform_cli.skeleton._check_artifacts_fresh", lambda *args, **kwargs: None)
+    monkeypatch.setattr("autoform_cli.skeleton._run_bounded_command", flooding_probe)
+    monkeypatch.setattr("autoform_cli.skeleton.DEFAULT_PROBE_OUTPUT_LIMIT", 1024)
+    probe = render_probe(imports=("Skel.Main",), roots=("Skel.x",), project_roots=("Skel",))
+
+    with pytest.raises(SkeletonError, match="1024-byte output limit"):
+        run_probe(probe, tmp_path)
 
 
 def test_probe_requires_an_existing_lake_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -2156,6 +2174,32 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
     )
     with pytest.raises(SkeletonError, match="build artifacts are stale"):
         extract_skeletons(blueprint, lean_root=project)
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_probe_records_bypass_the_command_capture_and_other_output(tmp_path: Path) -> None:
+    # Lean holds a command's `IO.println` output until the command ends, then
+    # prints it at a cost quadratic in its size. A probe that leaves before its
+    # command ends shows whether its records went past that capture, and a large
+    # message printed meanwhile must not split one of them.
+    project = _project(tmp_path)
+    build = subprocess.run(
+        ["lake", "build", "Skel.Main"], cwd=project, capture_output=True, text=True, timeout=600, check=False
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    probe = render_probe(
+        imports=("Skel.Main",), roots=("Skel.observation_determined",), project_roots=("Skel",)
+    )
+    loop = next(line for line in probe.splitlines() if "AutoformSkeleton.skeleton projectRoots" in line)
+    leave = "    (← IO.getStdout).flush\n    let _ : Unit ← IO.Process.exit 0"
+    noise = "#eval IO.println (String.mk (List.replicate 3000000 'x'))\n\n"
+    command = "set_option maxHeartbeats 0 in\nrun_cmd"
+    assert command in probe
+    probe = probe.replace(loop, f"{loop}\n{leave}").replace(command, f"{noise}{command}")
+
+    records = parse_probe_output(run_probe(probe, project), expected_roots=("Skel.observation_determined",))
+
+    assert records["Skel.observation_determined"]["found"] is True
 
 
 def _built_module(tmp_path: Path, module: str, source: str) -> Path:

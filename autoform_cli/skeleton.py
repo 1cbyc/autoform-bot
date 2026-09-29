@@ -74,6 +74,8 @@ SEMANTIC_SCHEMA = "autoform-lean-expr/v4"
 #: Every line the probe wants read back starts with this marker, so Lean's own
 #: informational output can never be mistaken for a result.
 PROBE_MARKER = "AUTOFORM_SKELETON "
+# Names the file the probe writes its records to; see run_probe.
+PROBE_OUTPUT_ENV = "AUTOFORM_SKELETON_OUTPUT"
 
 #: Module roots whose declarations are never listed as assumptions: they are
 #: the language itself, not mathematics a reader might want to double-check.
@@ -1660,6 +1662,7 @@ def render_probe(
         core_roots=", ".join(_lean_name(name) for name in _CORE_MODULE_ROOTS),
         imports="\n".join(f"import {module}" for module in sorted(set(imports))),
         marker=PROBE_MARKER,
+        output_env=PROBE_OUTPUT_ENV,
         project_roots=", ".join(_lean_name(name) for name in sorted(set(project_roots))),
         roots=", ".join(f"({json.dumps(name, ensure_ascii=False)}, {_lean_name(name)})" for name in roots),
     )
@@ -1791,6 +1794,9 @@ def run_probe(
     with _signal_guard(), tempfile.TemporaryDirectory(prefix="autoform-skeleton-") as scratch:
         source = Path(scratch) / "AutoformSkeletonProbe.lean"
         source.write_text(probe, encoding="utf-8")
+        # Records go to their own file: on stdout any other write could split one.
+        records = Path(scratch) / "records.out"
+        env[PROBE_OUTPUT_ENV] = str(records)
         try:
             result = _run_bounded_command(
                 [lake, "env", "lean", str(source)],
@@ -1806,6 +1812,7 @@ def run_probe(
                     "rerun with --timeout <seconds> for large projects"
                 ]
             ) from exc
+        output = _read_probe_records(records) if result.returncode == 0 else ""
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         shadowed = _SHADOWED_CORE_MODULE.search(detail)
@@ -1819,7 +1826,20 @@ def run_probe(
                 ]
             )
         raise SkeletonError([f"the skeleton probe failed; is the project built with `lake build`?\n{detail}"])
-    return result.stdout
+    return output or result.stdout
+
+
+def _read_probe_records(records: Path) -> str:
+    """Read the probe's records file under the same byte limit as its captured output."""
+
+    try:
+        with records.open("rb") as handle:
+            data = handle.read(DEFAULT_PROBE_OUTPUT_LIMIT + 1)
+    except FileNotFoundError:
+        return ""
+    if len(data) > DEFAULT_PROBE_OUTPUT_LIMIT:
+        raise SkeletonError([f"lake env lean exceeded the {DEFAULT_PROBE_OUTPUT_LIMIT}-byte output limit"])
+    return data.decode("utf-8")
 
 
 _FOUND_RECORD_FIELDS = frozenset(

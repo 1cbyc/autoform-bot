@@ -812,5 +812,15 @@ run_cmd do
   let semanticCache : IO.Ref AutoformSkeleton.SemanticCache ← IO.mkRef {{}}
   let emitted : IO.Ref (Std.HashSet (String × Name)) ← IO.mkRef {{}}
   let coreModules ← AutoformSkeleton.toolchainModules (← getEnv)
-  for (request, root) in [{roots}] do
-    AutoformSkeleton.skeleton projectRoots coreModules expandCache semanticCache emitted request root
+  -- A command's `IO.println` output is captured and printed as one message when
+  -- the command ends, at a cost quadratic in its size: on a Mathlib project that
+  -- outlasts the probe itself. Write to the file the CLI names instead, where no
+  -- other output can interleave with a record; without one, keep the capture.
+  let direct ← (← IO.getEnv "{output_env}").mapM fun path => IO.FS.Handle.mk path .write
+  let captured ← direct.mapM fun out => IO.setStdout (IO.FS.Stream.ofHandle out)
+  try
+    for (request, root) in [{roots}] do
+      AutoformSkeleton.skeleton projectRoots coreModules expandCache semanticCache emitted request root
+  finally
+    if let some out := direct then out.flush
+    if let some stream := captured then discard <| IO.setStdout stream
