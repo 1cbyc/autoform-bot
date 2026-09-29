@@ -245,21 +245,42 @@ def rawSignatureOf (c : Name) : CommandElabM String := do
 partial def findKind? (stx : Syntax) (k : SyntaxNodeKind) : Option Syntax :=
   if stx.getKind == k then some stx else stx.getArgs.findSome? (findKind? · k)
 
+/-- The namespace names in the words of one `open` line, and whether the
+command can go on: its names continue on more-indented lines, as in
+`open A B` followed by `  C`, until `in`, `hiding`, `renaming` or `(`. -/
+def openWords (words : String) : List Name × Bool :=
+  let ws := (words.splitOn " ").filter (fun t => t ≠ "" && t ≠ "scoped")
+  let stops (t : String) := t == "in" || t == "hiding" || t == "renaming" ||
+    t.startsWith "(" || t.startsWith "--" || t.startsWith "/-"
+  let names := ws.takeWhile (!stops ·)
+  (names.map String.toName, names.length == ws.length)
+
 /-- The namespaces the file opens above `pos`, from its `open …` commands,
-including a same-line `open … in` prefix. Their scoped notation (`#s`, `n !`,
-`∑ x ∈ s, f x`) must be active for the statement to parse; Lean records what a
-declaration means, not how its file was set up. Names are returned as written;
-the caller resolves them against the enclosing namespaces. -/
-def openedNamespaces (lines : List String) (pos : Position) : List Name :=
+including a same-line `open … in` prefix and names on continuation lines. Their
+scoped notation (`#s`, `n !`, `∑ x ∈ s, f x`) must be active for the statement
+to parse; Lean records what a declaration means, not how its file was set up.
+Names are returned as written; the caller resolves them against the enclosing
+namespaces. -/
+def openedNamespaces (lines : List String) (pos : Position) : List Name := Id.run do
   let current := ((lines[pos.line - 1]?.getD "").take pos.column).toString
-  (lines.take (pos.line - 1) ++ [current]).flatMap fun l =>
-    let l := l.trimAsciiStart.toString
-    if l.startsWith "open " then
-      ((l.drop 5).toString.splitOn " ")
-        |>.filter (fun t => t ≠ "" && t ≠ "scoped" && t ≠ "in")
-        |>.takeWhile (fun t => t ≠ "hiding" && t ≠ "renaming" && !t.startsWith "(")
-        |>.map String.toName
-    else []
+  let mut names : List Name := []
+  -- The column of an `open` whose names may continue on the next line.
+  let mut openColumn : Option Nat := none
+  for l in lines.take (pos.line - 1) ++ [current] do
+    let body := l.trimAsciiStart.toString
+    let column := l.length - body.length
+    if body.startsWith "open " then
+      let (opened, more) := openWords (body.drop 5).toString
+      names := names ++ opened
+      openColumn := if more then some column else none
+    else if let some c := openColumn then
+      if body.isEmpty then continue
+      if Nat.blt c column then
+        let (opened, more) := openWords body
+        names := names ++ opened
+        if !more then openColumn := none
+      else openColumn := none
+  return names
 
 /-- Slice the exact half-open source range recorded by Lean. Positions use
 Unicode columns, so convert them through `FileMap` before slicing UTF-8 bytes. -/
@@ -328,10 +349,46 @@ def commentsJson (bytes : ByteArray) (stx : Syntax) (cut : Nat) : Json :=
     if Nat.ble cut s || acc.contains r then acc else acc.push r
   Json.arr <| (ranges.qsort (fun a b => Nat.blt a.1 b.1)).map fun (s, e) => Json.arr #[s, e]
 
+/-- The tokens module `mod` can see: those it and its transitive imports
+declare, globally or scoped. A `local` token is not recorded anywhere. -/
+def visibleTokens (env : Environment) (mod : Name) : Std.HashSet String := Id.run do
+  let mut tokens : Std.HashSet String := {{}}
+  let mut seen : Std.HashSet Name := {{}}
+  let mut work : Array Name := #[mod]
+  while h : work.size > 0 do
+    let m := work[work.size - 1]
+    work := work.pop
+    if seen.contains m then continue
+    seen := seen.insert m
+    let some idx := env.getModuleIdx? m | continue
+    for e in Parser.parserExtension.ext.getModuleEntries env idx do
+      match e with
+      | .global (.token t) | .scoped _ (.token t) => tokens := tokens.insert t
+      | _ => pure ()
+    for i in env.header.moduleData[idx.toNat]!.imports do
+      work := work.push i.module
+  return tokens
+
+/-- Whether `text` holds a token that is not built into Lean, contains `--` or
+a block-comment opener, and is not visible to `mod`, the module the text sits
+in. There `a +-- b` starts a comment, but the probe parses in its own
+environment, where the token is active, so it cannot tell where that file's
+comments are. -/
+def commentLikeToken (penv : Environment) (mod : Name) (text : String) : IO Bool := do
+  let builtin ← Parser.builtinTokenTable.get
+  let holds (s t : String) := Nat.blt 1 (s.splitOn t).length
+  let found := ((Parser.getTokenTable penv).findPrefix "").filter fun t =>
+    (builtin.find? t).isNone && (holds t "--" || holds t "/-") && holds text t
+  if found.isEmpty then return false
+  let visible := visibleTokens penv mod
+  return found.any fun t => !visible.contains t
+
 /-- Capture a declaration from the same source snapshot the probe inspects,
 and parse it with Lean's own parser. The surrounding source-tree guard rejects
-concurrent edits. The parse is `none` when the slice does not parse alone. -/
-def declarationSnippet (c : Name) : CommandElabM (Option (String × Option Syntax)) := do
+concurrent edits. The parse is `none` when the slice does not parse alone; the
+environment it was parsed in is returned for parsing parts of it. -/
+def declarationSnippet (c : Name) :
+    CommandElabM (Option (String × Option Syntax × Environment)) := do
   let env ← getEnv
   let some r ← findDeclarationRanges? c | return none
   let some idx := env.getModuleIdxFor? c | return none
@@ -356,17 +413,20 @@ def declarationSnippet (c : Name) : CommandElabM (Option (String × Option Synta
     for opened in openedNamespaces lines r.range.pos do
       for scope in scopes.push Name.anonymous do
         if env.isNamespace (scope ++ opened) then activateScoped (scope ++ opened)
-    match Parser.runParserCategory (← getEnv) `command snippet with
-    | .error _ => return some (snippet, none)
-    | .ok stx => return some (snippet, some stx)
+    let penv ← getEnv
+    match Parser.runParserCategory penv `command snippet with
+    | .error _ => return some (snippet, none, penv)
+    | .ok stx => return some (snippet, some stx, penv)
 
 /-- A declaration's source and its comment ranges, `null` when it does not
 parse alone; the caller then decides whether the source can be shown. -/
 def declarationSource (c : Name) : CommandElabM (Option (String × Json)) := do
-  let some (snippet, stx?) ← declarationSnippet c | return none
+  let some (snippet, stx?, penv) ← declarationSnippet c | return none
   let comments := match stx? with
     | some stx => commentsJson snippet.toUTF8 stx snippet.utf8ByteSize
     | none => Json.null
+  let mod := (moduleOf penv c).getD Name.anonymous
+  if ← commentLikeToken penv mod snippet then return some (snippet, Json.null)
   return some (snippet, comments)
 
 /-- Lean generates companions such as `f._unary`, `f._f` and `S.x._default`
@@ -389,34 +449,63 @@ partial def companionSource (c : Name) : CommandElabM (Option (String × Json)) 
   if kind == "theorem" || kind == "axiom" then return none
   declarationSource shown
 
+/-- The node where a parsed declaration's value starts, ending its statement. -/
+def valueNode? (stx : Syntax) : Option Syntax :=
+  let decl := (findKind? stx ``Parser.Command.declaration).getD stx
+  (findKind? decl ``Parser.Command.declValSimple).orElse fun _ =>
+    (findKind? decl ``Parser.Command.declValEqns).orElse fun _ =>
+      findKind? decl ``Parser.Command.whereStructInst
+
+/-- The statement of a declaration that does not parse whole, as when only its
+proof uses `local notation`: cut before a `:=` and parse the prefix with
+`:= sorry` as its value. The cut is the statement only if the value then starts
+exactly there. A cut inside the proof keeps the real `:=` in the prefix, so the
+value starts earlier; one inside the statement (`let x := …`) leaves a prefix
+that does not parse. Returns the prefix and the syntax parsed from it. -/
+def statementPrefix? (penv : Environment) (snippet : String) :
+    Option (String × Syntax) := Id.run do
+  let mut written := ""
+  for part in (snippet.splitOn ":=").dropLast do
+    written := written ++ part
+    if let .ok stx := Parser.runParserCategory penv `command (written ++ ":= sorry") then
+      if let some v := valueNode? stx then
+        if (v.getPos?.map (·.byteIdx)) == some written.utf8ByteSize then
+          return some (written, stx)
+        -- The value starts earlier, so every later cut is inside the proof.
+        return none
+    written := written ++ ":="
+  return none
+
 /-- The declaration's source up to its value: the statement as written, without
 the proof, with its comment ranges. Parsed with Lean's own parser rather than
 cut by pattern matching. -/
 def statementSource (root : Name) : CommandElabM (Option (String × Json)) := do
   let env ← getEnv
-  let some (snippet, stx?) ← declarationSnippet root | return none
-  let withComments (written : String) : Option (String × Json) :=
-    some (written, match stx? with
-      | some stx => commentsJson snippet.toUTF8 stx written.utf8ByteSize
+  let some (snippet, stx?, penv) ← declarationSnippet root | return none
+  -- `parsed` is the text `stx` was parsed from; it starts with `written`.
+  let shown (written parsed : String) (stx? : Option Syntax) :
+      CommandElabM (Option (String × Json)) := do
+    if ← commentLikeToken penv ((moduleOf env root).getD Name.anonymous) written then
+      return some (written, Json.null)
+    return some (written, match stx? with
+      | some stx => commentsJson parsed.toUTF8 stx written.utf8ByteSize
       | none => Json.null)
   let kind := kindOf env root
   -- A type declaration has no value to strip: all of it is the statement.
   if kind == "structure" || kind == "class" || kind == "inductive" then
-    return withComments snippet.trimAsciiEnd.toString
-  let some stx := stx? | return none
-  let decl := (findKind? stx ``Parser.Command.declaration).getD stx
-  let val := (findKind? decl ``Parser.Command.declValSimple).orElse fun _ =>
-    (findKind? decl ``Parser.Command.declValEqns).orElse fun _ =>
-      findKind? decl ``Parser.Command.whereStructInst
-  let some v := val | do
+    return ← shown snippet.trimAsciiEnd.toString snippet stx?
+  let some stx := stx? | do
+    let some (written, stx) := statementPrefix? penv snippet | return none
+    shown written.trimAsciiEnd.toString (written ++ ":= sorry") (some stx)
+  let some v := valueNode? stx | do
     if kind == "axiom" || kind == "opaque" then
-      return withComments snippet.trimAsciiEnd.toString
+      return ← shown snippet.trimAsciiEnd.toString snippet (some stx)
     return none
   let some pos := v.getPos? | return none
   -- `pos` is a byte position: cut by bytes, not by characters, or every `∀`
   -- before the value pushes the cut past it.
   let bytes := snippet.toUTF8.extract 0 pos.byteIdx
-  return withComments (String.fromUTF8! bytes).trimAsciiEnd.toString
+  shown (String.fromUTF8! bytes).trimAsciiEnd.toString snippet (some stx)
 
 def rangeJson (c : Name) : CommandElabM Json := do
   match ← findDeclarationRanges? c with
@@ -556,6 +645,7 @@ def skeleton
       ("module", Json.str (toString ((moduleOf env c).getD Name.anonymous))),
       ("range", ← rangeJson c),
       ("signature", Json.str (← signatureOf c)),
+      ("raw_signature", Json.str (← rawSignatureOf c)),
       ("semantic_schema", Json.str semanticSchema),
       ("semantic", Json.str (← cachedSemanticMaterial semanticCache env c)),
       ("depends", Json.arr (deps.map fun d => Json.str (toString d))),

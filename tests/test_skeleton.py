@@ -19,11 +19,13 @@ import psutil
 from autoform_cli.__main__ import main
 from autoform_cli.lean import PACKET_SCHEMA, PASSAGE_SCHEMA, index_project
 from autoform_cli.skeleton import (
+    DeclarationSkeleton,
     PACKET_MANIFEST,
     PROBE_MARKER,
     SEMANTIC_SCHEMA,
     SKELETON_SCHEMA,
     SkeletonReport,
+    TrustedDeclaration,
     SkeletonError,
     UnresolvedTarget,
     _declaration,
@@ -125,6 +127,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [5, 6],
         "signature": "Skel.Eligible {Y : Type} (S : Y → Prop) (y : Y) : Prop",
+        "raw_signature": "Skel.Eligible {Y : Type} (S : Y -> Prop) (y : Y) : Prop",
         "semantic_schema": SEMANTIC_SCHEMA,
         "semantic": _semantic({"type": {"sort": {"zero": None}}, "value": {"bvar": 0}}),
         "depends": [],
@@ -138,6 +141,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [8, 10],
         "signature": "Skel.NonAmbiguous {Y : Type} (S : Y → Prop) : Prop",
+        "raw_signature": "Skel.NonAmbiguous {Y : Type} (S : Y -> Prop) : Prop",
         "semantic_schema": SEMANTIC_SCHEMA,
         "semantic": _semantic({"type": {"sort": {"zero": None}}, "value": {"bvar": 1}}),
         "depends": ["Skel.Eligible"],
@@ -155,6 +159,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
         "module": "Skel.Defs",
         "range": [15, 18],
         "signature": "Skel.Observation (Y : Type) : Type",
+        "raw_signature": "Skel.Observation (Y : Type) : Type",
         "semantic_schema": SEMANTIC_SCHEMA,
         "semantic": _semantic({"type": {"sort": {"zero": None}}, "constructors": []}),
         "depends": [],
@@ -652,10 +657,11 @@ def test_parse_probe_output_rejects_incomplete_semantic_records() -> None:
     with pytest.raises(SkeletonError, match="invalid statement_source"):
         parse_probe_output(PROBE_MARKER + json.dumps(record))
 
+    # A statement Lean cannot parse is withheld from the packet, not refused.
     record = _fake_found_record()
     record["statement_source"] = record["statement_comments"] = None
     (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
-    assert "omitted required statement_source" in str(_probe_record_issue(parsed))
+    assert _probe_record_issue(parsed) is None
 
 
 def test_generated_companions_without_a_source_range_need_no_source() -> None:
@@ -683,34 +689,34 @@ def test_generated_companions_without_a_source_range_need_no_source() -> None:
         )
 
 
-def test_unrecoverable_statement_fails_only_its_node(tmp_path: Path) -> None:
+def test_unparsable_source_is_withheld_not_refused(tmp_path: Path) -> None:
     project = _project(tmp_path)
-    blueprint = _blueprint(
-        tmp_path,
-        lean={"determined": "Skel.observation_determined", "supervision": "Skel.supervision_nonAmbiguous"},
-    )
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
     record = _fake_found_record()
-    trusted = record["trusted"]
-    assert isinstance(trusted, list) and isinstance(trusted[0], dict)
-    companion = dict(trusted[0], name="Skel.NonAmbiguous._unary", source_name="Skel.NonAmbiguous._unary")
-    record["trusted"] = [*trusted, dict(companion, range=None, source=None, source_comments=None)]
-    unparsable = dict(
-        record, root="Skel.supervision_nonAmbiguous", statement_source=None, statement_comments=None
-    )
-    output = "\n".join(PROBE_MARKER + json.dumps(item) for item in (record, unparsable))
+    # Lean parsed neither the statement nor a trusted source, and that source
+    # has a docstring Lean could not locate: both are withheld.
+    record["statement_source"] = record["statement_comments"] = None
+    record["trusted"][2]["source_comments"] = None
 
-    report = extract_skeletons(blueprint, lean_root=project, runner=lambda probe, root: output)
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
 
-    by_node = {node.node_id.rsplit("/", 1)[-1]: node for node in report.nodes}
-    (determined,) = by_node["determined"].declarations
-    assert "Skel.NonAmbiguous._unary" in [item.name for item in determined.trusted]
-    assert by_node["supervision"].declarations == ()
-    (issue,) = report.unresolved
-    assert issue.declaration == "Skel.supervision_nonAmbiguous"
-    assert "omitted required statement_source" in issue.reason
-    assert not report.clean
+    assert report.clean and not report.unresolved
+    (declaration,) = report.nodes[0].declarations
+    assert declaration.statement is None
+    eligible = next(item for item in declaration.trusted if item.name == "Skel.Eligible")
+    assert eligible.source is None and eligible.source_withheld
+    packet = report.nodes[0].blind_text()
+    assert "as written" not in packet and "Eligible (S" not in packet
+    assert packet.count("-- source not shown: Lean cannot read it reliably outside its file") == 2
+    assert f"-- raw signature: {eligible.raw_signature}" in packet
     path = write_skeleton_report(report, tmp_path / "report.json")
     assert load_skeleton_report(path) == report
+    # The flag cannot excuse source a report actually carries.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["nodes"][0]["declarations"][0]["trusted"][2]["source_withheld"] = True
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SkeletonError, match="invalid withheld source flag"):
+        load_skeleton_report(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -956,6 +962,7 @@ def test_trusted_theorem_source_never_exposes_its_proof(tmp_path: Path) -> None:
             "module": "Skel.Defs",
             "range": [12, 13],
             "signature": "Skel.eligible_of {Y : Type} (S : Y → Prop) (y : Y) (h : S y) : Skel.Eligible S y",
+            "raw_signature": "Skel.eligible_of {Y : Type} (S : Y -> Prop) (y : Y) (h : S y) : Skel.Eligible S y",
             "semantic_schema": SEMANTIC_SCHEMA,
             "semantic": _semantic({"type": {"sort": {"zero": None}}}),
             "depends": ["Skel.Eligible"],
@@ -1179,7 +1186,7 @@ def test_removing_comments_does_not_join_tokens_or_lines() -> None:
 def test_packets_fail_closed_when_lean_cannot_locate_comments(tmp_path: Path) -> None:
     record = _fake_found_record()
     # `=--` is a project token here, not a line comment. With ranges from Lean
-    # the code is kept; without them the packet is refused, not guessed.
+    # the code is kept; without them the source is withheld, not guessed.
     record["trusted"][2]["source"] = "def claim : Prop := 2 + 2 =--\n  5"
     record["trusted"][2]["source_comments"] = []
     project = _project(tmp_path)
@@ -1188,8 +1195,10 @@ def test_packets_fail_closed_when_lean_cannot_locate_comments(tmp_path: Path) ->
     assert "def claim : Prop := 2 + 2 =--\n  5" in report.nodes[0].blind_text()
 
     record["trusted"][2]["source_comments"] = None
-    with pytest.raises(SkeletonError, match="cannot separate comments from code"):
-        extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+    report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: PROBE_MARKER + json.dumps(record))
+    assert "=--" not in report.nodes[0].blind_text()
+    (claim,) = [item for item in report.nodes[0].declarations[0].trusted if item.name == "Skel.Eligible"]
+    assert claim.source is None and claim.source_withheld
 
 
 @pytest.mark.parametrize("ranges", [[[2, 5]], [[0, 999]], [[0, 5], [3, 8]], [[5, 3]], "none"])
@@ -2215,22 +2224,74 @@ def test_type_and_value_less_roots_show_their_whole_declaration(tmp_path: Path) 
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
-def test_local_notation_statement_fails_only_its_node(tmp_path: Path) -> None:
+def test_local_notation_statement_gets_a_packet_without_its_text(tmp_path: Path) -> None:
     project = _project(tmp_path)
     _build(project, "Skel.Kinds")
     roots = {"local": "Skel.Kinds.usesLocalNotation", "plain": "Skel.Kinds.plain"}
 
     report = extract_skeletons(_blueprint(tmp_path, lean=roots), lean_root=project)
 
-    assert [d.name for node in report.nodes for d in node.declarations] == ["Skel.Kinds.plain"]
-    (issue,) = report.unresolved
-    assert issue.declaration == "Skel.Kinds.usesLocalNotation"
-    assert "omitted required statement_source" in issue.reason
+    assert report.clean
+    by_name = {d.name: d for node in report.nodes for d in node.declarations}
+    local = by_name["Skel.Kinds.usesLocalNotation"]
+    # `𝟙` does not parse outside the file, so no text is shown; the signatures
+    # and kernel material still say what the theorem states.
+    assert local.statement is None and local.source is None
+    packet = local.blind_text()
+    assert "𝟙" not in packet and "-- source not shown" in packet
+    assert "OfNat.ofNat.{0} Nat 1" in local.raw_signature
 
     # The source index cannot see a declaration behind `open … in`; ask the probe.
     probe = render_probe(imports=("Skel.Kinds",), roots=("Skel.Kinds.usesSameLineOpen",), project_roots=("Skel",))
     (record,) = parse_probe_output(run_probe(probe, project)).values()
     assert record["statement_source"] == "theorem usesSameLineOpen : 𝟚 = 2"
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_source_lean_cannot_read_outside_its_file_is_withheld(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Unparsed", "Skel.CommentTokenUse")
+    roots = {
+        "continued": "Skel.Unparsed.usesContinuedOpen",
+        "proof": "Skel.Unparsed.localInProof",
+        "local": "Skel.Unparsed.usesLocalDef",
+        "blind": "Skel.Unparsed.usesBlindToken",
+    }
+
+    def extract(root: Path) -> dict[str, DeclarationSkeleton]:
+        report = extract_skeletons(_blueprint(root, lean=roots), lean_root=project)
+        assert report.clean
+        return {d.name: d for node in report.nodes for d in node.declarations}
+
+    def trusted(declaration: DeclarationSkeleton) -> TrustedDeclaration:
+        (item,) = declaration.trusted
+        return item
+
+    alone = extract(tmp_path / "alone")
+    # `open Other` continues with `Sc` on the next line, so `⟪two⟫` parses and
+    # Lean finds the docstring.
+    two = trusted(alone["Skel.Unparsed.usesContinuedOpen"])
+    assert two.source is not None and "Uses notation" not in alone["Skel.Unparsed.usesContinuedOpen"].blind_text()
+    # Only the proof uses local notation: the statement is still shown.
+    assert alone["Skel.Unparsed.localInProof"].statement == "theorem localInProof : 1 + 1 = 2"
+    # A body with local notation does not parse, and its docstring cannot be
+    # told from code: the source is withheld, the node stays clean.
+    local = trusted(alone["Skel.Unparsed.usesLocalDef"])
+    assert local.source is None and local.source_withheld
+    assert "⊞" not in alone["Skel.Unparsed.usesLocalDef"].blind_text()
+    # `-- _b +` is a comment in a file without the `+--` token.
+    blind = alone["Skel.Unparsed.usesBlindToken"]
+    assert "+--" not in blind.blind_text() and not trusted(blind).source_withheld
+
+    # With `+--` in the probe's environment, the probe cannot tell whether that
+    # text is a comment in its file, so it shows no source containing it.
+    roots["token"] = "Skel.usesCommentToken"
+    with_token = extract(tmp_path / "with-token")
+    blind = with_token["Skel.Unparsed.usesBlindToken"]
+    assert trusted(blind).source_withheld and "+--" not in blind.blind_text()
+    # Its own module imports the token, so there it is code.
+    assert with_token["Skel.usesCommentToken"].statement == "theorem Skel.usesCommentToken : 2 +-- 3 = 6"
+    assert with_token["Skel.Unparsed.usesLocalDef"].hash == alone["Skel.Unparsed.usesLocalDef"].hash
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")

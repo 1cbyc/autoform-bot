@@ -118,6 +118,11 @@ class SkeletonError(RuntimeError):
         super().__init__("; ".join(self.issues))
 
 
+#: Shown in place of source text Lean could not read apart from its file. The
+#: signatures and canonical kernel material above it still state the meaning.
+_NOT_SHOWN = "-- source not shown: Lean cannot read it reliably outside its file"
+
+
 @dataclass(frozen=True, slots=True)
 class TrustedDeclaration:
     """One project declaration a reader must agree with."""
@@ -129,11 +134,16 @@ class TrustedDeclaration:
     start_line: int | None
     end_line: int | None
     signature: str
+    #: The raw signature, so project printers cannot disguise a trusted theorem.
+    raw_signature: str
     semantic: str
     depends: tuple[str, ...]
     source: str | None = None
     #: UTF-8 byte ranges of the comments in ``source``, as Lean's parser found them.
     source_comments: tuple[tuple[int, int], ...] = ()
+    #: True when the source exists but is not shown: Lean could not tell its
+    #: comments from its code in the probe's context (see ``_shown_source``).
+    source_withheld: bool = False
 
     @property
     def lines(self) -> int:
@@ -148,10 +158,12 @@ class TrustedDeclaration:
             "module": self.module,
             "name": self.name,
             "path": self.path,
+            "raw_signature": self.raw_signature,
             "signature": self.signature,
             "semantic": self.semantic,
             "source": self.source,
             "source_comments": [list(item) for item in self.source_comments],
+            "source_withheld": self.source_withheld,
             "start_line": self.start_line,
         }
 
@@ -189,6 +201,9 @@ class DeclarationSkeleton:
     #: UTF-8 byte ranges of the comments in ``source`` and ``statement``.
     source_comments: tuple[tuple[int, int], ...] = ()
     statement_comments: tuple[tuple[int, int], ...] = ()
+    #: True when a definition's source exists but is not shown, as for
+    #: ``TrustedDeclaration.source_withheld``.
+    source_withheld: bool = False
 
     @property
     def defines(self) -> bool:
@@ -265,6 +280,8 @@ class DeclarationSkeleton:
             written = _without_comments(self.statement, self.statement_comments).strip("\n")
             if written:
                 lines += ["-- as written:", written]
+        if self.source_withheld or not (own or self.statement):
+            lines.append(_NOT_SHOWN)
         for item in self.trusted:
             body = _without_comments(item.source or "", item.source_comments).strip("\n")
             # The elaborated signature restores what `variable` binders and
@@ -273,10 +290,13 @@ class DeclarationSkeleton:
                 "",
                 f"-- {item.kind} {item.name}",
                 f"-- signature: {item.signature}",
+                f"-- raw signature: {item.raw_signature}",
                 f"-- canonical kernel material: {item.semantic}",
             ]
             if body:
                 lines.append(body)
+            elif item.source_withheld:
+                lines.append(_NOT_SHOWN)
         return "\n".join(lines) + "\n"
 
     def as_dict(self) -> dict[str, object]:
@@ -302,6 +322,7 @@ class DeclarationSkeleton:
             "skeleton_lines": self.skeleton_lines,
             "source": self.source,
             "source_comments": [list(item) for item in self.source_comments],
+            "source_withheld": self.source_withheld,
             "start_line": self.start_line,
             "statement": self.statement,
             "statement_comments": [list(item) for item in self.statement_comments],
@@ -631,6 +652,7 @@ _DECLARATION_REPORT_FIELDS = frozenset(
         "skeleton_lines",
         "source",
         "source_comments",
+        "source_withheld",
         "start_line",
         "statement",
         "statement_comments",
@@ -645,10 +667,12 @@ _TRUSTED_REPORT_FIELDS = frozenset(
         "module",
         "name",
         "path",
+        "raw_signature",
         "semantic",
         "signature",
         "source",
         "source_comments",
+        "source_withheld",
         "start_line",
     }
 )
@@ -713,13 +737,14 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
     source = _report_optional_string(item.get("source"), f"source for {name}")
     if kind in {"theorem", "axiom"} and source is not None:
         raise SkeletonError([f"proof-bearing source is forbidden for {kind} {name}"])
+    source_withheld = _report_withheld(item.get("source_withheld"), source, name)
     start_line = _report_optional_int(item.get("start_line"), f"start line for {name}")
-    entries = [(name, kind, source, start_line)]
-    entries += [(value.name, value.kind, value.source, value.start_line) for value in trusted]
-    for entry_name, entry_kind, entry_source, entry_start in entries:
-        if _source_required(entry_name, entry_kind, entry_source, entry_start is not None):
+    entries = [(name, kind, source, start_line, source_withheld)]
+    entries += [(value.name, value.kind, value.source, value.start_line, value.source_withheld) for value in trusted]
+    for entry_name, entry_kind, entry_source, entry_start, withheld in entries:
+        if not withheld and _source_required(entry_name, entry_kind, entry_source, entry_start is not None):
             raise SkeletonError([f"required source is missing for {entry_kind} {entry_name}"])
-    statement = _report_string(item.get("statement"), f"statement for {name}")
+    statement = _report_optional_string(item.get("statement"), f"statement for {name}")
     declaration = DeclarationSkeleton(
         name=name,
         kind=kind,
@@ -744,6 +769,7 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
         statement_comments=_comment_ranges(
             item.get("statement_comments"), statement, context=f"the statement of {name}"
         ),
+        source_withheld=source_withheld,
     )
     _validate_report_ranges(declaration.start_line, declaration.end_line, context=name)
     if item.get("hash") != declaration.hash:
@@ -775,10 +801,12 @@ def _trusted_from_dict(item: object, *, root: str) -> TrustedDeclaration:
         start_line=_report_optional_int(item.get("start_line"), f"start line for {name}"),
         end_line=_report_optional_int(item.get("end_line"), f"end line for {name}"),
         signature=_report_string(item.get("signature"), f"signature for {name}"),
+        raw_signature=_report_string(item.get("raw_signature"), f"raw signature for {name}"),
         semantic=semantic,
         depends=_report_string_tuple(item.get("depends"), f"dependencies for {name}"),
         source=source,
         source_comments=_comment_ranges(item.get("source_comments"), source, context=f"the source of {name}"),
+        source_withheld=_report_withheld(item.get("source_withheld"), source, name),
     )
     _validate_report_ranges(trusted.start_line, trusted.end_line, context=name)
     return trusted
@@ -795,6 +823,12 @@ def _report_optional_string(value: object, context: str) -> str | None:
         return None
     if not isinstance(value, str):
         raise SkeletonError([f"invalid {context} in skeleton report"])
+    return value
+
+
+def _report_withheld(value: object, source: str | None, name: str) -> bool:
+    if type(value) is not bool or (value and source is not None):
+        raise SkeletonError([f"invalid withheld source flag for {name} in skeleton report"])
     return value
 
 
@@ -1721,6 +1755,7 @@ _TRUSTED_RECORD_FIELDS = frozenset(
         "module",
         "name",
         "range",
+        "raw_signature",
         "semantic",
         "semantic_schema",
         "signature",
@@ -1822,6 +1857,7 @@ def _validate_trusted_record(record: dict[str, object], *, root: str) -> None:
     _require_semantic(record, context=context, kind=str(record["kind"]))
     _require_nonempty_string(record.get("module"), field="module", context=context)
     _require_nonempty_string(record.get("signature"), field="signature", context=context)
+    _require_nonempty_string(record.get("raw_signature"), field="raw_signature", context=context)
     _require_range(record.get("range"), context=context)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=context)
     _require_probe_comments(record, "source", "source_comments", context=context)
@@ -1857,18 +1893,14 @@ def _require_probe_source(value: object, *, kind: str, context: str) -> None:
 def _probe_record_issue(record: dict[str, object]) -> str | None:
     """Why a validated probe record cannot yield a skeleton, confined to its node.
 
-    A statement that does not parse in its file context (for example, one that
-    uses `local notation`) or a declaration whose source cannot be located
-    leaves nothing faithful to show a reviewer. That is a gap in this node's
-    evidence, not in the probe run, so other nodes still extract.
+    A declaration whose source cannot be located leaves nothing faithful to
+    show a reviewer. That is a gap in this node's evidence, not in the probe
+    run, so other nodes still extract. Source Lean cannot read outside its file
+    (for example, a statement that uses `local notation`) is only withheld: the
+    signatures and canonical kernel material still state its meaning.
     """
 
     root = str(record["root"])
-    if _statement(record.get("statement_source")) is None:
-        return (
-            "the skeleton probe omitted required statement_source: the statement "
-            "does not parse in its file context (for example, it uses local notation)"
-        )
     trusted = record["trusted"]
     assert isinstance(trusted, list)
     entries = [(root, root, record)]
@@ -1916,23 +1948,24 @@ def _require_probe_comments(record: dict[str, object], text_field: str, field: s
         raise SkeletonError([f"the skeleton probe emitted an invalid {field} field for {context}"]) from exc
 
 
-def _probe_comments(value: object, text: str | None, *, name: str) -> tuple[tuple[int, int], ...]:
-    """Comment ranges for display, failing closed when Lean could not find them.
+def _shown_source(
+    text: str | None, comments: object, *, name: str
+) -> tuple[str | None, tuple[tuple[int, int], ...], bool]:
+    """Source a reader can be shown, its comment ranges, and whether it was withheld.
 
     Only Lean knows where a comment starts: a project token such as ``=--`` is
     code to it. Text Lean could not parse alone is shown only if it has nothing
-    that could start a comment.
+    that could start a comment; otherwise it is withheld, and the reader gets
+    the signatures and canonical kernel material, which state its meaning.
     """
 
     if text is None:
-        return ()
-    if value is None:
+        return None, (), False
+    if comments is None:
         if "--" in text or "/-" in text:
-            raise SkeletonError(
-                [f"cannot separate comments from code in {name}: Lean could not parse its source alone"]
-            )
-        return ()
-    return _comment_ranges(value, text, context=name)
+            return None, (), True
+        return text, (), False
+    return text, _comment_ranges(comments, text, context=name), False
 
 
 def _require_range(value: object, *, context: str) -> None:
@@ -2480,17 +2513,17 @@ def _declaration(
     name = str(record["root"])
     semantic = str(record["semantic"])
     module = str(record.get("module") or "")
-    source = _optional_probe_string(record.get("source"))
-    written = _optional_probe_string(record.get("statement_source"))
+    source, source_comments, source_withheld = _shown_source(
+        _optional_probe_string(record.get("source")), record.get("source_comments"), name=name
+    )
+    written, written_comments, _ = _shown_source(
+        _optional_probe_string(record.get("statement_source")), record.get("statement_comments"), name=name
+    )
     statement = _statement(written)
     # `_statement` only trims the end, so the ranges still apply up to its length.
     limit = len((statement or "").encode("utf-8"))
     statement_comments = _comment_ranges(
-        [
-            [start, min(end, limit)]
-            for start, end in _probe_comments(record.get("statement_comments"), written, name=name)
-            if start < limit
-        ],
+        [[start, min(end, limit)] for start, end in written_comments if start < limit],
         statement,
         context=f"the statement of {name}",
     )
@@ -2522,8 +2555,9 @@ def _declaration(
         axiom_semantics=_semantic_pairs(record.get("axiom_semantics")),
         source=source,
         statement=statement,
-        source_comments=_probe_comments(record.get("source_comments"), source, name=name),
+        source_comments=source_comments,
         statement_comments=statement_comments,
+        source_withheld=source_withheld,
     )
     return declaration
 
@@ -2542,7 +2576,9 @@ def _trusted(
     start, end = _range(item.get("range"))
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
     _check_local_safety(source_name, semantic)
-    source = _optional_probe_string(item.get("source"))
+    source, source_comments, source_withheld = _shown_source(
+        _optional_probe_string(item.get("source")), item.get("source_comments"), name=name
+    )
     trusted = TrustedDeclaration(
         name=name,
         kind=str(item.get("kind") or "unknown"),
@@ -2551,10 +2587,12 @@ def _trusted(
         start_line=start,
         end_line=end,
         signature=str(item.get("signature") or ""),
+        raw_signature=str(item["raw_signature"]),
         semantic=semantic,
         depends=tuple(_strings(item.get("depends"))),
         source=source,
-        source_comments=_probe_comments(item.get("source_comments"), source, name=name),
+        source_comments=source_comments,
+        source_withheld=source_withheld,
     )
     return trusted
 
@@ -2662,6 +2700,8 @@ def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> s
             elif declaration.statement is not None:
                 out.append("   -- as written:")
                 out.extend(f"   {line}" for line in declaration.statement.splitlines())
+            if declaration.source_withheld or (declaration.source is None and declaration.statement is None):
+                out.append(f"   {_NOT_SHOWN}")
             out.append("")
             out.append(f"   {_trust_summary(declaration)} · skeleton {declaration.hash}")
             if declaration.assumed:
@@ -2674,6 +2714,8 @@ def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> s
                 excerpt = item.source
                 if excerpt is None:
                     out.extend(f"   {line}" for line in item.signature.splitlines())
+                    if item.source_withheld:
+                        out.append(f"   {_NOT_SHOWN}")
                 else:
                     out.extend(f"   {line}" for line in excerpt.splitlines())
             out.append("")

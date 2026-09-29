@@ -320,9 +320,7 @@ anywhere in the trusted closure is refused, as recorded by the Lean
 environment rather than by the source text: its kernel face is an opaque
 constant, so the body a reader would see is not what Lean checks. The command
 exits nonzero when a `lean:` name is absent from the sources or from the built
-environment, or when its statement cannot be cut from the source (for example,
-a theorem that uses `local notation`); that name is unresolved for its article
-only, other articles still extract, and it writes nothing into the vault;
+environment; that name is unresolved for its article only, other articles still extract, and it writes nothing into the vault;
 `--output` records the `autoform-skeleton/v4` report, which contains no
 timestamp or absolute path, for a later render or review to consume. The
 report identifies the exact blueprint, its complete target set, and whether
@@ -390,16 +388,29 @@ with every comment and docstring
 removed, so that a reader who is asked what the Lean
 literally asserts cannot read the author's intent into it. Lean's parser, not
 a separate lexer, locates the comments, so a project token that contains `--`
-stays code; a source Lean cannot parse on its own is refused if it may hold a
-comment. The raw signature bypasses project notation, unexpanders, and custom
-delaborators, so an `infixl " + " => HMul.hMul` cannot make a product read as
-a sum. The canonical material provides the same backstop for trusted definition
-bodies, structures, and generated companions.
+stays code. The probe parses each source in its own environment, which has the
+notation of every module the run imports but not the file's `local` notation.
+A source it cannot parse there (a body that uses `local notation`) is withheld
+if it may hold a comment, and so is any source containing a non-builtin token
+with `--` or `/-`, since its file may not import that token and would read
+the rest of the line as a comment. A withheld source leaves the declaration's
+signatures and kernel material in the packet and does not make the article
+unresolved. A `local` token containing `--` is invisible to the probe: the
+packet can then show code as a comment or a comment as code.
+
+Every item's signature is also printed raw, bypassing project notation,
+unexpanders, and custom delaborators, so an `infixl " + " => HMul.hMul` cannot
+make a product read as a sum in any signature. Source text is not notation-proof:
+a definition's body, including a definition root's own source, is shown as
+written, where such notation still applies. For those, and for structures and
+generated companions, only the canonical kernel material, shown for every item,
+states the meaning without notation.
 
 Each theorem's packet also carries the statement *as written*, cut before its
 value by Lean's parser with its enclosing namespaces and the file's opened
-namespaces in scope so that scoped notation parses, beside the elaborated
-signature: the printed form shows binders that `variable` and `include` inject
+namespaces in scope so that scoped notation parses (a proof Lean cannot parse,
+for example one using `local notation`, does not stop the cut; a statement Lean
+cannot parse is not shown), beside the elaborated signature: the printed form shows binders that `variable` and `include` inject
 and the type every cast lands in, the written form shows what the
 pretty-printer elides, and neither can hide what the other shows.
 
