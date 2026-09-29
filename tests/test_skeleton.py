@@ -581,7 +581,9 @@ def test_bounded_command_cleanup_reserves_time_and_reuses_final_deadline(
     assert deadlines[1] == deadlines[2]
 
 
-def test_probe_freshness_and_execution_share_one_deadline(tmp_path: Path, monkeypatch) -> None:
+def test_probe_freshness_and_execution_have_separate_budgets(tmp_path: Path, monkeypatch) -> None:
+    # On a Mathlib project the freshness check alone can take minutes, which
+    # must not come out of the probe's own budget.
     (tmp_path / "lake-manifest.json").write_text("{}\n", encoding="utf-8")
     calls: list[float] = []
 
@@ -589,14 +591,14 @@ def test_probe_freshness_and_execution_share_one_deadline(tmp_path: Path, monkey
         calls.append(kwargs["timeout"])
         return subprocess.CompletedProcess(command, 0, stdout="probe output", stderr="")
 
-    times = iter((100.0, 101.0, 104.0))
+    times = iter((100.0, 101.0))
     monkeypatch.setattr("autoform_cli.skeleton.shutil.which", lambda executable: "/bin/lake")
     monkeypatch.setattr("autoform_cli.skeleton._run_bounded_command", fake_run)
     monkeypatch.setattr("autoform_cli.skeleton.time.monotonic", lambda: next(times))
     probe = render_probe(imports=("Skel.Main",), roots=("Skel.x",), project_roots=("Skel",))
 
-    assert run_probe(probe, tmp_path, timeout=10) == "probe output"
-    assert calls == [9.0, 6.0]
+    assert run_probe(probe, tmp_path, timeout=10, freshness_timeout=20) == "probe output"
+    assert calls == [20, 9.0]
 
 
 def test_probe_requires_an_existing_lake_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -1591,6 +1593,25 @@ def test_cli_writes_the_artifact_and_fails_on_unresolved_names(tmp_path: Path, c
 
     assert main(["skeleton", str(blueprint), "--lean-root", str(project), "--node", "basics/determined", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["unresolved"] == []
+
+
+def test_cli_sets_the_probe_timeout(tmp_path: Path, capsys, monkeypatch) -> None:
+    project = _project(tmp_path)
+    blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
+    timeouts: list[float] = []
+
+    def fake_run_probe(probe: str, root: Path, *, timeout: float) -> str:
+        timeouts.append(timeout)
+        return _fake_probe_output()
+
+    monkeypatch.setattr("autoform_cli.__main__.run_probe", fake_run_probe)
+    command = ["skeleton", str(blueprint), "--lean-root", str(project), "--json"]
+    assert main([*command, "--timeout", "1800"]) == 0
+    assert timeouts == [1800.0]
+    for bad in ("0", "-5", "inf", "nan", "soon"):
+        with pytest.raises(SystemExit):
+            main([*command, "--timeout", bad])
+    assert "expected a positive number of seconds" in capsys.readouterr().err
 
 
 def test_cli_reports_extraction_failures_on_stderr(tmp_path: Path, capsys) -> None:

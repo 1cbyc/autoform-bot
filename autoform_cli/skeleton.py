@@ -89,6 +89,9 @@ _SHADOWED_CORE_MODULE = re.compile(
 )
 
 DEFAULT_PROBE_TIMEOUT = 600.0
+#: The Lake freshness check hashes every imported input, which on a Mathlib
+#: project can take minutes on its own, so it does not share the probe's budget.
+DEFAULT_FRESHNESS_TIMEOUT = 600.0
 DEFAULT_PROBE_OUTPUT_LIMIT = 64 * 1024 * 1024
 _PROCESS_TERMINATION_GRACE = 2.0
 #: Lake's exit status when ``--no-build`` finds a target that needs rebuilding.
@@ -1753,8 +1756,18 @@ def _check_artifacts_fresh(
         )
 
 
-def run_probe(probe: str, lean_root: Path, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> str:
-    """Run ``probe`` with ``lake env lean`` inside the built project."""
+def run_probe(
+    probe: str,
+    lean_root: Path,
+    *,
+    timeout: float = DEFAULT_PROBE_TIMEOUT,
+    freshness_timeout: float = DEFAULT_FRESHNESS_TIMEOUT,
+) -> str:
+    """Run ``probe`` with ``lake env lean`` inside the built project.
+
+    ``freshness_timeout`` bounds the Lake freshness check that runs first and
+    ``timeout`` the probe itself; neither spends the other's budget.
+    """
 
     lake = shutil.which("lake")
     if lake is None:
@@ -1764,13 +1777,8 @@ def run_probe(probe: str, lean_root: Path, *, timeout: float = DEFAULT_PROBE_TIM
             ["lake-manifest.json is missing; run `lake build` before extracting skeletons"]
         )
     modules = _probe_modules(probe)
+    _check_artifacts_fresh(lake, lean_root, modules, timeout=freshness_timeout)
     deadline = time.monotonic() + timeout
-    _check_artifacts_fresh(
-        lake,
-        lean_root,
-        modules,
-        timeout=max(0.0, deadline - time.monotonic()),
-    )
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     with _signal_guard(), tempfile.TemporaryDirectory(prefix="autoform-skeleton-") as scratch:
@@ -3494,6 +3502,7 @@ def _where(item: TrustedDeclaration) -> str:
 
 __all__ = [
     "ARTICLE_PACKET",
+    "DEFAULT_FRESHNESS_TIMEOUT",
     "DEFAULT_PROBE_TIMEOUT",
     "PROBE_MARKER",
     "SEMANTIC_SCHEMA",

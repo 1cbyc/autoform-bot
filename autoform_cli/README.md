@@ -338,7 +338,9 @@ Run skeleton extraction only in a trusted checkout or an operating-system
 sandbox. Lake evaluates `lakefile.lean`, and the generated probe imports project
 code whose initializers, macros, and metaprograms may perform arbitrary IO and
 can forge probe output. The timeout and output cap bound the direct batch
-command; on POSIX, Autoform also terminates its process group. They are resource
+command; on POSIX, Autoform also terminates its process group. The Lake
+freshness check and the probe each have their own 600-second budget;
+`--timeout SECONDS` sets the probe's, which a large project may need. They are resource
 controls, not a security or authenticity boundary.
 
 Every skeleton carries a full SHA-256 **drift hash**. It is derived from

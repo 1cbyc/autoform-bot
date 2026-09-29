@@ -22,9 +22,11 @@ from .lean import build_linker, declaration_names
 from .render import PublicationError, render_site
 from .scaffold import ScaffoldError, scaffold_project
 from .skeleton import (
+    DEFAULT_PROBE_TIMEOUT,
     SkeletonError,
     extract_skeletons,
     format_report,
+    run_probe,
     write_packets,
     write_skeleton_report,
 )
@@ -134,6 +136,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         metavar="DIR",
         help="with --packets: also write each article's cited source passage, for a faithfulness judge",
+    )
+    skeleton.add_argument(
+        "--timeout",
+        type=_positive_seconds,
+        metavar="SECONDS",
+        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g}); "
+        "the Lake freshness check before it has its own budget",
     )
 
     render = subparsers.add_parser("render", help="build the publishable blueprint")
@@ -338,6 +347,16 @@ def _migrate(args: argparse.Namespace) -> int:
     return 1 if args.check and not plan.complete else 0
 
 
+def _positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = 0.0
+    if not 0 < seconds < float("inf"):
+        raise argparse.ArgumentTypeError(f"expected a positive number of seconds, got {value!r}")
+    return seconds
+
+
 def _skeleton(args: argparse.Namespace) -> int:
     if args.passages is not None and args.packets is None:
         print("error: --passages requires --packets", file=sys.stderr)
@@ -357,6 +376,9 @@ def _skeleton(args: argparse.Namespace) -> int:
         report = extract_skeletons(
             args.blueprint_dir,
             lean_root=args.lean_root,
+            runner=None
+            if args.timeout is None
+            else lambda probe, root: run_probe(probe, root, timeout=args.timeout),
             node_ids=tuple(args.nodes) if args.nodes else None,
         )
     except SkeletonError as exc:
