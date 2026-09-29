@@ -49,11 +49,19 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psutil
 
 from .graph import Graph, GraphValidationError, Node, load_graph
-from .lean import PACKET_SCHEMA, PASSAGE_SCHEMA, SourceIndex, declaration_names, index_project
+from .lean import (
+    MANAGED_OUTPUT_SCHEMAS,
+    PACKET_SCHEMA,
+    PASSAGE_SCHEMA,
+    SourceIndex,
+    declaration_names,
+    index_project,
+)
 
 try:  # Python 3.11+
     import tomllib
@@ -150,9 +158,9 @@ class DeclarationSkeleton:
     start_line: int | None
     end_line: int | None
     signature: str
-    #: The signature printed with notation off, so project syntax cannot make
-    #: ``HMul.hMul a b`` read as ``a + b``.
-    notation_free_signature: str
+    #: The raw signature, so project printers cannot make ``HMul.hMul a b``
+    #: read as ``a + b``.
+    raw_signature: str
     semantic: str
     lean_version: str
     depends: tuple[str, ...]
@@ -237,8 +245,9 @@ class DeclarationSkeleton:
             f"-- axioms: {', '.join(self.axioms) if self.axioms else 'none'}",
             "",
             self.signature,
-            "-- without notation:",
-            self.notation_free_signature,
+            "-- raw signature:",
+            self.raw_signature,
+            f"-- canonical kernel material: {self.semantic}",
         ]
         own = _without_comments(self.source or "", self.source_comments).strip("\n")
         if own:
@@ -251,7 +260,12 @@ class DeclarationSkeleton:
             body = _without_comments(item.source or "", item.source_comments).strip("\n")
             # The elaborated signature restores what `variable` binders and
             # `open` leave implicit in the source, such as the type of `S`.
-            lines += ["", f"-- {item.kind} {item.name}", f"-- signature: {item.signature}"]
+            lines += [
+                "",
+                f"-- {item.kind} {item.name}",
+                f"-- signature: {item.signature}",
+                f"-- canonical kernel material: {item.semantic}",
+            ]
             if body:
                 lines.append(body)
         return "\n".join(lines) + "\n"
@@ -271,7 +285,7 @@ class DeclarationSkeleton:
             "lean_version": self.lean_version,
             "module": self.module,
             "name": self.name,
-            "notation_free_signature": self.notation_free_signature,
+            "raw_signature": self.raw_signature,
             "path": self.path,
             "signature": self.signature,
             "semantic": self.semantic,
@@ -593,7 +607,7 @@ _DECLARATION_REPORT_FIELDS = frozenset(
         "lean_version",
         "module",
         "name",
-        "notation_free_signature",
+        "raw_signature",
         "path",
         "semantic",
         "signature",
@@ -697,8 +711,8 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
         start_line=start_line,
         end_line=_report_optional_int(item.get("end_line"), f"end line for {name}"),
         signature=_report_string(item.get("signature"), f"signature for {name}"),
-        notation_free_signature=_report_string(
-            item.get("notation_free_signature"), f"notation-free signature for {name}"
+        raw_signature=_report_string(
+            item.get("raw_signature"), f"raw signature for {name}"
         ),
         semantic=semantic,
         lean_version=_report_string(item.get("lean_version"), f"Lean version for {name}"),
@@ -811,13 +825,19 @@ def _sha256_id(content: bytes) -> str:
 
 
 def _without_comments(text: str, comments: tuple[tuple[int, int], ...]) -> str:
-    """Remove the comment ranges Lean's parser found, then the blank lines left behind."""
+    """Blank the comment ranges Lean found without joining surrounding tokens."""
 
     data = text.encode("utf-8")
     kept: list[bytes] = []
     cursor = 0
     for start, end in comments:
         kept.append(data[cursor:start])
+        removed = data[start:end].decode("utf-8")
+        kept.append(
+            "".join(character if character in "\r\n\t" else " " for character in removed).encode(
+                "utf-8"
+            )
+        )
         cursor = end
     kept.append(data[cursor:])
     return "\n".join(
@@ -1666,7 +1686,7 @@ _FOUND_RECORD_FIELDS = frozenset(
         "module",
         "range",
         "root",
-        "notation_free_signature",
+        "raw_signature",
         "semantic",
         "semantic_schema",
         "signature",
@@ -1738,7 +1758,7 @@ def _validate_probe_record(record: dict[str, object], *, root: str) -> None:
     _require_nonempty_string(record.get("module"), field="module", context=root)
     _require_nonempty_string(record.get("signature"), field="signature", context=root)
     _require_nonempty_string(
-        record.get("notation_free_signature"), field="notation_free_signature", context=root
+        record.get("raw_signature"), field="raw_signature", context=root
     )
     _require_range(record.get("range"), context=root)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=root)
@@ -2395,7 +2415,11 @@ def source_passage(
         return None, None
 
     for target in node.sources:
-        path, _, fragment = target.partition("#")
+        parsed = urlsplit(target)
+        if parsed.scheme or parsed.netloc:
+            continue
+        path = parsed.path
+        fragment = parsed.fragment
         match = _LINE_LOCATOR.fullmatch(fragment or "")
         if match is None or not path or path.endswith(".md"):
             continue
@@ -2413,6 +2437,8 @@ def source_passage(
             # between pages, and every locator into such a file would then drift
             # by one line per page.
             lines = captured[0].decode("utf-8").split("\n")
+            if lines and lines[-1] == "":
+                lines.pop()
         except (ValueError, UnicodeError):
             return broken(target, "names a file that is not readable UTF-8 text")
         start = int(match.group(1))
@@ -2474,7 +2500,7 @@ def _declaration(
         start_line=start,
         end_line=end,
         signature=str(record.get("signature") or ""),
-        notation_free_signature=str(record["notation_free_signature"]),
+        raw_signature=str(record["raw_signature"]),
         semantic=semantic,
         lean_version=str(record["lean_version"]),
         depends=tuple(_strings(record.get("depends"))),
@@ -2720,11 +2746,10 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"]) from exc
     if not isinstance(payload, dict):
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])
-    expected_schema = PACKET_SCHEMA if kind == "packets" else PASSAGE_SCHEMA
     entries = payload.get(kind)
     if (
         payload.get("kind") != kind
-        or payload.get("schema") != expected_schema
+        or (kind, payload.get("schema")) not in MANAGED_OUTPUT_SCHEMAS
         or not isinstance(entries, list)
     ):
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])

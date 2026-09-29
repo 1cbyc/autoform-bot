@@ -20,6 +20,10 @@ opaque opaqueWitness : Nat := opaqueSeed
 
 theorem usesOpaque : opaqueWitness = opaqueWitness := rfl
 
+opaque ordinaryWithNamedCompanion : Nat
+
+unsafe def ordinaryWithNamedCompanion._unsafe_rec : Nat := 1
+
 def selectedProposition : Prop := Vendor.Choice.proposition
 
 def usesExternalDetail : Nat := Vendor.visible._helper

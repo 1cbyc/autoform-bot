@@ -364,6 +364,8 @@ tree, so removed declarations cannot leave stale packets behind. A concurrent
 change detected before commit aborts publication instead of being overwritten.
 If the isolated old tree changes later, Autoform preserves it at a reported
 recovery path instead of deleting it.
+Packet and passage manifests use their v2 schemas; v1 output trees are still
+recognized and replaced during an upgrade.
 
 An unresolved selected declaration makes the report incomplete and prevents
 all packet and passage publication; `--output` alone can still record that
@@ -372,15 +374,17 @@ their parent filesystems must support the temporary files, hard links, and
 atomic renames used for guarded replacement.
 
 A packet holds only what a blind auditor may see: the signature, the same
-signature printed with notation off, the statement as written, and the source
-of every project definition it rests on, with every comment and docstring
+signature printed in Lean's raw expression form, the canonical kernel material,
+the statement as written, and the source of every project definition it rests on,
+with every comment and docstring
 removed, so that a reader who is asked what the Lean
 literally asserts cannot read the author's intent into it. Lean's parser, not
 a separate lexer, locates the comments, so a project token that contains `--`
 stays code; a source Lean cannot parse on its own is refused if it may hold a
-comment. The notation-free signature spells every application by its constant,
-so project notation such as an `infixl " + " => HMul.hMul` cannot make a
-product read as a sum. Custom delaborators still apply to it.
+comment. The raw signature bypasses project notation, unexpanders, and custom
+delaborators, so an `infixl " + " => HMul.hMul` cannot make a product read as
+a sum. The canonical material provides the same backstop for trusted definition
+bodies, structures, and generated companions.
 
 Each theorem's packet also carries the statement *as written*, cut before its
 value by Lean's parser with its enclosing namespaces and the file's opened
@@ -392,9 +396,10 @@ can hide what the other shows.
 A statement's source passage can travel with it. A `## Sources` link to a
 non-Markdown file inside the blueprint with a `#L<start>-L<end>` fragment, for
 example `../../../sources/lebl-ra/ch-real-nums.tex#L693-L714`, names the exact
-text the statement came from. A first such link that names no text, because
-it points outside the blueprint, names a missing or unreadable file, or names
-no lines of it, leaves the article's declarations unresolved. `--passages DIR` writes those passages beside
+text the statement came from. External URLs are skipped. A first local locator
+that names no text, because it points outside the blueprint, names a missing
+file or non-UTF-8 text, or names no lines of it, leaves the article's
+declarations unresolved. `--passages DIR` writes those passages beside
 the packets, one per article, in a separate, disjoint managed directory. It
 requires `--packets`. Each article directory also holds `article.lean`, the
 joint packet of every declaration the article

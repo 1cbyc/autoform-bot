@@ -82,7 +82,8 @@ companion alone is not evidence, since ordinary recursive definitions have one. 
 def safetyJson (env : Environment) (c : Name) (info : ConstantInfo) : Json :=
   if info.isPartial then Json.str "partial"
   else if info.isUnsafe then Json.str "unsafe"
-  else if (info matches .opaqueInfo _) && env.contains (Compiler.mkUnsafeRecName c) then
+  else if (info matches .opaqueInfo _) &&
+      (env.find? (Compiler.mkUnsafeRecName c)).any (fun companion => companion.isPartial) then
     Json.str "partial"
   else Json.str "safe"
 
@@ -233,10 +234,11 @@ def signatureOf (c : Name) : CommandElabM String := do
   let sig ← liftTermElabM (PrettyPrinter.ppSignature c)
   return sig.fmt.pretty 100
 
-/-- The signature with every notation, infix operator, and unexpander turned
-off. Project syntax can print `HMul.hMul a b` as `a + b`; this form cannot. -/
-def notationFreeSignatureOf (c : Name) : CommandElabM String := do
-  let sig ← liftTermElabM <| withOptions (·.setBool `pp.notation false) (PrettyPrinter.ppSignature c)
+/-- The raw signature, bypassing project notation, unexpanders, and custom
+delaborators. Project syntax can print `HMul.hMul a b` as `a + b`; this form
+cannot. -/
+def rawSignatureOf (c : Name) : CommandElabM String := do
+  let sig ← liftTermElabM <| withOptions (·.setBool `pp.raw true) (PrettyPrinter.ppSignature c)
   return sig.fmt.pretty 100
 
 /-- First node of syntax kind `k` inside `stx`, depth-first. -/
@@ -571,7 +573,7 @@ def skeleton
     ("module", Json.str (toString ((moduleOf env root).getD Name.anonymous))),
     ("range", ← rangeJson root),
     ("signature", Json.str (← signatureOf root)),
-    ("notation_free_signature", Json.str (← notationFreeSignatureOf root)),
+    ("raw_signature", Json.str (← rawSignatureOf root)),
     ("semantic_schema", Json.str semanticSchema),
     ("semantic", Json.str (← cachedSemanticMaterial semanticCache env root)),
     ("depends", Json.arr (rootDeps.map fun d => Json.str (toString d))),

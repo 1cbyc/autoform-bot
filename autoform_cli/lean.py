@@ -30,9 +30,16 @@ _DECLARATION = re.compile(
 )
 _IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
 #: Schemas of the skeleton command's packet and passage manifests.
-PACKET_SCHEMA = "autoform-skeleton-packets/v1"
-PASSAGE_SCHEMA = "autoform-skeleton-passages/v1"
-_MANAGED_OUTPUT_SCHEMAS = frozenset({("packets", PACKET_SCHEMA), ("passages", PASSAGE_SCHEMA)})
+PACKET_SCHEMA = "autoform-skeleton-packets/v2"
+PASSAGE_SCHEMA = "autoform-skeleton-passages/v2"
+MANAGED_OUTPUT_SCHEMAS = frozenset(
+    {
+        ("packets", "autoform-skeleton-packets/v1"),
+        ("packets", PACKET_SCHEMA),
+        ("passages", "autoform-skeleton-passages/v1"),
+        ("passages", PASSAGE_SCHEMA),
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +110,7 @@ def _is_managed_output(path: Path) -> bool:
         return False
     return isinstance(payload, dict) and (
         payload.get("kind"), payload.get("schema")
-    ) in _MANAGED_OUTPUT_SCHEMAS
+    ) in MANAGED_OUTPUT_SCHEMAS
 
 
 def _scan(text: str, relative: Path) -> list[Declaration]:
@@ -444,6 +451,9 @@ def _git(root: str | Path, *arguments: str) -> str | None:
 
 __all__ = [
     "Declaration",
+    "MANAGED_OUTPUT_SCHEMAS",
+    "PACKET_SCHEMA",
+    "PASSAGE_SCHEMA",
     "SourceIndex",
     "SourceLinker",
     "build_linker",

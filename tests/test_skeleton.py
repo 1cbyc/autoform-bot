@@ -17,7 +17,7 @@ import pytest
 import psutil
 
 from autoform_cli.__main__ import main
-from autoform_cli.lean import index_project
+from autoform_cli.lean import PACKET_SCHEMA, PASSAGE_SCHEMA, index_project
 from autoform_cli.skeleton import (
     PACKET_MANIFEST,
     PROBE_MARKER,
@@ -36,6 +36,7 @@ from autoform_cli.skeleton import (
     _stage_output,
     _hash_module_files,
     _check_local_safety,
+    _without_comments,
     _probe_record_issue,
     extract_skeletons,
     format_report,
@@ -179,7 +180,7 @@ def _fake_probe_output(*, include_ghost: bool = False) -> str:
             module="Skel.Main",
             range=[14, 17],
             signature="Skel.observation_determined {Y : Type} (o : Skel.Observation Y) :\n  ∃ y, o.admits y",
-            notation_free_signature=(
+            raw_signature=(
                 "Skel.observation_determined {Y : Type} (o : Skel.Observation Y) :\n  Exists fun y => o.admits y"
             ),
             semantic_schema=SEMANTIC_SCHEMA,
@@ -1080,10 +1081,10 @@ def test_blind_packet_shows_the_statement_without_notation(tmp_path: Path) -> No
     report = extract_skeletons(blueprint, lean_root=project, runner=lambda p, r: _fake_probe_output())
     declaration = report.nodes[0].declarations[0]
 
-    assert "-- without notation:\n" + declaration.notation_free_signature in declaration.blind_text()
+    assert "-- raw signature:\n" + declaration.raw_signature in declaration.blind_text()
     assert "Exists fun y => o.admits y" in declaration.blind_text()
     # Notation that hides a different operator changes the packet a reviewer sees.
-    misread = replace(declaration, notation_free_signature=declaration.notation_free_signature + " ")
+    misread = replace(declaration, raw_signature=declaration.raw_signature + " ")
     assert misread.evidence_hash != declaration.evidence_hash
 
 
@@ -1094,9 +1095,14 @@ def test_review_hash_binds_the_meaning_hash(tmp_path: Path) -> None:
     node = report.nodes[0]
     declaration = node.declarations[0]
 
-    # A packet can read the same across a change of meaning; a review recorded
-    # against the review hash must not carry over.
-    changed = replace(node, declarations=(replace(declaration, semantic=declaration.semantic + " "),))
+    # An external boundary can change meaning without changing the packet text;
+    # a review recorded against the review hash must not carry over.
+    module, kind, _ = declaration.boundary_modules[0]
+    changed_declaration = replace(
+        declaration,
+        boundary_modules=((module, kind, "sha256:" + "0" * 64),),
+    )
+    changed = replace(node, declarations=(changed_declaration,))
     assert changed.evidence_hash == node.evidence_hash
     assert changed.hash != node.hash
     assert changed.review_hash != node.review_hash
@@ -1117,6 +1123,14 @@ def test_packets_drop_the_comments_lean_reports_and_keep_the_rest(tmp_path: Path
     blind = report.nodes[0].blind_text()
     assert "KEEPOUT" not in blind and "def docOpened : Nat := 6" in blind
     assert "Uses a structure" not in blind and "theorem observation_determined" in blind
+
+
+def test_removing_comments_does_not_join_tokens_or_lines() -> None:
+    inline = "Nat.succ/- explanation -/0"
+    multiline = "foo/- first\nsecond -/bar"
+
+    assert _without_comments(inline, ((8, 25),)) == "Nat.succ" + " " * 17 + "0"
+    assert _without_comments(multiline, ((3, 21),)) == "foo\n" + " " * 9 + "bar"
 
 
 def test_packets_fail_closed_when_lean_cannot_locate_comments(tmp_path: Path) -> None:
@@ -1149,9 +1163,11 @@ def test_probe_comment_ranges_must_cover_comments(tmp_path: Path, ranges: object
 @pytest.mark.parametrize(
     ("link", "why"),
     [
+        ("../../sources/book.tex#L4-L4", "names no lines of its file"),
         ("../../sources/book.tex#L5-L6", "names no lines of its file"),
         ("../../sources/book.tex#L2-L1", "names no lines of its file"),
         ("../../sources/book.tex#L0-L1", "names no lines of its file"),
+        ("../../sources/empty.tex#L1-L1", "names no lines of its file"),
         ("../../sources/missing.tex#L1-L1", "names a missing file"),
         ("../../sources/binary.tex#L1-L1", "not readable UTF-8 text"),
         ("../../../outside.tex#L1-L1", "points outside the blueprint"),
@@ -1163,6 +1179,7 @@ def test_extraction_reports_a_locator_that_names_no_passage(tmp_path: Path, link
     sources = blueprint / "sources"
     sources.mkdir()
     (sources / "book.tex").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    (sources / "empty.tex").write_text("", encoding="utf-8")
     (sources / "binary.tex").write_bytes(b"\xff\xfe\n")
     (tmp_path / "outside.tex").write_text("outside\n", encoding="utf-8")
     article = blueprint / "roadmap" / "basics" / "determined.md"
@@ -1901,6 +1918,12 @@ def test_the_probe_reads_a_built_project(tmp_path: Path) -> None:
     with pytest.raises(SkeletonError, match="partial declaration .* cannot be included"):
         extract_skeletons(partial_blueprint, lean_root=project)
 
+    ordinary_blueprint = _blueprint(
+        tmp_path / "ordinary",
+        lean={"ordinary": "Skel.Semantics.ordinaryWithNamedCompanion"},
+    )
+    assert extract_skeletons(ordinary_blueprint, lean_root=project).clean
+
     source = project / "Skel" / "Main.lean"
     source.write_text(
         source.read_text(encoding="utf-8").replace(
@@ -1931,18 +1954,65 @@ def test_project_notation_cannot_disguise_the_statement(tmp_path: Path) -> None:
         "namespace Skel.PktNotation\n"
         'infixl:65 (priority := high) " + " => HMul.hMul\n'
         "theorem addComm' (a b : Nat) : a + b = b + a := Nat.mul_comm a b\n"
+        "def disguisedProduct (a b : Nat) : Nat := a + b\n"
+        "theorem usesDisguised (a b : Nat) : disguisedProduct a b = a * b := rfl\n"
         "end Skel.PktNotation\n",
     )
-    blueprint = _blueprint(tmp_path, lean={"comm": "Skel.PktNotation.addComm'"})
+    blueprint = _blueprint(
+        tmp_path,
+        lean={
+            "comm": "Skel.PktNotation.addComm'",
+            "trusted": "Skel.PktNotation.usesDisguised",
+        },
+    )
+
+    report = extract_skeletons(blueprint, lean_root=project)
+
+    assert report.clean
+    declaration = next(
+        declaration
+        for node in report.nodes
+        for declaration in node.declarations
+        if declaration.name == "Skel.PktNotation.addComm'"
+    )
+    # Every notated form reads as addition; the packet must show multiplication.
+    assert "a + b = b + a" in declaration.signature
+    assert "HMul.hMul." in declaration.raw_signature
+    assert "-- raw signature:\n" + declaration.raw_signature in declaration.blind_text()
+
+    uses_disguised = next(
+        declaration
+        for node in report.nodes
+        for declaration in node.declarations
+        if declaration.name == "Skel.PktNotation.usesDisguised"
+    )
+    (trusted,) = uses_disguised.trusted
+    assert "a + b" in (trusted.source or "")
+    assert '"HMul"' in trusted.semantic and '"hMul"' in trusted.semantic
+    assert f"-- canonical kernel material: {trusted.semantic}" in uses_disguised.blind_text()
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_project_delaborator_cannot_disguise_the_statement(tmp_path: Path) -> None:
+    project = _built_module(
+        tmp_path,
+        "PktDelab",
+        "import Lean\n"
+        "open Lean PrettyPrinter Delaborator\n"
+        "namespace Skel.PktDelab\n"
+        "def hidden (a b : Nat) : Prop := a = b\n"
+        "@[app_delab hidden] def delabHidden : Delab := do `(True)\n"
+        "theorem target (a : Nat) : hidden a a := rfl\n"
+        "end Skel.PktDelab\n",
+    )
+    blueprint = _blueprint(tmp_path, lean={"target": "Skel.PktDelab.target"})
 
     report = extract_skeletons(blueprint, lean_root=project)
 
     assert report.clean
     declaration = report.nodes[0].declarations[0]
-    # Every notated form reads as addition; the packet must show multiplication.
-    assert "a + b = b + a" in declaration.signature
-    assert "HMul.hMul a b" in declaration.notation_free_signature
-    assert "-- without notation:\n" + declaration.notation_free_signature in declaration.blind_text()
+    assert "True" in declaration.signature
+    assert "Skel.PktDelab.hidden" in declaration.raw_signature
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
@@ -1956,9 +2026,12 @@ def test_lean_decides_which_source_text_is_comment(tmp_path: Path) -> None:
         "def docOpened : Nat := 6\n"
         "def claim : Prop := 2 + 2 =--\n"
         "  5\n"
+        "def joined : Nat := Nat.succ/- KEEPOUT_JOIN -/0\n"
+        "def multiline : Nat := Nat.succ/- KEEPOUT_MULTI\n"
+        "  STILL_HIDDEN -/0\n"
         "/-- KEEPOUT_ROOT -/\n"
-        "theorem stripRoot : docOpened = 6 ∧ claim := -- KEEPOUT_PROOF\n"
-        "  ⟨rfl, by unfold claim; decide⟩\n"
+        "theorem stripRoot : docOpened = 6 ∧ claim ∧ joined = 1 ∧ multiline = 1 := -- KEEPOUT_PROOF\n"
+        "  ⟨rfl, by unfold claim; decide, rfl, rfl⟩\n"
         "end Skel.PktStrip\n",
     )
     blueprint = _blueprint(tmp_path, lean={"strip": "Skel.PktStrip.stripRoot"})
@@ -1968,8 +2041,11 @@ def test_lean_decides_which_source_text_is_comment(tmp_path: Path) -> None:
     assert report.clean
     blind = report.nodes[0].blind_text()
     assert "KEEPOUT" not in blind
+    assert "STILL_HIDDEN" not in blind
     assert "def docOpened : Nat := 6" in blind
     assert "def claim : Prop := 2 + 2 =--\n  5" in blind
+    assert re.search(r"def joined : Nat := Nat\.succ +0", blind)
+    assert re.search(r"def multiline : Nat := Nat\.succ\n +0", blind)
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
@@ -2604,7 +2680,9 @@ def test_a_line_locator_on_a_source_file_yields_the_passage(tmp_path: Path) -> N
     article.write_text(
         article.read_text(encoding="utf-8").replace(
             "## Depends on",
-            "## Sources\n\n- [notes](../../sources/notes.md)\n- [Theorem 2](../../sources/book.tex#L5-L7)\n\n## Depends on",
+            "## Sources\n\n- [notes](../../sources/notes.md)\n"
+            "- [external](https://example.com/paper.tex#L1-L2)\n"
+            "- [Theorem 2](../../sources/book.tex#L5-L7)\n\n## Depends on",
         ),
         encoding="utf-8",
     )
@@ -2701,12 +2779,23 @@ def test_packet_publication_replaces_stale_managed_output(tmp_path: Path) -> Non
     stale_passage = passages / "stale.txt"
     stale_packet.write_text("stale\n", encoding="utf-8")
     stale_passage.write_text("stale\n", encoding="utf-8")
+    for root, schema in (
+        (packets, "autoform-skeleton-packets/v1"),
+        (passages, "autoform-skeleton-passages/v1"),
+    ):
+        manifest_path = root / PACKET_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema"] = schema
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     write_packets(report, packets, passages=passages)
 
     assert not stale_packet.exists()
     assert not stale_passage.exists()
-    assert json.loads((passages / PACKET_MANIFEST).read_text(encoding="utf-8"))["kind"] == "passages"
+    assert json.loads((packets / PACKET_MANIFEST).read_text(encoding="utf-8"))["schema"] == PACKET_SCHEMA
+    passage_manifest = json.loads((passages / PACKET_MANIFEST).read_text(encoding="utf-8"))
+    assert passage_manifest["kind"] == "passages"
+    assert passage_manifest["schema"] == PASSAGE_SCHEMA
 
 
 def test_packet_publication_refuses_unmanaged_or_symlink_output(tmp_path: Path) -> None:
