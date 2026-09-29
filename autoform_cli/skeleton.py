@@ -707,9 +707,8 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
     start_line = _report_optional_int(item.get("start_line"), f"start line for {name}")
     entries = [(name, kind, source, start_line)]
     entries += [(value.name, value.kind, value.source, value.start_line) for value in trusted]
-    ranged = {entry[0] for entry in entries if entry[3] is not None}
     for entry_name, entry_kind, entry_source, entry_start in entries:
-        if _source_required(entry_name, entry_kind, entry_source, entry_start is not None, ranged):
+        if _source_required(entry_name, entry_kind, entry_source, entry_start is not None):
             raise SkeletonError([f"required source is missing for {entry_kind} {entry_name}"])
     statement = _report_string(item.get("statement"), f"statement for {name}")
     declaration = DeclarationSkeleton(
@@ -1867,24 +1866,25 @@ def _probe_record_issue(record: dict[str, object]) -> str | None:
     assert isinstance(trusted, list)
     entries = [(root, root, record)]
     entries += [(str(item["name"]), f"{root} trusted declaration {item['name']}", item) for item in trusted]
-    ranged = {name for name, _, item in entries if item.get("range") is not None}
     for name, context, item in entries:
-        if _source_required(name, str(item["kind"]), item.get("source"), item.get("range") is not None, ranged):
+        if _source_required(name, str(item["kind"]), item.get("source"), item.get("range") is not None):
             return f"the skeleton probe omitted required source for {context}"
     return None
 
 
-def _source_required(name: str, kind: str, source: object, has_range: bool, ranged: set[str]) -> bool:
+def _source_required(name: str, kind: str, source: object, has_range: bool) -> bool:
     """Whether a declaration lacks the source text a reviewer must be shown.
 
     Lean generates companions such as `f._unary`, `f._f`, `root._auto_1` and
     `S.x._default` without a source range. Their elaborated material is still
     bound by the hash, and the declaration they come from carries the source.
+    Any other name must carry its own: a metaprogram can add `base.secret`
+    without a range, and `base`'s source does not describe it.
     """
 
     if kind in {"theorem", "axiom"} or (isinstance(source, str) and source.strip()):
         return False
-    return has_range or not (_internal_detail(name) or _name_parent(name) in ranged)
+    return has_range or not _internal_detail(name)
 
 
 def _internal_detail(name: str) -> bool:
@@ -1896,15 +1896,7 @@ def _internal_detail(name: str) -> bool:
     )
 
 
-def _name_parent(name: str) -> str | None:
-    last, quoted = _lean_name_parts(name)[-1]
-    length = len(last) + (2 if quoted else 0)
-    return name[: -length - 1] if len(name) > length else None
-
-
-def _require_probe_comments(
-    record: dict[str, object], text_field: str, field: str, *, context: str
-) -> None:
+def _require_probe_comments(record: dict[str, object], text_field: str, field: str, *, context: str) -> None:
     """Comment ranges are ``null`` when Lean could not parse the text on its own."""
 
     value = record.get(field)

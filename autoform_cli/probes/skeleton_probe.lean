@@ -372,13 +372,16 @@ def declarationSource (c : Name) : CommandElabM (Option (String × Json)) := do
 /-- Lean generates companions such as `f._unary`, `f._f` and `S.x._default`
 without a source range. Their kernel material is bound separately; for reading,
 show the declaration they were generated from, unless that is a theorem or
-axiom, whose source would carry a proof. -/
+axiom, whose source would carry a proof. Only Lean internal-detail names, or
+names the environment folds onto another declaration, borrow a source: a
+metaprogram can add `base.secret` without a range, and it is not `base`. -/
 partial def companionSource (c : Name) : CommandElabM (Option (String × Json)) := do
   let env ← getEnv
   let parent := c.getPrefix
   if (← findDeclarationRanges? c).isSome || !env.contains parent then return none
+  if !c.isInternalDetail && canonical env c == c then return none
   if (← findDeclarationRanges? parent).isNone then
-    return ← if c.isInternalDetail then companionSource parent else pure none
+    return ← companionSource parent
   -- A field's companions (`S.x._default`, `S.p._autoParam`) read best in the
   -- structure that declares the field.
   let shown := canonical env parent

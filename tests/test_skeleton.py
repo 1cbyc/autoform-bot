@@ -668,18 +668,19 @@ def test_generated_companions_without_a_source_range_need_no_source() -> None:
     def rangeless(name: str) -> dict[str, object]:
         return dict(base, name=name, source_name=name, range=None, source=None, source_comments=None)
 
-    # Lean's internal-detail spellings, or any name under a declaration with a range.
-    companions = ["Skel.NonAmbiguous._unary", "Skel.Other.eq_1", "Skel.NonAmbiguous.generated"]
+    # Lean's internal-detail spellings only.
+    companions = ["Skel.NonAmbiguous._unary", "Skel.Other.eq_1"]
     record["trusted"] = [*trusted, *(rangeless(name) for name in companions)]
     (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
     assert _probe_record_issue(parsed) is None
 
-    record["trusted"] = [*trusted, rangeless("Skel.Unplaced.helper")]
-    (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
-    assert _probe_record_issue(parsed) == (
-        "the skeleton probe omitted required source for "
-        "Skel.observation_determined trusted declaration Skel.Unplaced.helper"
-    )
+    # An ordinary name needs its own source, even under a declaration with a range.
+    for name in ("Skel.Unplaced.helper", "Skel.NonAmbiguous.generated"):
+        record["trusted"] = [*trusted, rangeless(name)]
+        (parsed,) = parse_probe_output(PROBE_MARKER + json.dumps(record)).values()
+        assert _probe_record_issue(parsed) == (
+            f"the skeleton probe omitted required source for Skel.observation_determined trusted declaration {name}"
+        )
 
 
 def test_unrecoverable_statement_fails_only_its_node(tmp_path: Path) -> None:
@@ -2042,6 +2043,44 @@ def test_project_delaborator_cannot_disguise_the_statement(tmp_path: Path) -> No
     declaration = report.nodes[0].declarations[0]
     assert "True" in declaration.signature
     assert "Skel.PktDelab.hidden" in declaration.raw_signature
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_generated_declaration_does_not_borrow_its_parents_source(tmp_path: Path) -> None:
+    # `mk_secret` adds definitions without source ranges under the names of
+    # `base` and `thm`. Neither is a Lean internal detail, so neither may be
+    # shown as `base`'s source or pass with no source at all.
+    project = _built_module(
+        tmp_path,
+        "Rev",
+        "import Lean\n"
+        "open Lean Elab Command\n"
+        "def Skel.Rev.mkSecret (n : Name) (v : Nat) : CoreM Unit := do\n"
+        "  let val : DefinitionVal :=\n"
+        "    { name := n, levelParams := [], type := mkConst ``Nat,\n"
+        "      value := mkNatLit v, hints := .abbrev, safety := .safe }\n"
+        "  addDecl (.defnDecl val)\n"
+        'elab "mk_secret" : command => liftTermElabM do\n'
+        "  Skel.Rev.mkSecret `Skel.Rev.base.secret 7\n"
+        "  Skel.Rev.mkSecret `Skel.Rev.thm.secret 8\n"
+        "namespace Skel.Rev\n"
+        "def base : Nat := 1\n"
+        "mk_secret\n"
+        "theorem root : base.secret = 7 := rfl\n"
+        "theorem thm : thm.secret = 8 := rfl\n"
+        "end Skel.Rev\n",
+    )
+    blueprint = _blueprint(tmp_path, lean={"root": "Skel.Rev.root", "thm": "Skel.Rev.thm"})
+
+    report = extract_skeletons(blueprint, lean_root=project)
+
+    assert not report.clean
+    assert tuple(issue.message for issue in report.unresolved) == (
+        "basics/root: Skel.Rev.root: the skeleton probe omitted required source for "
+        "Skel.Rev.root trusted declaration Skel.Rev.base.secret",
+        "basics/thm: Skel.Rev.thm: the skeleton probe omitted required source for "
+        "Skel.Rev.thm trusted declaration Skel.Rev.thm.secret",
+    )
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
