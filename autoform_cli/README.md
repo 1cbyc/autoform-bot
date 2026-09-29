@@ -313,7 +313,9 @@ are folded; a name such as `f.eq_1` or `f._helper` is not. Names outside the
 project are the trusted base and are not
 expanded. Compiler-generated companions without a source range, such as
 `f._unary`, `f._f`, and `S.x._default`, are bound by their elaborated material
-and shown with the declaration they were generated from. A `partial def`
+and shown with the declaration they were generated from. Any other
+declaration without its own source, such as one a metaprogram adds under an
+existing name, is refused rather than shown as its parent. A `partial def`
 anywhere in the trusted closure is refused, as recorded by the Lean
 environment rather than by the source text: its kernel face is an opaque
 constant, so the body a reader would see is not what Lean checks. The command
