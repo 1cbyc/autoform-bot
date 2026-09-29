@@ -356,8 +356,9 @@ Reports and packet manifests also carry an evidence hash over the exact packet
 shown to a reviewer. It identifies those bytes but does not authenticate who
 reviewed them. An article review hash additionally binds the joint packet to the
 cited passage, its locator, and the drift hash, so a review recorded against it
-does not survive a change of meaning that leaves the packet text unchanged. All three are advisory provenance checksums when
-candidate code controls the checkout.
+does not survive a change of meaning that leaves the packet text unchanged. All
+three are advisory provenance checksums when candidate code controls the
+checkout.
 
 `--packets DIR` writes one comment-stripped packet per skeleton, with a
 manifest mapping packets to articles and hashes. The destination must be empty
@@ -390,10 +391,10 @@ bodies, structures, and generated companions.
 
 Each theorem's packet also carries the statement *as written*, cut before its
 value by Lean's parser with its enclosing namespaces and the file's opened
-namespaces in scope so that scoped notation parses, beside the elaborated signature: the printed form
-shows binders that `variable` and `include` inject and the type every cast
-lands in, the written form shows what the pretty-printer elides, and neither
-can hide what the other shows.
+namespaces in scope so that scoped notation parses, beside the elaborated
+signature: the printed form shows binders that `variable` and `include` inject
+and the type every cast lands in, the written form shows what the
+pretty-printer elides, and neither can hide what the other shows.
 
 A statement's source passage can travel with it. A `## Sources` link to a
 non-Markdown file inside the blueprint with a `#L<start>-L<end>` fragment, for

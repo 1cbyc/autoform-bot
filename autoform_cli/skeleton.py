@@ -719,9 +719,7 @@ def _declaration_from_dict(item: object) -> DeclarationSkeleton:
         start_line=start_line,
         end_line=_report_optional_int(item.get("end_line"), f"end line for {name}"),
         signature=_report_string(item.get("signature"), f"signature for {name}"),
-        raw_signature=_report_string(
-            item.get("raw_signature"), f"raw signature for {name}"
-        ),
+        raw_signature=_report_string(item.get("raw_signature"), f"raw signature for {name}"),
         semantic=semantic,
         lean_version=_report_string(item.get("lean_version"), f"Lean version for {name}"),
         depends=_report_string_tuple(item.get("depends"), f"dependencies for {name}"),
@@ -841,21 +839,13 @@ def _without_comments(text: str, comments: tuple[tuple[int, int], ...]) -> str:
     for start, end in comments:
         kept.append(data[cursor:start])
         removed = data[start:end].decode("utf-8")
-        kept.append(
-            "".join(character if character in "\r\n\t" else " " for character in removed).encode(
-                "utf-8"
-            )
-        )
+        kept.append("".join(character if character in "\r\n\t" else " " for character in removed).encode("utf-8"))
         cursor = end
     kept.append(data[cursor:])
-    return "\n".join(
-        line.rstrip() for line in b"".join(kept).decode("utf-8").splitlines() if line.strip()
-    )
+    return "\n".join(line.rstrip() for line in b"".join(kept).decode("utf-8").splitlines() if line.strip())
 
 
-def _comment_ranges(
-    value: object, text: str | None, *, context: str
-) -> tuple[tuple[int, int], ...]:
+def _comment_ranges(value: object, text: str | None, *, context: str) -> tuple[tuple[int, int], ...]:
     """Validate comment ranges: sorted, disjoint UTF-8 byte spans that open a comment."""
 
     if text is None:
@@ -1765,9 +1755,7 @@ def _validate_probe_record(record: dict[str, object], *, root: str) -> None:
     _require_semantic(record, context=root, kind=str(record["kind"]))
     _require_nonempty_string(record.get("module"), field="module", context=root)
     _require_nonempty_string(record.get("signature"), field="signature", context=root)
-    _require_nonempty_string(
-        record.get("raw_signature"), field="raw_signature", context=root
-    )
+    _require_nonempty_string(record.get("raw_signature"), field="raw_signature", context=root)
     _require_range(record.get("range"), context=root)
     _require_probe_source(record.get("source"), kind=str(record["kind"]), context=root)
     _require_probe_comments(record, "source", "source_comments", context=root)
@@ -2059,9 +2047,7 @@ def _check_local_safety(source_name: str, semantic: str) -> None:
     payload = json.loads(semantic)
     materials = [payload["root"], *(entry["material"] for entry in payload["generated"])]
     if any(isinstance(material, dict) and material.get("safety") == "partial" for material in materials):
-        raise SkeletonError(
-            [f"partial declaration {source_name} cannot be included in a trusted skeleton"]
-        )
+        raise SkeletonError([f"partial declaration {source_name} cannot be included in a trusted skeleton"])
 
 
 def _require_semantic_pairs(
@@ -2399,9 +2385,7 @@ def _statement(value: object) -> str | None:
     return _TRAILING_VALUE.sub("", value).rstrip()
 
 
-def source_passage(
-    node: Node, blueprint: Path, *, issues: list[str] | None = None
-) -> tuple[str | None, str | None]:
+def source_passage(node: Node, blueprint: Path, *, issues: list[str] | None = None) -> tuple[str | None, str | None]:
     """Return the passage an article cites through a line locator, and the locator.
 
     A ``## Sources`` link to a non-Markdown file inside the blueprint with a

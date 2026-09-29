@@ -35,10 +35,10 @@ source excerpt paired with an older compiled declaration. Record the skeleton
 hash as a drift checksum for the elaborated declaration and trust context, and
 the evidence hash for the exact packet that was read. For a
 source-faithfulness verdict, record the article review hash that binds the joint
-packet to the cited passage, its locator, and the skeleton hash. These hashes are provenance evidence,
-not reviewer authentication or an approval key. Candidate code runs during
-extraction and can forge process output, so treat its report as advisory when
-the checkout is not trusted.
+packet to the cited passage, its locator, and the skeleton hash. These hashes
+are provenance evidence, not reviewer authentication or an approval key.
+Candidate code runs during extraction and can forge process output, so treat
+its report as advisory when the checkout is not trusted.
 
 Report findings first, ordered by severity and tied to files or nodes. Then give
 the rubric scores, weighted verdict, commands run, unresolved questions, and a
