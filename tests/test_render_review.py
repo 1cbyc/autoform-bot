@@ -18,6 +18,8 @@ from autoform_cli.skeleton import DeclarationSkeleton
 
 
 def _declaration() -> DeclarationSkeleton:
+    statement = "/-- reviewer hint that is absent from the packet -/\ntheorem result : True"
+    comment_end = len(statement[: statement.index("-/") + 2].encode("utf-8"))
     return DeclarationSkeleton(
         name="Review.result",
         kind="theorem",
@@ -26,7 +28,8 @@ def _declaration() -> DeclarationSkeleton:
         start_line=1,
         end_line=2,
         signature="Review.result : True",
-        semantic='{"const":"True"}',
+        raw_signature="Review.result : True",
+        semantic='{"generated":[],"root":{"safety":"safe","type":{"sort":{"zero":null}}}}',
         lean_version="4.32.2",
         depends=(),
         trusted=(),
@@ -35,7 +38,8 @@ def _declaration() -> DeclarationSkeleton:
         boundary_modules=(),
         axioms=(),
         axiom_semantics=(),
-        statement="/-- reviewer hint that is absent from the packet -/\ntheorem result : True",
+        statement=statement,
+        statement_comments=((0, comment_end),),
     )
 
 

@@ -107,7 +107,8 @@ jobs:
           set -euo pipefail
           marker="blueprint/.autoform-review"
           has_review_artifacts=false
-          if [[ -d blueprint/readbacks ]] || git grep -q '^[[:space:]]*review_approved:' -- blueprint; then
+          if [[ -d blueprint/readbacks ]] || \
+            git grep -q '^[[:space:]]*review_approved[[:space:]]*:' -- blueprint/roadmap; then
             has_review_artifacts=true
           fi
           if [[ -e "$marker" || -L "$marker" ]]; then
@@ -125,7 +126,8 @@ jobs:
 
       # Without --bundle the check derives the bundle from its own extraction,
       # so no committed stale report can certify a changed blueprint or Lean
-      # tree, and the tree is extracted once rather than once per command.
+      # tree, and the tree is extracted once rather than once to prepare and
+      # again to check.
       - name: Verify statement reviews
         if: env.AUTOFORM_REVIEW_ENABLED == 'true'
         run: >-

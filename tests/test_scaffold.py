@@ -328,6 +328,7 @@ def test_generated_ci_rebuilds_opted_in_statement_review_evidence(tmp_path: Path
         assert 'marker="blueprint/.autoform-review"' in workflow
         assert "ad00ec55a215821b56f924782e25d7a77fff6696ee23cc465af20476b545b620" in workflow
         assert "review cards or approvals exist without $marker" in workflow
+        assert "review_approved[[:space:]]*:' -- blueprint/roadmap" in workflow
         assert "AUTOFORM_REVIEW_ENABLED=true" in workflow
         # One extraction per command: the check derives its own bundle.
         assert "autoform review check blueprint --lean-root .\n" in workflow
@@ -335,7 +336,7 @@ def test_generated_ci_rebuilds_opted_in_statement_review_evidence(tmp_path: Path
     assert "review_args=(--review)" in pages and "--review-bundle" not in pages
     assert "Build Lean for statement review" in pages
     assert "--with markdown==3.10.3" in pages
-    assert "--with pymdown-extensions==10.21.3" in pages
+    assert "--with pymdown-extensions==11.0.1" in pages
     assert (tmp_path / "blueprint/.autoform-review").read_text(encoding="utf-8") == (
         "autoform-review-policy/v1\n"
     )

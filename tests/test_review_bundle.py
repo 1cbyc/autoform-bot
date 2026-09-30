@@ -20,14 +20,23 @@ from autoform_cli.review import (
     write_review_bundle,
     write_review_packets,
 )
-from autoform_cli.skeleton import DeclarationSkeleton, NodeSkeleton, SkeletonReport
+from autoform_cli.skeleton import (
+    DeclarationSkeleton,
+    NodeSkeleton,
+    SkeletonError,
+    SkeletonReport,
+    UnresolvedTarget,
+    write_packets,
+)
 
 
-_SEMANTIC = '{"type":{"sort":{"zero":null}}}'
+_SEMANTIC = '{"generated":[],"root":{"safety":"safe","type":{"sort":{"zero":null}}}}'
 _ARTICLE_ID = "af_0123456789abcdef01234567"
+_BLUEPRINT_HASH = "sha256:" + "0" * 64
 
 
 def _declaration(name: str = "Skel.sup_unique", signature: str | None = None) -> DeclarationSkeleton:
+    rendered_signature = signature or f"{name} (a b : Nat) (h : a = b) : b = a"
     return DeclarationSkeleton(
         name=name,
         kind="theorem",
@@ -35,7 +44,8 @@ def _declaration(name: str = "Skel.sup_unique", signature: str | None = None) ->
         path="Skel/Main.lean",
         start_line=3,
         end_line=4,
-        signature=signature or f"{name} (a b : Nat) (h : a = b) : b = a",
+        signature=rendered_signature,
+        raw_signature=rendered_signature,
         semantic=_SEMANTIC,
         lean_version="4.32.2",
         depends=(),
@@ -53,14 +63,19 @@ def _report(
     *,
     node_id: str = "basics/result",
     article_path: str = "roadmap/basics/result.md",
-    unresolved: tuple[str, ...] = (),
+    unresolved: tuple[UnresolvedTarget, ...] = (),
 ) -> SkeletonReport:
+    declaration = declaration or _declaration()
     return SkeletonReport(
+        blueprint_hash=_BLUEPRINT_HASH,
+        targets=((node_id, (declaration.name,)),),
+        selection="all",
+        selected_nodes=(node_id,),
         nodes=(
             NodeSkeleton(
                 node_id=node_id,
                 article_path=article_path,
-                declarations=(declaration or _declaration(),),
+                declarations=(declaration,),
                 passage="Source theorem.",
                 passage_locator="roadmap/basics/sources/book.txt#L2-L2",
             ),
@@ -197,9 +212,12 @@ def test_fenced_fake_source_section_cannot_replace_review_evidence(tmp_path: Pat
 @pytest.mark.parametrize(
     "report",
     [
-        SkeletonReport(nodes=(), unresolved=()),
-        _report(unresolved=("basics/result: probe failed",)),
-        SkeletonReport(
+        replace(_report(), nodes=()),
+        _report(
+            unresolved=(UnresolvedTarget("basics/result", "Skel.sup_unique", "probe failed"),)
+        ),
+        replace(
+            _report(),
             nodes=(
                 NodeSkeleton(
                     node_id="basics/other",
@@ -207,7 +225,6 @@ def test_fenced_fake_source_section_cannot_replace_review_evidence(tmp_path: Pat
                     declarations=(_declaration(),),
                 ),
             ),
-            unresolved=(),
         ),
     ],
 )
@@ -225,6 +242,20 @@ def test_bundle_requires_a_durable_article_id(tmp_path: Path) -> None:
 
     with pytest.raises(ReviewError, match=r"autoform migrate"):
         build_review_bundle(graph, _report())
+
+
+def test_bundle_requires_a_rendered_declaration_sized_article(tmp_path: Path) -> None:
+    blueprint = _blueprint(tmp_path)
+    article = blueprint / "roadmap" / "basics" / "result.md"
+    article.write_text(
+        article.read_text(encoding="utf-8").replace("declaration: theorem\n", ""),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReviewError) as error:
+        build_review_bundle(load_graph(blueprint), _report())
+
+    assert "review-article-shape" in {finding.code for finding in error.value.findings}
 
 
 def test_bundle_requires_exact_source_passage_for_cited_lean_article(tmp_path: Path) -> None:
@@ -404,6 +435,20 @@ def test_packet_writer_revalidates_hand_constructed_bundle(tmp_path: Path) -> No
     assert not (tmp_path / "outside.lean").exists()
 
 
+def test_packet_writers_do_not_overwrite_each_others_output(tmp_path: Path) -> None:
+    bundle = build_review_bundle(load_graph(_blueprint(tmp_path)), _report())
+    review_packets = tmp_path / "review-packets"
+    write_review_packets(bundle, review_packets)
+
+    with pytest.raises(SkeletonError, match="refusing to overwrite"):
+        write_packets(_report(), review_packets)
+
+    skeleton_packets = tmp_path / "skeleton-packets"
+    write_packets(_report(), skeleton_packets)
+    with pytest.raises(ReviewError, match="refusing to overwrite"):
+        write_review_packets(bundle, skeleton_packets)
+
+
 def test_audit_refuses_to_trust_approval_without_bundle_and_fresh_skeleton(tmp_path: Path) -> None:
     blueprint = _blueprint(tmp_path, approved="sha256:" + "a" * 64)
     bundle = build_review_bundle(load_graph(blueprint), _report())
@@ -475,20 +520,30 @@ def test_scoped_validation_ignores_unrelated_drift_but_rejects_target_drift(
     )
     target = _report().nodes[0]
     other_declaration = _declaration("Skel.other")
+    other = NodeSkeleton(
+        node_id="basics/other",
+        article_path="roadmap/basics/other.md",
+        declarations=(other_declaration,),
+    )
     full_report = SkeletonReport(
-        nodes=(
-            target,
-            NodeSkeleton(
-                node_id="basics/other",
-                article_path="roadmap/basics/other.md",
-                declarations=(other_declaration,),
-            ),
+        blueprint_hash=_BLUEPRINT_HASH,
+        targets=(
+            (other.node_id, (other_declaration.name,)),
+            (target.node_id, (target.declarations[0].name,)),
         ),
+        selection="all",
+        selected_nodes=(other.node_id, target.node_id),
+        nodes=(other, target),
         unresolved=(),
     )
     graph = load_graph(blueprint)
     bundle = build_review_bundle(graph, full_report)
-    scoped = SkeletonReport(nodes=(target,), unresolved=())
+    scoped = replace(
+        full_report,
+        selection="filtered",
+        selected_nodes=(target.node_id,),
+        nodes=(target,),
+    )
 
     other_path.write_text(
         other_path.read_text(encoding="utf-8").replace("An unrelated claim.", "Changed elsewhere."),

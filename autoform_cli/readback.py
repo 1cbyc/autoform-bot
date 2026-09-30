@@ -447,20 +447,10 @@ def prepare_readback(
 
     blueprint_path = Path(blueprint).expanduser().resolve()
     path = readback_path(blueprint_path, article_id, declaration.name)
-    if not model.strip():
-        raise ValueError("a read-back requires a nonempty model label")
-    if not _safe_model_label(model):
-        raise ValueError("a read-back model label must be printable, single-line text")
-    if not text.strip():
-        raise ValueError("a read-back requires nonempty testimony")
-    testimony_errors = _testimony_errors(text)
-    if testimony_errors:
-        raise ValueError("unsafe read-back testimony: " + "; ".join(testimony_errors))
+    _validate_readback_fields(model, text, expected_card_hash)
     expected_packet = declaration.blind_text()
     if packet_text != expected_packet or evidence_hash_of(packet_text) != declaration.evidence_hash:
         raise ValueError(f"read-back packet does not match the current packet for {declaration.name}")
-    if expected_card_hash is not None and _hash_or_none(expected_card_hash) is None:
-        raise ValueError(f"invalid expected card hash: {expected_card_hash!r}")
 
     content = _card_content(
         article_id=article_id,
@@ -479,6 +469,24 @@ def prepare_readback(
         content=content,
         expected_card_hash=expected_card_hash,
     )
+
+
+def _validate_readback_fields(
+    model: str,
+    text: str,
+    expected_card_hash: str | None,
+) -> None:
+    if not model.strip():
+        raise ValueError("a read-back requires a nonempty model label")
+    if not _safe_model_label(model):
+        raise ValueError("a read-back model label must be printable, single-line text")
+    if not text.strip():
+        raise ValueError("a read-back requires nonempty testimony")
+    testimony_errors = _testimony_errors(text)
+    if testimony_errors:
+        raise ValueError("unsafe read-back testimony: " + "; ".join(testimony_errors))
+    if expected_card_hash is not None and _hash_or_none(expected_card_hash) is None:
+        raise ValueError(f"invalid expected card hash: {expected_card_hash!r}")
 
 
 def planned_readback(
@@ -502,6 +510,11 @@ def planned_readback(
     """
 
     blueprint_path = Path(blueprint).expanduser().resolve()
+    _validate_readback_fields(model, text, expected_card_hash)
+    if _hash_or_none(skeleton_hash) is None:
+        raise ValueError(f"invalid skeleton hash: {skeleton_hash!r}")
+    if _hash_or_none(packet_hash) is None or evidence_hash_of(packet_text) != packet_hash:
+        raise ValueError("read-back packet does not match its prepared packet hash")
     return PreparedReadback(
         blueprint=blueprint_path,
         article_id=article_id,

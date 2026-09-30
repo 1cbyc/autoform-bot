@@ -9,7 +9,7 @@ import os
 import socket
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -44,7 +44,6 @@ from .skeleton import (
     SkeletonReport,
     extract_skeletons,
     format_report,
-    load_skeleton_report,
     run_probe,
     write_packets,
     write_skeleton_report,
@@ -89,6 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help="prepared review evidence; re-extracted and checked against the current Lean project",
     )
+    _add_probe_timeout_argument(audit)
 
     doctor = subparsers.add_parser("doctor", help="diagnose the local Markdown runtime contract")
     doctor.add_argument("project_or_blueprint")
@@ -161,13 +161,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="DIR",
         help="with --packets: also write each article's cited source passage, for a faithfulness judge",
     )
-    skeleton.add_argument(
-        "--timeout",
-        type=_positive_seconds,
-        metavar="SECONDS",
-        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g}); "
-        "the Lake freshness check before it has its own budget",
-    )
+    _add_probe_timeout_argument(skeleton)
 
     review = subparsers.add_parser("review", help="prepare and verify statement-review evidence")
     review_subparsers = review.add_subparsers(dest="review_command", required=True)
@@ -179,6 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     review_prepare.add_argument("--lean-root", type=Path, required=True)
     review_prepare.add_argument("-o", "--output", type=Path, required=True)
     review_prepare.add_argument("--packets", type=Path, metavar="DIR")
+    _add_probe_timeout_argument(review_prepare)
 
     review_record = review_subparsers.add_parser(
         "record",
@@ -201,6 +196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--expected-card-hash",
         help="replace an existing different card only if its current content has this hash",
     )
+    _add_probe_timeout_argument(review_record)
 
     review_check = review_subparsers.add_parser(
         "check",
@@ -214,6 +210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="the bundle `review prepare` wrote; without it, one is derived from this run's own extraction",
     )
     review_check.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    _add_probe_timeout_argument(review_check)
 
     render = subparsers.add_parser("render", help="build the publishable blueprint")
     render.add_argument("blueprint_dir")
@@ -237,6 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="add review disclosures from evidence derived in this run, without a prepared bundle",
     )
+    _add_probe_timeout_argument(render)
 
     args = parser.parse_args(argv)
 
@@ -269,6 +267,16 @@ def _add_claim_board_arguments(parser: argparse.ArgumentParser) -> None:
         help="stable identity for this agent (or set AUTOFORM_WORKER_ID)",
     )
     parser.add_argument("--scratch", type=Path, help="local bare Git object cache")
+
+
+def _add_probe_timeout_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--timeout",
+        type=_positive_seconds,
+        metavar="SECONDS",
+        help=f"seconds the Lean probe may run (default {DEFAULT_PROBE_TIMEOUT:g}); "
+        "the Lake freshness check before it has its own budget",
+    )
 
 
 def _init(args: argparse.Namespace) -> int:
@@ -359,6 +367,7 @@ def _audit(args: argparse.Namespace) -> int:
                 args.blueprint_dir,
                 lean_root=args.lean_root,
                 bundle_path=args.review_bundle,
+                timeout=args.timeout,
             )
         except (GraphValidationError, ReviewError, SkeletonError) as exc:
             for issue in exc.issues:
@@ -461,6 +470,12 @@ def _positive_seconds(value: str) -> float:
     return seconds
 
 
+def _probe_runner(timeout: float | None) -> Callable[[str, Path], str] | None:
+    if timeout is None:
+        return None
+    return lambda probe, root: run_probe(probe, root, timeout=timeout)
+
+
 def _skeleton(args: argparse.Namespace) -> int:
     if args.passages is not None and args.packets is None:
         print("error: --passages requires --packets", file=sys.stderr)
@@ -480,9 +495,7 @@ def _skeleton(args: argparse.Namespace) -> int:
         report = extract_skeletons(
             args.blueprint_dir,
             lean_root=args.lean_root,
-            runner=None
-            if args.timeout is None
-            else lambda probe, root: run_probe(probe, root, timeout=args.timeout),
+            runner=_probe_runner(args.timeout),
             node_ids=tuple(args.nodes) if args.nodes else None,
         )
     except SkeletonError as exc:
@@ -554,7 +567,11 @@ def _review_prepare(args: argparse.Namespace) -> int:
             return 2
     try:
         graph = load_graph(args.blueprint_dir)
-        skeleton = extract_skeletons(args.blueprint_dir, lean_root=args.lean_root)
+        skeleton = extract_skeletons(
+            args.blueprint_dir,
+            lean_root=args.lean_root,
+            runner=_probe_runner(args.timeout),
+        )
         bundle = build_review_bundle(graph, skeleton)
         if args.packets is not None:
             written = write_review_packets(bundle, args.packets)
@@ -618,6 +635,7 @@ def _review_record(args: argparse.Namespace) -> int:
         skeleton = extract_skeletons(
             args.blueprint_dir,
             lean_root=args.lean_root,
+            runner=_probe_runner(args.timeout),
             node_ids=tuple(sorted({node_id for _, node_id, _, _ in before})),
         )
         # The extraction must describe the blueprint the cards are filed
@@ -667,19 +685,15 @@ def _article_report(report: SkeletonReport, node_id: str) -> SkeletonReport:
 
     ``validate_review_article`` insists on a report scoped to exactly its own
     article, so that missing evidence cannot pass. A batch extracts several
-    articles at once and hands each its own node. An unresolved issue that
-    cannot be attributed to a node stays with every article, and fails them all.
+    articles at once and hands each its own node and unresolved targets.
     """
 
-    prefixes = tuple(f"{node.node_id}: " for node in report.nodes)
     return replace(
         report,
+        selection="filtered",
+        selected_nodes=(node_id,),
         nodes=tuple(node for node in report.nodes if node.node_id == node_id),
-        unresolved=tuple(
-            issue
-            for issue in report.unresolved
-            if issue.startswith(f"{node_id}: ") or not issue.startswith(prefixes)
-        ),
+        unresolved=tuple(issue for issue in report.unresolved if issue.node_id == node_id),
     )
 
 
@@ -752,20 +766,34 @@ def _planned_records(
 ) -> list[PreparedReadback]:
     """The cards the batch would file if the prepared evidence is current."""
 
-    return [
-        planned_readback(
-            blueprint,
-            article_id=item.request.article_id,
-            declaration=item.request.declaration,
-            skeleton_hash=item.prepared.skeleton_hash,
-            packet_hash=item.prepared.packet_hash,
-            model=model,
-            text=item.testimony,
-            packet_text=item.packet,
-            expected_card_hash=item.request.expected_card_hash,
-        )
-        for item in inputs
-    ]
+    findings: list[ReviewFinding] = []
+    cards: list[PreparedReadback] = []
+    for item in inputs:
+        try:
+            cards.append(
+                planned_readback(
+                    blueprint,
+                    article_id=item.request.article_id,
+                    declaration=item.request.declaration,
+                    skeleton_hash=item.prepared.skeleton_hash,
+                    packet_hash=item.prepared.packet_hash,
+                    model=model,
+                    text=item.testimony,
+                    packet_text=item.packet,
+                    expected_card_hash=item.request.expected_card_hash,
+                )
+            )
+        except ValueError as exc:
+            findings.append(
+                ReviewFinding(
+                    item.request.article_id,
+                    "review-record-invalid",
+                    f"{item.request.declaration}: {exc}",
+                )
+            )
+    if findings:
+        raise ReviewError(findings)
+    return cards
 
 
 def _refuse_conflicts(cards: list[PreparedReadback]) -> None:
@@ -849,6 +877,7 @@ def _review_check(args: argparse.Namespace) -> int:
             args.blueprint_dir,
             lean_root=args.lean_root,
             bundle_path=args.bundle,
+            timeout=args.timeout,
         )
         findings = review_findings(graph, bundle, skeleton)
     except (GraphValidationError, ReviewError, SkeletonError) as exc:
@@ -883,6 +912,7 @@ def _current_review(
     *,
     lean_root: Path,
     bundle_path: Path | None,
+    timeout: float | None = None,
 ):
     """The graph, one extraction, and a review bundle validated against both.
 
@@ -894,7 +924,11 @@ def _current_review(
     """
 
     graph = load_graph(blueprint_dir)
-    skeleton = extract_skeletons(blueprint_dir, lean_root=lean_root)
+    skeleton = extract_skeletons(
+        blueprint_dir,
+        lean_root=lean_root,
+        runner=_probe_runner(timeout),
+    )
     bundle = build_review_bundle(graph, skeleton) if bundle_path is None else load_review_bundle(bundle_path)
     findings = validate_review_bundle(graph, bundle, skeleton)
     if findings:
@@ -952,6 +986,7 @@ def _render(args: argparse.Namespace) -> int:
                 args.blueprint_dir,
                 lean_root=args.lean_root,
                 bundle_path=args.review_bundle,
+                timeout=args.timeout,
             )
         report = render_site(
             args.blueprint_dir,

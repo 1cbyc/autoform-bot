@@ -108,7 +108,12 @@ def test_build_output_is_skipped(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "schema", ["autoform-skeleton-packets/v1", "autoform-skeleton-packets/v2"]
+    "schema",
+    [
+        "autoform-skeleton-packets/v1",
+        "autoform-skeleton-packets/v2",
+        "autoform-review-packets/v1",
+    ],
 )
 def test_managed_packet_output_is_not_indexed_as_project_source(
     tmp_path: Path, schema: str

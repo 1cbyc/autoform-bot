@@ -3050,7 +3050,7 @@ def _output_identity(path: Path) -> tuple[int, int, str] | None:
     return metadata.st_dev, metadata.st_ino, digest.hexdigest()
 
 
-def validate_managed_output(
+def _validate_managed_output(
     path: Path,
     *,
     kind: str,
@@ -3090,9 +3090,18 @@ def validate_managed_output(
     return identity
 
 
-def article_output_path(node_id: str) -> Path:
-    """Return the safe relative output path for a blueprint article id."""
+def validate_managed_output(
+    path: Path,
+    *,
+    kind: str,
+    schema: str | None = None,
+) -> tuple[int, int, str] | None:
+    """Validate an output tree against its exact producer schema."""
 
+    return _validate_managed_output(path, kind=kind, schema=schema)
+
+
+def _safe_node_path(node_id: str) -> Path:
     path = Path(*node_id.split("/"))
     if (
         not node_id
@@ -3100,7 +3109,7 @@ def article_output_path(node_id: str) -> Path:
         or path.as_posix() != node_id
         or any(part in {"", ".", ".."} for part in path.parts)
     ):
-        raise SkeletonError([f"unsafe article id in managed output: {node_id!r}"])
+        raise SkeletonError([f"unsafe article id in packet output: {node_id!r}"])
     return path
 
 
@@ -3124,7 +3133,11 @@ def declaration_filename(name: str, *, suffix: str = ".lean") -> str:
     return f"{encoded}--{digest}{suffix}"
 
 
-def stage_managed_output(destination: Path) -> Path:
+def _packet_filename(name: str) -> str:
+    return declaration_filename(name)
+
+
+def _stage_output(destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     existing_mode: int | None = None
     try:
@@ -3148,6 +3161,12 @@ def stage_managed_output(destination: Path) -> Path:
             raise
         return stage
     raise SkeletonError([f"cannot allocate staging directory beside {destination}"])
+
+
+def stage_managed_output(destination: Path) -> Path:
+    """Create a transaction stage beside a managed output directory."""
+
+    return _stage_output(destination)
 
 
 def _stage_report_output(
@@ -3303,7 +3322,7 @@ def _preflight_output_installs(
             ) from cleanup_exc
 
 
-def replace_managed_outputs(
+def _replace_outputs(
     outputs: list[tuple[Path, Path, tuple[int, int, str] | None]],
 ) -> None:
     """Commit staged outputs with rollback, but not cross-path linearizability.
@@ -3428,6 +3447,14 @@ def replace_managed_outputs(
             )
 
 
+def replace_managed_outputs(
+    outputs: list[tuple[Path, Path, tuple[int, int, str] | None]],
+) -> None:
+    """Publish staged managed outputs with the skeleton transaction protocol."""
+
+    _replace_outputs(outputs)
+
+
 def _paths_overlap(first: Path, second: Path) -> bool:
     first_resolved = first.resolve()
     second_resolved = second.resolve()
@@ -3448,7 +3475,7 @@ def write_skeleton_report(report: SkeletonReport, destination: str | Path) -> Pa
     stage: Path | None = None
     try:
         stage, identity = _stage_report_output(report, output)
-        replace_managed_outputs([(output, stage, identity)])
+        _replace_outputs([(output, stage, identity)])
         stage = None
     except OSError as exc:
         raise SkeletonError([f"could not prepare skeleton report output: {exc}"]) from exc
@@ -3512,9 +3539,9 @@ def write_packets(
         or (passages_root is not None and _paths_overlap(passages_root, report_destination))
     ):
         raise SkeletonError(["report output must be disjoint from packet and passage directories"])
-    root_identity = validate_managed_output(root, kind="packets")
+    root_identity = _validate_managed_output(root, kind="packets")
     passages_identity = (
-        validate_managed_output(passages_root, kind="passages")
+        _validate_managed_output(passages_root, kind="passages")
         if passages_root is not None
         else None
     )
@@ -3526,12 +3553,12 @@ def write_packets(
     manifest: list[dict[str, str]] = []
     passage_manifest: list[dict[str, str]] = []
     try:
-        packet_stage = stage_managed_output(root)
-        passages_stage = stage_managed_output(passages_root) if passages_root is not None else None
+        packet_stage = _stage_output(root)
+        passages_stage = _stage_output(passages_root) if passages_root is not None else None
         if report_destination is not None:
             report_stage, report_identity = _stage_report_output(report, report_destination)
         for node in report.nodes:
-            node_path = article_output_path(node.node_id)
+            node_path = _safe_node_path(node.node_id)
             passage_path: str | None = None
             if passages_stage is not None and node.passage is not None:
                 passage_relative = node_path / "passage.txt"
@@ -3555,7 +3582,7 @@ def write_packets(
                 article.write_text(node.blind_text(), encoding="utf-8")
                 written.append(root / article_relative)
             for declaration in node.declarations:
-                relative = node_path / declaration_filename(declaration.name)
+                relative = node_path / _packet_filename(declaration.name)
                 path = packet_stage / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(declaration.blind_text(), encoding="utf-8")
@@ -3602,7 +3629,7 @@ def write_packets(
             outputs.append((passages_root, passages_stage, passages_identity))
         if report_destination is not None and report_stage is not None:
             outputs.append((report_destination, report_stage, report_identity))
-        replace_managed_outputs(outputs)
+        _replace_outputs(outputs)
         packet_stage = None
         passages_stage = None
         report_stage = None
@@ -3654,7 +3681,6 @@ __all__ = [
     "SkeletonError",
     "SkeletonReport",
     "TrustedDeclaration",
-    "article_output_path",
     "declaration_filename",
     "evidence_hash_of",
     "extract_graph_skeletons",

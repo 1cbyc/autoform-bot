@@ -374,6 +374,8 @@ approval does not record either hash alone. It records one `review_approved`
 hash over the complete review surface: the article's title and statement, cited source
 passage and locator, exact joint packet, and every validated read-back card.
 Changing any reviewed input invalidates the approval.
+These hashes detect drift but do not authenticate a reviewer or the evidence
+when candidate code controls the checkout.
 
 A read-back is an independent agent's mathematical-English account of one
 declaration packet. The coordinator gives that agent only an opaque packet and
@@ -486,12 +488,13 @@ autoform render blueprint --lean-root . --review
 `review prepare` extracts Lean evidence from the current built tree and writes
 a strict, versioned bundle plus opaque packets. The bundle contains the exact
 article titles and statements, cited passages, declaration mapping, and packet bytes, but
-not the later testimony. A Lean-mapped article marked `origin: cited` must link
+not the later testimony. Every Lean-mapped review article must be a
+declaration-sized leaf so its evidence appears in the rendered site. An article
+marked `origin: cited` must link
 to an in-vault, non-Markdown source snapshot with an exact
 `#L<start>-L<end>` range; preparation refuses a citation it cannot put before
 the reviewer. `review record` rechecks the selected current article
-and the exact packet bytes before filing a card; an unrelated article changing
-does not block that record.
+and the exact packet bytes before filing a card.
 
 `--manifest` files a batch against one extraction, where one record per card
 would pay a Lake freshness check and a Lean start each. The manifest reuses
@@ -514,7 +517,7 @@ testimony is read and checked against the bundle before Lean starts. So is
 every card the batch would write over: a re-review lands on the path of the
 card it supersedes, which it may replace only by naming that card's hash, and
 the batch lists every card that needs one, with the hash, before extracting. The
-extraction is scoped to exactly the batch's articles, and each article is
+extraction selects the batch's articles, and each article is
 validated against its own part of it, as a single record would be. The
 blueprint is then reloaded: if any selected article changed while Lean ran,
 nothing is filed. Every card is built and checked before the first is written,
@@ -531,7 +534,9 @@ hashed, never a reconstructed or comment-bearing approximation. Read-back
 cards are absorbed into their article and are not published as standalone
 pages. Without `--bundle`, `review check` derives the bundle from its own
 extraction, and `render --review` does the same: each extracts the tree once
-instead of once to prepare and again to check.
+instead of once to prepare and again to check. Each review command that
+extracts Lean, plus review-enabled `audit` and `render`, accepts the same
+`--timeout SECONDS` probe override as `skeleton`.
 
 Newly scaffolded projects commit the versioned `.autoform-review` policy marker,
 so generated CI enforces this gate from the first formalized statement. Older

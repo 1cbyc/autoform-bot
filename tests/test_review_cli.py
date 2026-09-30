@@ -8,7 +8,9 @@ import pytest
 from autoform_cli.__main__ import main
 from autoform_cli.readback import load_readbacks
 from autoform_cli.review import REVIEW_PACKET_SCHEMA, load_review_bundle
-from autoform_cli.skeleton import DeclarationSkeleton, NodeSkeleton, SkeletonReport
+from autoform_cli.skeleton import DeclarationSkeleton, NodeSkeleton, SkeletonError, SkeletonReport
+
+_BLUEPRINT_HASH = "sha256:" + "0" * 64
 
 
 def _blueprint(root: Path) -> Path:
@@ -56,7 +58,8 @@ def _skeleton() -> SkeletonReport:
         start_line=1,
         end_line=1,
         signature="Review.result : True",
-        semantic='{"const":"True"}',
+        raw_signature="Review.result : True",
+        semantic='{"generated":[],"root":{"safety":"safe","type":{"sort":{"zero":null}}}}',
         lean_version="4.32.2",
         depends=(),
         trusted=(),
@@ -67,6 +70,10 @@ def _skeleton() -> SkeletonReport:
         axiom_semantics=(),
     )
     return SkeletonReport(
+        blueprint_hash=_BLUEPRINT_HASH,
+        targets=(("basics/result", (declaration.name,)),),
+        selection="all",
+        selected_nodes=("basics/result",),
         nodes=(
             NodeSkeleton(
                 node_id="basics/result",
@@ -86,11 +93,20 @@ def test_review_cli_prepares_records_and_checks_exact_evidence(
     blueprint = _blueprint(tmp_path)
     skeleton = _skeleton()
     extraction_scopes: list[object] = []
+    probe_timeouts: list[float] = []
+
+    def run_probe(probe: str, root: Path, *, timeout: float) -> str:
+        probe_timeouts.append(timeout)
+        return ""
 
     def extract(*args: object, **kwargs: object) -> SkeletonReport:
         extraction_scopes.append(kwargs.get("node_ids"))
+        runner = kwargs.get("runner")
+        assert callable(runner)
+        runner("", tmp_path)
         return skeleton
 
+    monkeypatch.setattr("autoform_cli.__main__.run_probe", run_probe)
     monkeypatch.setattr("autoform_cli.__main__.extract_skeletons", extract)
     bundle_path = tmp_path / "review.json"
     packets = tmp_path / "packets"
@@ -106,6 +122,8 @@ def test_review_cli_prepares_records_and_checks_exact_evidence(
             str(bundle_path),
             "--packets",
             str(packets),
+            "--timeout",
+            "1800",
         ]
     ) == 0
     capsys.readouterr()
@@ -138,6 +156,8 @@ def test_review_cli_prepares_records_and_checks_exact_evidence(
             str(testimony),
             "--model",
             "test-model",
+            "--timeout",
+            "1800",
         ]
     ) == 0
     capsys.readouterr()
@@ -156,6 +176,8 @@ def test_review_cli_prepares_records_and_checks_exact_evidence(
             str(tmp_path),
             "--bundle",
             str(bundle_path),
+            "--timeout",
+            "1800",
         ]
     ) == 1
     output = capsys.readouterr().out
@@ -179,9 +201,12 @@ def test_review_cli_prepares_records_and_checks_exact_evidence(
             str(tmp_path),
             "--bundle",
             str(bundle_path),
+            "--timeout",
+            "1800",
         ]
     ) == 0
     assert "OK: statement reviews match" in capsys.readouterr().out
+    assert probe_timeouts == [1800.0] * 4
 
 
 def test_check_and_render_derive_the_bundle_from_their_own_extraction(
@@ -253,6 +278,33 @@ def test_render_takes_one_source_of_review_evidence(tmp_path: Path, capsys: pyte
 
     assert main(["render", str(blueprint), "--review", "--output", str(tmp_path / "site")]) == 2
     assert "--review requires --lean-root" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_status"),
+    [
+        (
+            ["audit", "blueprint", "--lean-root", ".", "--review-bundle", "review.json"],
+            2,
+        ),
+        (["render", "blueprint", "--lean-root", ".", "--review"], 1),
+    ],
+)
+def test_review_consumers_forward_probe_timeout(
+    command: list[str],
+    expected_status: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeouts: list[float | None] = []
+
+    def current_review(*args: object, **kwargs: object) -> object:
+        timeouts.append(kwargs.get("timeout"))
+        raise SkeletonError(["stop after observing timeout"])
+
+    monkeypatch.setattr("autoform_cli.__main__._current_review", current_review)
+
+    assert main([*command, "--timeout", "1800"]) == expected_status
+    assert timeouts == [1800.0]
 
 
 def test_review_record_rejects_packet_bytes_that_differ_from_bundle(
@@ -374,7 +426,8 @@ def _node(node_id: str, name: str) -> NodeSkeleton:
                 start_line=1,
                 end_line=1,
                 signature=f"{name} : True",
-                semantic='{"const":"True"}',
+                raw_signature=f"{name} : True",
+                semantic='{"generated":[],"root":{"safety":"safe","type":{"sort":{"zero":null}}}}',
                 lean_version="4.32.2",
                 depends=(),
                 trusted=(),
@@ -402,7 +455,18 @@ class _Extraction:
             self.on_extract()
         nodes = (_node("basics/other", "Review.other"), _node("basics/result", "Review.result"))
         wanted = None if node_ids is None else set(node_ids)
-        return SkeletonReport(nodes=tuple(n for n in nodes if wanted is None or n.node_id in wanted), unresolved=())
+        selected = tuple(node for node in nodes if wanted is None or node.node_id in wanted)
+        return SkeletonReport(
+            blueprint_hash=_BLUEPRINT_HASH,
+            targets=tuple(
+                (node.node_id, tuple(declaration.name for declaration in node.declarations))
+                for node in nodes
+            ),
+            selection="all" if wanted is None else "filtered",
+            selected_nodes=tuple(node.node_id for node in selected),
+            nodes=selected,
+            unresolved=(),
+        )
 
 
 def _prepared_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extraction: _Extraction) -> tuple[Path, Path, Path]:
@@ -476,13 +540,15 @@ def test_a_batch_files_every_card_against_one_extraction(
 def test_one_bad_record_stops_the_batch_before_any_card_is_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    blueprint, bundle, manifest = _prepared_batch(tmp_path, monkeypatch, _Extraction())
+    extraction = _Extraction()
+    blueprint, bundle, manifest = _prepared_batch(tmp_path, monkeypatch, extraction)
     (manifest.parent / "Review.result.md").write_text("   \n", encoding="utf-8")
     capsys.readouterr()
 
     assert _record(blueprint, bundle, manifest, tmp_path) == 2
 
     assert load_readbacks(blueprint) == {}
+    assert extraction.scopes == [None]  # only `review prepare` extracted
     err = capsys.readouterr().err
     assert "Review.result: a read-back requires nonempty testimony" in err
 

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .graph import ARTICLE_ID_PATTERN, Graph, Node
-from .lean import declaration_names
+from .lean import REVIEW_PACKET_SCHEMA, declaration_names
 from .markdown import FENCE, FENCE_CLOSE, HEADING, frontmatter_end, strip_line_comments
 from .readback import Readback, load_readbacks
 from .skeleton import (
@@ -40,7 +40,6 @@ from .skeleton import (
 REVIEW_BUNDLE_SCHEMA = "autoform-review-bundle/v1"
 REVIEW_ARTICLE_SCHEMA = "autoform-review-article/v1"
 REVIEW_APPROVAL_SCHEMA = "autoform-review-approval/v1"
-REVIEW_PACKET_SCHEMA = "autoform-review-packets/v1"
 REVIEW_RECORDS_SCHEMA = "autoform-review-records/v1"
 _HASH_PREFIX = "sha256:"
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -397,7 +396,7 @@ def validate_review_article(
             ReviewFinding(
                 node.id,
                 "review-report-unresolved",
-                f"scoped skeleton extraction is incomplete: {issue}",
+                f"scoped skeleton extraction is incomplete: {issue.message}",
             )
             for issue in current_skeleton.unresolved
         )
@@ -699,12 +698,22 @@ def write_review_packets(bundle: ReviewBundle, directory: str | Path) -> list[Pa
 def _report_findings(graph: Graph, skeleton: SkeletonReport) -> list[ReviewFinding]:
     findings: list[ReviewFinding] = []
     for node in sorted(graph.nodes.values(), key=lambda item: item.id):
-        if node.lean is not None and node.article_id is None:
+        if node.lean is None:
+            continue
+        if node.article_id is None:
             findings.append(
                 ReviewFinding(
                     node.id,
                     "review-article-id-missing",
                     "Lean-mapped article has no durable article_id; run `autoform migrate` before preparing review evidence",
+                )
+            )
+        if not node.formalizable or graph.children(node.id):
+            findings.append(
+                ReviewFinding(
+                    node.id,
+                    "review-article-shape",
+                    "Lean-mapped review article must be a declaration-sized leaf rendered by the blueprint site",
                 )
             )
     if skeleton.schema != SKELETON_SCHEMA or skeleton.semantic_schema != SEMANTIC_SCHEMA:
@@ -725,9 +734,12 @@ def _report_findings(graph: Graph, skeleton: SkeletonReport) -> list[ReviewFindi
             )
         )
     for issue in skeleton.unresolved:
-        node_id = issue.partition(":")[0] if ":" in issue else ""
         findings.append(
-            ReviewFinding(node_id, "review-report-unresolved", f"skeleton extraction is incomplete: {issue}")
+            ReviewFinding(
+                issue.node_id,
+                "review-report-unresolved",
+                f"skeleton extraction is incomplete: {issue.message}",
+            )
         )
     expected = _declaration_mapping(graph)
     actual = {node.node_id: tuple(item.name for item in node.declarations) for node in skeleton.nodes}

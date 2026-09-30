@@ -53,7 +53,8 @@ jobs:
           set -euo pipefail
           marker="blueprint/.autoform-review"
           has_review_artifacts=false
-          if [[ -d blueprint/readbacks ]] || git grep -q '^[[:space:]]*review_approved:' -- blueprint; then
+          if [[ -d blueprint/readbacks ]] || \
+            git grep -q '^[[:space:]]*review_approved[[:space:]]*:' -- blueprint/roadmap; then
             has_review_artifacts=true
           fi
           if [[ -e "$marker" || -L "$marker" ]]; then
@@ -117,7 +118,7 @@ jobs:
           --with mkdocs-material==9.6.21
           --with mkdocs-literate-nav==0.6.2
           --with markdown==3.10.3
-          --with pymdown-extensions==10.21.3
+          --with pymdown-extensions==11.0.1
           mkdocs build --strict
 
       - name: Upload Pages artifact

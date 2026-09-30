@@ -25,10 +25,11 @@ from autoform_cli.skeleton import (
     write_packets,
 )
 
-_PROP = '{"generated":[],"root":{"type":{"sort":{"zero":null}}}}'
-_BODY = '{"generated":[],"root":{"type":{"sort":{"zero":null}},"value":{"bvar":0}}}'
-_OTHER_BODY = '{"generated":[],"root":{"type":{"sort":{"zero":null}},"value":{"bvar":1}}}'
+_PROP = '{"generated":[],"root":{"safety":"safe","type":{"sort":{"zero":null}}}}'
+_BODY = '{"generated":[],"root":{"safety":"safe","type":{"sort":{"zero":null}},"value":{"bvar":0}}}'
+_OTHER_BODY = '{"generated":[],"root":{"safety":"safe","type":{"sort":{"zero":null}},"value":{"bvar":1}}}'
 _ARTICLE_ID = "af_0123456789abcdef01234567"
+_BLUEPRINT_HASH = "sha256:" + "0" * 64
 
 
 # --------------------------------------------------------------------------- #
@@ -37,6 +38,13 @@ _ARTICLE_ID = "af_0123456789abcdef01234567"
 
 
 def _trusted(source: str, semantic: str = _BODY) -> TrustedDeclaration:
+    comments: list[tuple[int, int]] = []
+    if source.startswith("/--"):
+        end = source.index("-/") + 2
+        comments.append((0, len(source[:end].encode("utf-8"))))
+    line_comment = source.find("--", 3)
+    if line_comment >= 0:
+        comments.append((len(source[:line_comment].encode("utf-8")), len(source.encode("utf-8"))))
     return TrustedDeclaration(
         name="Skel.IsSup",
         kind="def",
@@ -45,9 +53,11 @@ def _trusted(source: str, semantic: str = _BODY) -> TrustedDeclaration:
         start_line=3,
         end_line=4,
         signature="Skel.IsSup {S : Type} [LinearOrder S] (E : Set S) (b : S) : Prop",
+        raw_signature="Skel.IsSup {S : Type} [LinearOrder S] (E : Set S) (b : S) : Prop",
         semantic=semantic,
         depends=(),
         source=source,
+        source_comments=tuple(comments),
     )
 
 
@@ -65,6 +75,7 @@ def _declaration(
         start_line=10,
         end_line=14,
         signature="Skel.sup_unique {E : Set ℝ} {a b : ℝ} (ha : Skel.IsSup E a) (hb : Skel.IsSup E b) : a = b",
+        raw_signature="Skel.sup_unique {E : Set ℝ} {a b : ℝ} (ha : Skel.IsSup E a) (hb : Skel.IsSup E b) : a = b",
         semantic=_PROP,
         lean_version="4.32.2",
         depends=("Skel.IsSup",),
@@ -82,7 +93,14 @@ def _report(declaration: DeclarationSkeleton | None = None) -> SkeletonReport:
     node = NodeSkeleton(
         node_id="basics/sup-unique", article_path="roadmap/basics/sup-unique.md", declarations=(declaration,)
     )
-    return SkeletonReport(nodes=(node,), unresolved=())
+    return SkeletonReport(
+        blueprint_hash=_BLUEPRINT_HASH,
+        targets=((node.node_id, (declaration.name,)),),
+        selection="all",
+        selected_nodes=(node.node_id,),
+        nodes=(node,),
+        unresolved=(),
+    )
 
 
 def _blueprint(root: Path) -> Path:

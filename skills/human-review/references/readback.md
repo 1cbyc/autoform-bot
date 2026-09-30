@@ -10,9 +10,11 @@ read-back audits used by [Prove2me](https://prove2.me).
 ## You are working blind, and that is the point
 
 You have been given one prepared packet: the comment-stripped skeleton of one
-declaration. It holds the elaborated signature of a theorem or definition and
-the source of every project definition the statement rests on, with all
-comments and docstrings removed.
+declaration. It holds the elaborated and raw signatures, canonical kernel
+material, and the safely attributable source of project definitions the
+statement rests on, with all comments and docstrings removed. A definition
+whose source cannot be attributed safely is marked `source not shown`; use its
+signatures and canonical material, and do not infer the missing source.
 
 You have not been given the article, the source text, or any description of
 the intent, and you must not look for them. Do not open the blueprint, the
