@@ -257,6 +257,7 @@ def test_probe_spells_names_without_trusting_lean_to_parse_them() -> None:
     assert probe.startswith("import Skel.Defs\nimport Skel.Main\n")
     assert 'Name.str (Name.str (Name.anonymous) "Skel") "observation_determined"' in probe
     assert f'"{PROBE_MARKER}' in probe
+    assert "def probeOutputLimit : Nat := 67108864" in probe
     assert 'Name.str (Name.anonymous) "Init"' in probe
     assert "info.fromClass" in probe
     assert "privateToUserName c" in probe
@@ -822,12 +823,12 @@ def test_unparsable_source_is_withheld_not_refused(tmp_path: Path) -> None:
 
     assert report.clean and not report.unresolved
     (declaration,) = report.nodes[0].declarations
-    assert declaration.statement is None
+    assert declaration.statement is None and declaration.source_withheld
     eligible = next(item for item in declaration.trusted if item.name == "Skel.Eligible")
     assert eligible.source is None and eligible.source_withheld
     packet = report.nodes[0].blind_text()
     assert "as written" not in packet and "Eligible (S" not in packet
-    assert packet.count("-- source not shown: Lean cannot read it reliably outside its file") == 2
+    assert packet.count("-- source not shown: no reliable standalone source is available") == 2
     assert f"-- raw signature: {eligible.raw_signature}" in packet
     path = write_skeleton_report(report, tmp_path / "report.json")
     assert load_skeleton_report(path) == report
@@ -836,6 +837,12 @@ def test_unparsable_source_is_withheld_not_refused(tmp_path: Path) -> None:
     data["trusted"][data["nodes"][0]["declarations"][0]["trusted"][2]]["source_withheld"] = True
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(SkeletonError, match="invalid withheld source flag"):
+        load_skeleton_report(path)
+    data = report.as_dict()
+    data["trusted"][eligible.name]["start_line"] = None
+    data["trusted"][eligible.name]["end_line"] = None
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SkeletonError, match="required source is missing"):
         load_skeleton_report(path)
 
 
@@ -2207,6 +2214,31 @@ def test_probe_records_bypass_the_command_capture_and_other_output(tmp_path: Pat
     assert records["Skel.observation_determined"]["found"] is True
 
 
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_probe_stops_before_its_records_file_exceeds_the_limit(tmp_path: Path, monkeypatch) -> None:
+    project = _project(tmp_path)
+    _build(project, "Skel.Main")
+    limit = 1024
+    sizes: list[int] = []
+    bounded = _run_bounded_command
+
+    def inspect_records(command, **kwargs):
+        result = bounded(command, **kwargs)
+        if kwargs.get("context") == "lake env lean":
+            sizes.append(Path(kwargs["env"][PROBE_OUTPUT_ENV]).stat().st_size)
+        return result
+
+    monkeypatch.setattr("autoform_cli.skeleton.DEFAULT_PROBE_OUTPUT_LIMIT", limit)
+    monkeypatch.setattr("autoform_cli.skeleton._run_bounded_command", inspect_records)
+    probe = render_probe(
+        imports=("Skel.Main",), roots=("Skel.observation_determined",), project_roots=("Skel",)
+    )
+
+    with pytest.raises(SkeletonError, match=f"{limit}-byte output limit"):
+        run_probe(probe, project)
+    assert sizes and sizes[0] <= limit
+
+
 def _built_module(tmp_path: Path, module: str, source: str) -> Path:
     project = _project(tmp_path)
     (project / "Skel" / f"{module}.lean").write_text(source, encoding="utf-8")
@@ -2289,8 +2321,8 @@ def test_project_delaborator_cannot_disguise_the_statement(tmp_path: Path) -> No
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
 def test_generated_declaration_does_not_borrow_its_parents_source(tmp_path: Path) -> None:
     # `mk_secret` adds definitions without source ranges under the names of
-    # `base` and `thm`. Neither is a Lean internal detail, so neither may be
-    # shown as `base`'s source or pass with no source at all.
+    # `base` and `thm`. Ordinary names are refused. An internal-looking name
+    # cannot be proved generated, so it is retained without invented source.
     project = _built_module(
         tmp_path,
         "Rev",
@@ -2304,14 +2336,19 @@ def test_generated_declaration_does_not_borrow_its_parents_source(tmp_path: Path
         'elab "mk_secret" : command => liftTermElabM do\n'
         "  Skel.Rev.mkSecret `Skel.Rev.base.secret 7\n"
         "  Skel.Rev.mkSecret `Skel.Rev.thm.secret 8\n"
+        "  Skel.Rev.mkSecret `Skel.Rev.base._f 9\n"
         "namespace Skel.Rev\n"
         "def base : Nat := 1\n"
         "mk_secret\n"
         "theorem root : base.secret = 7 := rfl\n"
         "theorem thm : thm.secret = 8 := rfl\n"
+        "theorem internal : base._f = 9 := rfl\n"
         "end Skel.Rev\n",
     )
-    blueprint = _blueprint(tmp_path, lean={"root": "Skel.Rev.root", "thm": "Skel.Rev.thm"})
+    blueprint = _blueprint(
+        tmp_path,
+        lean={"root": "Skel.Rev.root", "thm": "Skel.Rev.thm", "internal": "Skel.Rev.internal"},
+    )
 
     report = extract_skeletons(blueprint, lean_root=project)
 
@@ -2322,6 +2359,14 @@ def test_generated_declaration_does_not_borrow_its_parents_source(tmp_path: Path
         "basics/thm: Skel.Rev.thm: the skeleton probe omitted required source for "
         "Skel.Rev.thm trusted declaration Skel.Rev.thm.secret",
     )
+    internal = report.node("basics/internal")
+    assert internal is not None and internal.complete
+    (declaration,) = internal.declarations
+    (helper,) = declaration.trusted
+    assert helper.name == "Skel.Rev.base._f"
+    assert helper.source is None and helper.source_withheld
+    assert "def base : Nat := 1" not in declaration.blind_text()
+    assert "-- source not shown" in declaration.blind_text()
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
@@ -2352,9 +2397,79 @@ def test_lean_decides_which_source_text_is_comment(tmp_path: Path) -> None:
     assert "KEEPOUT" not in blind
     assert "STILL_HIDDEN" not in blind
     assert "def docOpened : Nat := 6" in blind
-    assert "def claim : Prop := 2 + 2 =--\n  5" in blind
+    # The probe cannot reconstruct whether a same-module token was declared
+    # before this source, so it does not guess whether `=--` is code.
+    assert "def claim : Prop := 2 + 2 =--\n  5" not in blind
+    assert "-- source not shown" in blind
     assert re.search(r"def joined : Nat := Nat\.succ +0", blind)
     assert re.search(r"def multiline : Nat := Nat\.succ\n +0", blind)
+
+
+@pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
+def test_ambiguous_scoped_token_is_withheld_and_where_statement_is_recovered(tmp_path: Path) -> None:
+    project = _built_module(
+        tmp_path,
+        "ParseEdges",
+        "namespace Skel.ParseEdges\n"
+        "namespace Scope\n"
+        'scoped infixl:65 " +-- " => Nat.add\n'
+        "end Scope\n"
+        "def SECRET (n : Nat) : Nat := n\n"
+        "/-\n"
+        "open Scope\n"
+        "-/\n"
+        "def hidden : Nat := 1 +-- SECRET\n"
+        "  2\n"
+        "def lateHidden : Nat := 1 +--- SECRET\n"
+        "  2\n"
+        'infixl:65 " +--- " => Nat.add\n'
+        "theorem root : hidden = 3 := rfl\n"
+        "theorem lateRoot : lateHidden = 3 := rfl\n"
+        "structure ProofPair : Prop where\n"
+        "  left : True\n"
+        "  right : True\n"
+        'local notation "⊹" => True.intro\n'
+        'local notation "⊙" => (rfl : (1 : Nat) = 1)\n'
+        "theorem letStatement : (let n := 1; n = 1) := ⊙\n"
+        "theorem whereProof (α : Type) : ProofPair where\n"
+        "  left := by exact ⊹\n"
+        "  right := by exact ⊹\n"
+        "end Skel.ParseEdges\n",
+    )
+    blueprint = _blueprint(
+        tmp_path,
+        lean={
+            "trap": "Skel.ParseEdges.root",
+            "late": "Skel.ParseEdges.lateRoot",
+            "let": "Skel.ParseEdges.letStatement",
+            "where": "Skel.ParseEdges.whereProof",
+        },
+    )
+
+    report = extract_skeletons(blueprint, lean_root=project)
+
+    assert report.clean
+    trap = report.node("basics/trap")
+    assert trap is not None
+    (hidden,) = trap.declarations[0].trusted
+    assert hidden.name == "Skel.ParseEdges.hidden"
+    assert hidden.source is None and hidden.source_withheld
+    assert "SECRET" not in trap.blind_text()
+    late = report.node("basics/late")
+    assert late is not None
+    (late_hidden,) = late.declarations[0].trusted
+    assert late_hidden.name == "Skel.ParseEdges.lateHidden"
+    assert late_hidden.source is None and late_hidden.source_withheld
+    assert "SECRET" not in late.blind_text()
+    let_statement = report.node("basics/let")
+    assert let_statement is not None
+    assert let_statement.declarations[0].statement == (
+        "theorem letStatement : (let n := 1; n = 1)"
+    )
+    where = report.node("basics/where")
+    assert where is not None
+    assert where.declarations[0].statement == "theorem whereProof (α : Type) : ProofPair"
+    assert not where.declarations[0].source_withheld
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
@@ -2524,7 +2639,7 @@ def test_source_lean_cannot_read_outside_its_file_is_withheld(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
-def test_generated_companions_extract_with_their_parent_source(tmp_path: Path) -> None:
+def test_rangeless_companions_extract_without_claiming_parent_source(tmp_path: Path) -> None:
     project = _project(tmp_path)
     _build(project, "Skel.Kinds", "Skel.Partial")
     roots = {
@@ -2540,13 +2655,17 @@ def test_generated_companions_extract_with_their_parent_source(tmp_path: Path) -
 
     assert report.clean
     trusted = {item.name: item for node in report.nodes for d in node.declarations for item in d.trusted}
-    for name in ("Skel.Kinds.wf._unary", "Skel.Kinds.fact._f", "Skel.Partial.Inner.ev._f"):
+    companions = (
+        "Skel.Kinds.wf._unary",
+        "Skel.Kinds.fact._f",
+        "Skel.Partial.Inner.ev._f",
+        "Skel.Kinds.Cfg.x._default",
+        "Skel.Kinds.usesAutoParam._auto_1",
+    )
+    proof = next(name for name in trusted if name.endswith("nestedProof._proof_1"))
+    for name in (*companions, proof):
         assert trusted[name].start_line is None
-        assert trusted[name].source == trusted[name.rsplit(".", 1)[0]].source
-    assert str(trusted["Skel.Kinds.Cfg.x._default"].source).startswith("structure Cfg where")
-    # The parent is a theorem, so its source would show a proof.
-    assert trusted["Skel.Kinds.usesAutoParam._auto_1"].source is None
-    assert any(name.endswith("nestedProof._proof_1") for name in trusted)
+        assert trusted[name].source is None and trusted[name].source_withheld
     # Ordinary, well-founded and structural recursion have `_unsafe_rec`
     # companions too; only a `partial def` is partial.
     for name in ("Skel.Kinds.wf", "Skel.Kinds.wf._unary", "Skel.Kinds.fact", "Skel.Partial.Inner.ev"):
@@ -2676,7 +2795,8 @@ def test_external_internal_detail_rotates_the_declaration_hash(tmp_path: Path) -
 @pytest.mark.skipif(not _lean_toolchain_available(), reason="needs lake and the fixture's Lean toolchain")
 def test_shared_probe_tables_keep_every_hash(tmp_path: Path) -> None:
     # The probe states each trusted declaration, semantic material, and module
-    # once per run. Recorded before that change: every hash must survive it.
+    # once per run. Drift hashes must survive sharing; the full golden also
+    # records intentional changes to the packet evidence presented to a reader.
     project = _project(tmp_path)
     build = subprocess.run(["lake", "build"], cwd=project, capture_output=True, text=True, timeout=600, check=False)
     assert build.returncode == 0, build.stderr
@@ -2728,7 +2848,7 @@ def test_shared_probe_tables_keep_every_hash(tmp_path: Path) -> None:
         node = NodeSkeleton(node_id=project_root, article_path="a.md", declarations=tuple(declarations))
         hashes[project_root] = [node.hash, node.evidence_hash, node.review_hash]
     digest = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
-    assert digest == "6ed0a2d73fd58e4c8a13a67bf3bf7f4ba3e27c2c156a080f3c689249d10f0df7", f"{digest}\n{json.dumps(hashes, indent=1)}"
+    assert digest == "3db5dbb9571689ba28c8877c4f25661a64db9768ada86293e0116cc5a17b6238", f"{digest}\n{json.dumps(hashes, indent=1)}"
 
 
 def _build_semantics(project: Path) -> None:

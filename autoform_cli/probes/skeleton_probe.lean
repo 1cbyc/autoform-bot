@@ -110,6 +110,22 @@ structure SemanticCache where
   materials : Std.HashMap Name Json := {{}}
   fragmentIds : Std.HashMap (Array Piece) Piece := {{}}
   fragments : Nat := 0
+  outputBytes : Nat := 0
+  output : Option IO.FS.Handle := none
+
+def probeOutputLimit : Nat := {output_limit}
+
+/-- Write one complete record without letting the scratch file grow past the
+CLI's output limit. The Python reader checks the limit again after exit. -/
+def emitRecord (cache : IO.Ref SemanticCache) (record : Json) : IO Unit := do
+  let line := s!"{marker}{{record.compress}}\n"
+  let total := (← cache.get).outputBytes + line.utf8ByteSize
+  if total > probeOutputLimit then
+    throw <| IO.userError s!"lake env lean exceeded the {{probeOutputLimit}}-byte output limit"
+  cache.modify fun c => {{ c with outputBytes := total }}
+  match (← cache.get).output with
+  | some out => out.putStr line
+  | none => IO.print line
 
 /-- Pieces as the probe prints them: adjacent text merged into one string and
 each fragment as its number. Expanding the numbers gives `Json.compress`. -/
@@ -144,7 +160,7 @@ def sealPieces (cache : IO.Ref SemanticCache) (parts : Array Piece) : IO Piece :
     {{ c with fragments := id + 1, fragmentIds := c.fragmentIds.insert parts (.ref id size) }}
   let entry := Json.mkObj [
     ("table", Json.str "fragment"), ("name", Json.str (toString id)), ("value", piecesJson parts)]
-  IO.println s!"{marker}{{entry.compress}}"
+  emitRecord cache entry
   return .ref id size
 
 /-- `exprJson`, as pieces. `Json.compress` is compositional, so each node's
@@ -439,12 +455,15 @@ def commentsJson (bytes : ByteArray) (stx : Syntax) (cut : Nat) : Json :=
     if Nat.ble cut s || acc.contains r then acc else acc.push r
   Json.arr <| (ranges.qsort (fun a b => Nat.blt a.1 b.1)).map fun (s, e) => Json.arr #[s, e]
 
-/-- The tokens module `mod` can see: those it and its transitive imports
-declare, globally or scoped. A `local` token is not recorded anywhere. -/
-def visibleTokens (env : Environment) (mod : Name) : Std.HashSet String := Id.run do
+/-- The global tokens declared by imports of `mod`. Tokens declared in `mod`
+itself are not safe here: the final environment does not record whether their
+declaration came before or after the source being inspected. Nor does it record
+where scoped tokens were opened. A `local` token is not recorded at all. -/
+def importedGlobalTokens (env : Environment) (mod : Name) : Std.HashSet String := Id.run do
   let mut tokens : Std.HashSet String := {{}}
   let mut seen : Std.HashSet Name := {{}}
-  let mut work : Array Name := #[mod]
+  let some rootIdx := env.getModuleIdx? mod | return tokens
+  let mut work : Array Name := env.header.moduleData[rootIdx.toNat]!.imports.map (·.module)
   while h : work.size > 0 do
     let m := work[work.size - 1]
     work := work.pop
@@ -453,25 +472,25 @@ def visibleTokens (env : Environment) (mod : Name) : Std.HashSet String := Id.ru
     let some idx := env.getModuleIdx? m | continue
     for e in Parser.parserExtension.ext.getModuleEntries env idx do
       match e with
-      | .global (.token t) | .scoped _ (.token t) => tokens := tokens.insert t
+      | .global (.token t) => tokens := tokens.insert t
       | _ => pure ()
     for i in env.header.moduleData[idx.toNat]!.imports do
       work := work.push i.module
   return tokens
 
-/-- Whether `text` holds a token that is not built into Lean, contains `--` or
-a block-comment opener, and is not visible to `mod`, the module the text sits
-in. There `a +-- b` starts a comment, but the probe parses in its own
-environment, where the token is active, so it cannot tell where that file's
-comments are. -/
+/-- Whether `text` holds a non-builtin token containing `--` or a block-comment
+opener that was not globally active through an import. The probe's combined
+imports, a later declaration, or a reconstructed scoped `open` may activate it
+here even when the source did not, so the probe then cannot safely distinguish
+that token from a comment. -/
 def commentLikeToken (penv : Environment) (mod : Name) (text : String) : IO Bool := do
   let builtin ← Parser.builtinTokenTable.get
   let holds (s t : String) := Nat.blt 1 (s.splitOn t).length
   let found := ((Parser.getTokenTable penv).findPrefix "").filter fun t =>
     (builtin.find? t).isNone && (holds t "--" || holds t "/-") && holds text t
   if found.isEmpty then return false
-  let visible := visibleTokens penv mod
-  return found.any fun t => !visible.contains t
+  let global := importedGlobalTokens penv mod
+  return found.any fun t => !global.contains t
 
 /-- Capture a declaration from the same source snapshot the probe inspects,
 and parse it with Lean's own parser. The surrounding source-tree guard rejects
@@ -519,17 +538,15 @@ def declarationSource (c : Name) : CommandElabM (Option (String × Json)) := do
   if ← commentLikeToken penv mod snippet then return some (snippet, Json.null)
   return some (snippet, comments)
 
-/-- Lean generates companions such as `f._unary`, `f._f` and `S.x._default`
-without a source range. Their kernel material is bound separately; for reading,
-show the declaration they were generated from, unless that is a theorem or
-axiom, whose source would carry a proof. Only Lean internal-detail names, or
-names the environment folds onto another declaration, borrow a source: a
-metaprogram can add `base.secret` without a range, and it is not `base`. -/
+/-- Some declarations have a source range only through a parent that Lean's
+environment structurally identifies, such as a constructor's inductive type.
+Show that parent unless it is a theorem or axiom, whose source carries a proof.
+An internal-looking name is not provenance: project metaprograms can create it. -/
 partial def companionSource (c : Name) : CommandElabM (Option (String × Json)) := do
   let env ← getEnv
   let parent := c.getPrefix
   if (← findDeclarationRanges? c).isSome || !env.contains parent then return none
-  if !c.isInternalDetail && canonical env c == c then return none
+  if canonical env c == c then return none
   if (← findDeclarationRanges? parent).isNone then
     return ← companionSource parent
   -- A field's companions (`S.x._default`, `S.p._autoParam`) read best in the
@@ -547,11 +564,10 @@ def valueNode? (stx : Syntax) : Option Syntax :=
       findKind? decl ``Parser.Command.whereStructInst
 
 /-- The statement of a declaration that does not parse whole, as when only its
-proof uses `local notation`: cut before a `:=` and parse the prefix with
-`:= sorry` as its value. The cut is the statement only if the value then starts
-exactly there. A cut inside the proof keeps the real `:=` in the prefix, so the
-value starts earlier; one inside the statement (`let x := …`) leaves a prefix
-that does not parse. Returns the prefix and the syntax parsed from it. -/
+proof uses `local notation`: cut at successive `:=` tokens and parse the prefix
+with `:= sorry` as its value. The parsed value's start is the real statement
+boundary. A cut inside a structure-style proof therefore recovers its preceding
+`where`; one inside the statement (`let x := …`) does not parse as a command. -/
 def statementPrefix? (penv : Environment) (snippet : String) :
     Option (String × Syntax) := Id.run do
   let mut written := ""
@@ -559,10 +575,10 @@ def statementPrefix? (penv : Environment) (snippet : String) :
     written := written ++ part
     if let .ok stx := Parser.runParserCategory penv `command (written ++ ":= sorry") then
       if let some v := valueNode? stx then
-        if (v.getPos?.map (·.byteIdx)) == some written.utf8ByteSize then
-          return some (written, stx)
-        -- The value starts earlier, so every later cut is inside the proof.
-        return none
+        if let some pos := v.getPos? then
+          if Nat.ble pos.byteIdx written.utf8ByteSize then
+            let statementBytes := snippet.toUTF8.extract 0 pos.byteIdx
+            return some (String.fromUTF8! statementBytes, stx)
     written := written ++ ":="
   return none
 
@@ -602,19 +618,21 @@ def rangeJson (c : Name) : CommandElabM Json := do
   | some r => return Json.arr #[r.range.pos.line, r.range.endPos.line]
   | none   => return Json.null
 
-def emit (request : String) (fields : List (String × Json)) : CommandElabM Unit :=
-  IO.println s!"{marker}{{(Json.mkObj (("root", Json.str request) :: fields)).compress}}"
+def emit (cache : IO.Ref SemanticCache) (request : String)
+    (fields : List (String × Json)) : CommandElabM Unit :=
+  emitRecord cache <| Json.mkObj (("root", Json.str request) :: fields)
 
 /-- Emit one entry of a table shared by every root, the first time a root
 needs it. Roots name their trusted declarations, external semantic material,
 and boundary modules, so what many roots share is stated once per run. -/
-def emitShared (emitted : IO.Ref (Std.HashSet (String × Name))) (table : String) (name : Name)
+def emitShared (cache : IO.Ref SemanticCache)
+    (emitted : IO.Ref (Std.HashSet (String × Name))) (table : String) (name : Name)
     (value : CommandElabM Json) : CommandElabM Unit := do
   unless (← emitted.get).contains (table, name) do
     emitted.modify (·.insert (table, name))
     let entry := Json.mkObj [
       ("table", Json.str table), ("name", Json.str (toString name)), ("value", ← value)]
-    IO.println s!"{marker}{{entry.compress}}"
+    emitRecord cache entry
 
 /-- The modules that belong to the running toolchain. A name root is not
 enough: a dependency may name its own module `Lake.Foo`, and that module is
@@ -639,7 +657,7 @@ def skeleton
     (request : String) (root : Name) : CommandElabM Unit := do
   let env ← getEnv
   unless env.contains root do
-    emit request [("found", Json.bool false)]
+    emit semanticCache request [("found", Json.bool false)]
     return
   -- `env.header` is slow to reach from the interpreted probe, so the module of
   -- each dependency is looked up in names read once per root.
@@ -729,7 +747,7 @@ def skeleton
   -- the artifact into `.olean`, `.olean.server`, and `.olean.private` (which
   -- holds private bodies and proofs); bind every part that exists.
   for mod in boundaryModules.qsort Name.lt do
-    emitShared emitted "module" mod do
+    emitShared semanticCache emitted "module" mod do
       let olean ← findOLean mod
       unless ← olean.pathExists do
         throwError "compiled artifact unavailable for boundary module {{mod}}"
@@ -744,7 +762,7 @@ def skeleton
   -- A trusted declaration's record does not depend on the root: its
   -- dependencies are its own meaning's local constants.
   for c in trusted.qsort Name.lt do
-    emitShared emitted "trusted" c do
+    emitShared semanticCache emitted "trusted" c do
       let deps := (edges.find? (·.1 == c)).map (·.2) |>.getD #[]
       let kind := kindOf env c
       let (source, sourceComments) ← if kind == "theorem" || kind == "axiom" then
@@ -781,9 +799,9 @@ def skeleton
     | some (s, comments) => pure (Json.str s, comments)
     | none => pure (Json.null, Json.null)
   for d in sortedAssumed ++ sortedAxioms do
-    emitShared emitted "semantic" d do
+    emitShared semanticCache emitted "semantic" d do
       cachedSemanticMaterial semanticCache env d
-  emit request <| [
+  emit semanticCache request <| [
     ("found", Json.bool true),
     ("statement_source", statement),
     ("statement_comments", statementComments),
@@ -809,18 +827,16 @@ set_option maxHeartbeats 0 in
 run_cmd do
   let projectRoots : List Name := [{project_roots}]
   let expandCache : IO.Ref (Std.HashMap Name (Array Name)) ← IO.mkRef {{}}
-  let semanticCache : IO.Ref AutoformSkeleton.SemanticCache ← IO.mkRef {{}}
   let emitted : IO.Ref (Std.HashSet (String × Name)) ← IO.mkRef {{}}
   let coreModules ← AutoformSkeleton.toolchainModules (← getEnv)
   -- A command's `IO.println` output is captured and printed as one message when
   -- the command ends, at a cost quadratic in its size: on a Mathlib project that
-  -- outlasts the probe itself. Write to the file the CLI names instead, where no
-  -- other output can interleave with a record; without one, keep the capture.
+  -- outlasts the probe itself. Write records to the file the CLI names instead,
+  -- without redirecting incidental stdout into that trusted record stream.
   let direct ← (← IO.getEnv "{output_env}").mapM fun path => IO.FS.Handle.mk path .write
-  let captured ← direct.mapM fun out => IO.setStdout (IO.FS.Stream.ofHandle out)
+  let semanticCache : IO.Ref AutoformSkeleton.SemanticCache ← IO.mkRef {{ output := direct }}
   try
     for (request, root) in [{roots}] do
       AutoformSkeleton.skeleton projectRoots coreModules expandCache semanticCache emitted request root
   finally
     if let some out := direct then out.flush
-    if let some stream := captured then discard <| IO.setStdout stream

@@ -309,13 +309,13 @@ every miss silently shrinks the surface a reader is told to trust. Constructors,
 projections, recursors, `noConfusion` helpers, and matchers are folded onto the
 declaration the reader sees in the source, so a structure appears once, as its
 `structure` block. Only companions that Lean's environment records as generated
-are folded; a name such as `f.eq_1` or `f._helper` is not. Names outside the
-project are the trusted base and are not
-expanded. Compiler-generated companions without a source range, such as
-`f._unary`, `f._f`, and `S.x._default`, are bound by their elaborated material
-and shown with the declaration they were generated from. Any other
-declaration without its own source, such as one a metaprogram adds under an
-existing name, is refused rather than shown as its parent. A `partial def`
+are folded; an internal-looking name alone is not proof of provenance. Names
+outside the project are the trusted base and are not expanded. Rangeless
+internal-detail declarations, including helpers such as `f._unary`, `f._f`,
+and `S.x._default`, are bound by their elaborated material and marked
+`-- source not shown` rather than being passed off as their parent's source.
+An ordinary declaration without its own source, such as one a metaprogram adds
+under an existing name, is refused. A `partial def`
 anywhere in a declaration's trusted closure is refused, as recorded by the Lean
 environment rather than by the source text: its kernel face is an opaque
 constant, so the body a reader would see is not what Lean checks. The command
@@ -392,17 +392,17 @@ atomic renames used for guarded replacement.
 
 A packet holds only what a blind auditor may see: the signature, the same
 signature printed in Lean's raw expression form, the canonical kernel material,
-the statement as written, and the source of every project definition it rests on,
-with every comment and docstring
-removed, so that a reader who is asked what the Lean
-literally asserts cannot read the author's intent into it. Lean's parser, not
-a separate lexer, locates the comments, so a project token that contains `--`
-stays code. The probe parses each source in its own environment, which has the
-notation of every module the run imports but not the file's `local` notation.
+the statement as written, and the source of every project definition it rests
+on, with every comment and docstring the probe can identify removed, so that a
+reader who is asked what the Lean literally asserts cannot read the author's
+intent into it. Lean's parser, not a separate lexer, locates those comments.
+The probe parses each source in its own environment, which has the notation of
+every module the run imports but not the file's `local` notation.
 A source it cannot parse there (a body that uses `local notation`) is withheld
-if it may hold a comment, and so is any source containing a non-builtin token
-with `--` or `/-`, since its file may not import that token and would read
-the rest of the line as a comment. A withheld source leaves the declaration's
+if it may hold a comment. Source containing a known non-builtin token with
+`--` or `/-` is also withheld unless that token was globally active through an
+import, since the probe cannot reconstruct when a same-module token was declared
+or where a scoped token was active. A withheld source leaves the declaration's
 signatures and kernel material in the packet and does not make the article
 unresolved. A `local` token containing `--` is invisible to the probe: the
 packet can then show code as a comment or a comment as code.
@@ -415,13 +415,14 @@ written, where such notation still applies. For those, and for structures and
 generated companions, only the canonical kernel material, shown for every item,
 states the meaning without notation.
 
-Each theorem's packet also carries the statement *as written*, cut before its
-value by Lean's parser with its enclosing namespaces and the file's opened
-namespaces in scope so that scoped notation parses (a proof Lean cannot parse,
-for example one using `local notation`, does not stop the cut; a statement Lean
-cannot parse is not shown), beside the elaborated signature: the printed form shows binders that `variable` and `include` inject
-and the type every cast lands in, the written form shows what the
-pretty-printer elides, and neither can hide what the other shows.
+Each theorem's packet also carries the statement *as written*, cut before a
+`:=` value or a structure-style `where` value by Lean's parser with its
+enclosing namespaces and the file's opened namespaces in scope. A proof Lean
+cannot parse, for example one using `local notation`, does not stop those cuts.
+The statement sits beside the elaborated signature: the printed form shows
+binders that `variable` and `include` inject and the type every cast lands in;
+the written form shows what the pretty-printer elides. Equation-style forms
+that cannot be parsed outside their file are marked `-- source not shown`.
 
 A statement's source passage can travel with it. A `## Sources` link to a
 non-Markdown file inside the blueprint with a `#L<start>-L<end>` fragment, for

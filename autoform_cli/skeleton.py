@@ -130,9 +130,9 @@ class _CommandTimedOut(SkeletonError):
     """A bounded command ran out of time; its caller knows which budget to raise."""
 
 
-#: Shown in place of source text Lean could not read apart from its file. The
-#: signatures and canonical kernel material above it still state the meaning.
-_NOT_SHOWN = "-- source not shown: Lean cannot read it reliably outside its file"
+#: Shown when no source can be attributed and parsed safely. The signatures
+#: and canonical kernel material above it still state the meaning.
+_NOT_SHOWN = "-- source not shown: no reliable standalone source is available"
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,8 +153,7 @@ class TrustedDeclaration:
     source: str | None = None
     #: UTF-8 byte ranges of the comments in ``source``, as Lean's parser found them.
     source_comments: tuple[tuple[int, int], ...] = ()
-    #: True when the source exists but is not shown: Lean could not tell its
-    #: comments from its code in the probe's context (see ``_shown_source``).
+    #: True when no source can be attributed and parsed safely.
     source_withheld: bool = False
 
     @property
@@ -213,8 +212,8 @@ class DeclarationSkeleton:
     #: UTF-8 byte ranges of the comments in ``source`` and ``statement``.
     source_comments: tuple[tuple[int, int], ...] = ()
     statement_comments: tuple[tuple[int, int], ...] = ()
-    #: True when a definition's source exists but is not shown, as for
-    #: ``TrustedDeclaration.source_withheld``.
+    #: True when the declaration's source or written statement cannot safely
+    #: be shown, as for ``TrustedDeclaration.source_withheld``.
     source_withheld: bool = False
 
     @property
@@ -830,7 +829,10 @@ def _declaration_from_dict(
     entries = [(name, kind, source, start_line, source_withheld)]
     entries += [(value.name, value.kind, value.source, value.start_line, value.source_withheld) for value in trusted]
     for entry_name, entry_kind, entry_source, entry_start, withheld in entries:
-        if not withheld and _source_required(entry_name, entry_kind, entry_source, entry_start is not None):
+        missing_required = _source_required(
+            entry_name, entry_kind, entry_source, entry_start is not None
+        )
+        if missing_required and not (withheld and entry_start is not None):
             raise SkeletonError([f"required source is missing for {entry_kind} {entry_name}"])
     statement = _report_optional_string(item.get("statement"), f"statement for {name}")
     declaration = DeclarationSkeleton(
@@ -1663,6 +1665,7 @@ def render_probe(
         imports="\n".join(f"import {module}" for module in sorted(set(imports))),
         marker=PROBE_MARKER,
         output_env=PROBE_OUTPUT_ENV,
+        output_limit=DEFAULT_PROBE_OUTPUT_LIMIT,
         project_roots=", ".join(_lean_name(name) for name in sorted(set(project_roots))),
         roots=", ".join(f"({json.dumps(name, ensure_ascii=False)}, {_lean_name(name)})" for name in roots),
     )
@@ -2172,11 +2175,11 @@ def _probe_record_issue(record: dict[str, object]) -> str | None:
 def _source_required(name: str, kind: str, source: object, has_range: bool) -> bool:
     """Whether a declaration lacks the source text a reviewer must be shown.
 
-    Lean generates companions such as `f._unary`, `f._f`, `root._auto_1` and
-    `S.x._default` without a source range. Their elaborated material is still
-    bound by the hash, and the declaration they come from carries the source.
-    Any other name must carry its own: a metaprogram can add `base.secret`
-    without a range, and `base`'s source does not describe it.
+    Lean reserves internal-detail spellings for helpers such as `f._unary`,
+    `f._f`, `root._auto_1` and `S.x._default`. Their elaborated material is
+    bound by the hash, but the spelling alone cannot prove which source made
+    them, so a missing source is stated rather than borrowed from their parent.
+    Any ordinary name without its own source is refused.
     """
 
     if kind in {"theorem", "axiom"} or (isinstance(source, str) and source.strip()):
@@ -2772,12 +2775,16 @@ def _declaration(
     name = str(record["root"])
     semantic = str(record["semantic"])
     module = str(record.get("module") or "")
+    start, end = _range(record.get("range"))
     source, source_comments, source_withheld = _shown_source(
         _optional_probe_string(record.get("source")), record.get("source_comments"), name=name
     )
-    written, written_comments, _ = _shown_source(
+    written, written_comments, statement_withheld = _shown_source(
         _optional_probe_string(record.get("statement_source")), record.get("statement_comments"), name=name
     )
+    if written is None and source is None and start is not None:
+        statement_withheld = True
+    source_withheld = source_withheld or statement_withheld
     statement = _statement(written)
     # `_statement` only trims the end, so the ranges still apply up to its length.
     limit = len((statement or "").encode("utf-8"))
@@ -2786,7 +2793,6 @@ def _declaration(
         statement,
         context=f"the statement of {name}",
     )
-    start, end = _range(record.get("range"))
     path = _source_path(name, module, libraries=libraries, lean_root=lean_root, index=index)
     declaration = DeclarationSkeleton(
         name=name,
@@ -2835,6 +2841,8 @@ def _trusted(
     source, source_comments, source_withheld = _shown_source(
         _optional_probe_string(item.get("source")), item.get("source_comments"), name=name
     )
+    if source is None and start is None and _internal_detail(name):
+        source_withheld = True
     trusted = TrustedDeclaration(
         name=name,
         kind=str(item.get("kind") or "unknown"),
