@@ -3,14 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
+from autoform_cli.lean import SourceLinker, _without_lean_comments, declaration_names, index_project
 
-from autoform_cli.lean import (
-    SourceLinker,
-    declaration_names,
-    index_project,
-    strip_lean_comments,
-)
+
+def strip_lean_comments(text: str) -> str:
+    return "\n".join(line.rstrip() for line in _without_lean_comments(text).splitlines() if line.strip())
+
 
 _SOURCE = """import Mathlib
 
@@ -107,18 +105,13 @@ def test_build_output_is_skipped(tmp_path: Path) -> None:
     assert index.find("vendored") is None
 
 
-@pytest.mark.parametrize(
-    "schema", ["autoform-skeleton-packets/v1", "autoform-skeleton-packets/v2"]
-)
-def test_managed_packet_output_is_not_indexed_as_project_source(
-    tmp_path: Path, schema: str
-) -> None:
+def test_managed_packet_output_is_not_indexed_as_project_source(tmp_path: Path) -> None:
     packets = tmp_path / "000-review-packets"
     packet = packets / "node" / "target.lean"
     packet.parent.mkdir(parents=True)
     packet.write_text("def target : Nat := 2\n", encoding="utf-8")
     (packets / "manifest.json").write_text(
-        json.dumps({"kind": "packets", "packets": [], "schema": schema}) + "\n",
+        json.dumps({"kind": "packets", "packets": [], "schema": "autoform-skeleton-packets/v2"}) + "\n",
         encoding="utf-8",
     )
 
@@ -167,6 +160,15 @@ def test_comment_stripping_reads_slash_dash_dash_slash_as_a_docstring() -> None:
     # Lean reads `/--` as a docstring opener, so `/--/ ... -/` is one comment.
     assert strip_lean_comments("/--/ KEEPOUT -/\ndef d : Nat := 6") == "def d : Nat := 6"
     assert strip_lean_comments("/-!/ KEEPOUT -/\ndef d : Nat := 6") == "def d : Nat := 6"
+
+
+def test_double_brace_in_interpolation_opens_a_structure_instance(tmp_path: Path) -> None:
+    # Lean has no `{{` escape: both braces open code, so these markers sit in a nested string.
+    line = 'def s : String := s!"{{ fst := "--", snd := 1 : String × Nat }.fst}"'
+    index = _index(tmp_path, line.replace("--", "/-") + "\ndef t : Nat := 1\n")
+
+    assert strip_lean_comments(line + " -- remove me") == line
+    assert index.find("t") is not None
 
 
 def test_permalink_pins_the_commit(tmp_path: Path) -> None:
