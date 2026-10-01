@@ -36,7 +36,6 @@ import psutil
 
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import (
-    MANAGED_OUTPUT_SCHEMAS,
     PACKET_SCHEMA,
     PASSAGE_SCHEMA,
     SourceIndex,
@@ -51,6 +50,9 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 SKELETON_SCHEMA = "autoform-skeleton/v4"
 SEMANTIC_SCHEMA = "autoform-lean-expr/v4"
+_WRITABLE_OUTPUT_SCHEMAS = frozenset(
+    {("packets", PACKET_SCHEMA), ("passages", PASSAGE_SCHEMA)}
+)
 
 #: Every line the probe wants read back starts with this marker, so Lean's own
 #: informational output can never be mistaken for a result.
@@ -143,7 +145,10 @@ class TrustedDeclaration:
         return text.count("\n") + 1 if text else 0
 
     def as_dict(self) -> dict[str, object]:
-        return asdict(self)
+        shown = asdict(self)
+        shown["depends"] = list(self.depends)
+        shown["source_comments"] = [list(item) for item in self.source_comments]
+        return shown
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -169,6 +174,12 @@ class DeclarationSkeleton(TrustedDeclaration):
     statement: str | None = None
     #: UTF-8 byte ranges of the comments in ``statement``.
     statement_comments: tuple[tuple[int, int], ...] = ()
+
+    @property
+    def defines(self) -> bool:
+        """Whether the root is a definition rather than a proposition."""
+
+        return self.kind not in {"theorem", "axiom"}
 
     @property
     def declaration_lines(self) -> int:
@@ -259,7 +270,20 @@ class DeclarationSkeleton(TrustedDeclaration):
     def as_dict(self) -> dict[str, object]:
         """The report record, naming what the report's shared tables state once."""
 
-        shown = {item.name: getattr(self, item.name) for item in fields(self) if not item.name.endswith("_semantics")}
+        shown = {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if not item.name.endswith("_semantics")
+        }
+        shown.update(
+            {
+                "assumed": list(self.assumed),
+                "axioms": list(self.axioms),
+                "depends": list(self.depends),
+                "source_comments": [list(item) for item in self.source_comments],
+                "statement_comments": [list(item) for item in self.statement_comments],
+            }
+        )
         return shown | {
             "boundary_modules": list(dict.fromkeys(module for module, _, _ in self.boundary_modules)),
             "declaration_lines": self.declaration_lines,
@@ -387,6 +411,12 @@ class SkeletonReport:
         """Return the skeleton record of one article, if it has one."""
 
         return next((node for node in self.nodes if node.node_id == node_id), None)
+
+    def declarations(self, node_id: str) -> tuple[DeclarationSkeleton, ...]:
+        """Return the skeletons behind one article, or none."""
+
+        node = self.node(node_id)
+        return () if node is None else node.declarations
 
     def as_dict(self) -> dict[str, object]:
         # Roots in one project share most of what they trust; each shared
@@ -750,7 +780,11 @@ def _comment_ranges(value: object, text: str | None, *, context: str) -> tuple[t
     return tuple(ranges)
 
 
-def _read_snapshot_pass(path: Path) -> bytes | None:
+def _read_snapshot_pass(
+    path: Path, *, keep_content: bool
+) -> tuple[bytes, tuple[int, str]] | None:
+    """Read one bounded regular-file pass."""
+
     try:
         path_metadata = path.lstat()
     except FileNotFoundError:
@@ -775,35 +809,51 @@ def _read_snapshot_pass(path: Path) -> bytes | None:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise SkeletonError([f"skeleton input is not a regular file: {path}"])
+        digest = hashlib.sha256()
         chunks: list[bytes] = []
         size = 0
-        while block := os.read(descriptor, 64 * 1024):
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
             size += len(block)
             if size > _SNAPSHOT_FILE_LIMIT:
                 raise SkeletonError(
                     [f"skeleton input exceeds the {_SNAPSHOT_FILE_LIMIT}-byte limit: {path}"]
                 )
-            chunks.append(block)
+            digest.update(block)
+            if keep_content:
+                chunks.append(block)
     except OSError as exc:
         raise SkeletonError([f"cannot read skeleton input {path}: {exc}"]) from exc
     finally:
         os.close(descriptor)
-    return b"".join(chunks)
+    return b"".join(chunks), (size, digest.hexdigest())
 
 
-def _read_snapshot_file(path: Path) -> bytes | None:
+def _read_snapshot_file(path: Path) -> tuple[bytes, tuple[int, str]] | None:
     """Read a bounded regular file twice to reject concurrent content changes."""
 
-    captured = _read_snapshot_pass(path)
-    if _read_snapshot_pass(path) != captured:
+    captured = _read_snapshot_pass(path, keep_content=True)
+    verified = _read_snapshot_pass(path, keep_content=False)
+    captured_fingerprint = None if captured is None else captured[1]
+    verified_fingerprint = None if verified is None else verified[1]
+    if captured_fingerprint != verified_fingerprint:
         raise SkeletonError([f"skeleton input changed while it was read: {path}"])
     return captured
 
 
-def _project_control_snapshot(root: Path) -> tuple[tuple[str, bytes | None], ...]:
+def _snapshot_regular_file(path: Path) -> tuple[int, str] | None:
+    captured = _read_snapshot_file(path)
+    return None if captured is None else captured[1]
+
+
+def _project_control_snapshot(root: Path) -> tuple[tuple[str, tuple[int, str] | None], ...]:
     """Fingerprint the Lake inputs that select the compiled environment."""
 
-    return tuple((name, _read_snapshot_file(root / name)) for name in _PROJECT_CONTROL_FILES)
+    return tuple(
+        (name, _snapshot_regular_file(root / name)) for name in _PROJECT_CONTROL_FILES
+    )
 
 
 def _graph_snapshot(graph: Graph) -> tuple[tuple[str, str, str], ...]:
@@ -1153,7 +1203,7 @@ def lean_libraries(lean_root: str | Path) -> tuple[LeanLibrary, ...]:
     toml_snapshot = _read_snapshot_file(root / "lakefile.toml")
     lakefile_snapshot = _read_snapshot_file(root / "lakefile.lean")
     if toml_snapshot is not None:
-        text = toml_snapshot
+        text = toml_snapshot[0]
     elif lakefile_snapshot is not None:
         text = _translate_lakefile(root)
     else:
@@ -1200,7 +1250,7 @@ def _translate_lakefile(root: Path) -> bytes:
         translated = _read_snapshot_file(target)
         if translated is None:
             raise SkeletonError(["lake translate-config failed: translated configuration is missing"])
-        return translated
+        return translated[0]
 
 
 def module_of(path: Path, libraries: tuple[LeanLibrary, ...]) -> str | None:
@@ -2191,7 +2241,7 @@ def source_passage(node: Node, blueprint: Path, *, issues: list[str] | None = No
             # `splitlines` also breaks on form feeds, which `pdftotext` writes
             # between pages, and every locator into such a file would then drift
             # by one line per page.
-            lines = captured.decode("utf-8").split("\n")
+            lines = captured[0].decode("utf-8").split("\n")
             if lines and lines[-1] == "":
                 lines.pop()
         except (ValueError, UnicodeError):
@@ -2347,6 +2397,25 @@ def _dependency_order(items: list[TrustedDeclaration]) -> list[TrustedDeclaratio
 # --------------------------------------------------------------------------- #
 
 
+def source_excerpt(
+    item: TrustedDeclaration | DeclarationSkeleton, lean_root: Path
+) -> str | None:
+    """Return the source lines of ``item``, or ``None`` when they cannot be read."""
+
+    if item.path is None or item.start_line is None or item.end_line is None:
+        return None
+    root = lean_root.resolve()
+    candidate = (root / item.path).resolve()
+    try:
+        candidate.relative_to(root)
+        lines = candidate.read_text(encoding="utf-8").split("\n")
+    except (ValueError, OSError, UnicodeError):
+        return None
+    if item.start_line < 1 or item.end_line > len(lines) or item.end_line < item.start_line:
+        return None
+    return "\n".join(lines[item.start_line - 1 : item.end_line])
+
+
 def format_report(report: SkeletonReport, *, lean_root: Path | None = None) -> str:
     """Render the report as the text a reviewer reads.
 
@@ -2440,7 +2509,7 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
     if not (
         isinstance(payload, dict)
         and payload.get("kind") == kind
-        and (kind, payload.get("schema")) in MANAGED_OUTPUT_SCHEMAS
+        and (kind, payload.get("schema")) in _WRITABLE_OUTPUT_SCHEMAS
         and isinstance(payload.get(kind), list)
     ):
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])
@@ -2876,6 +2945,7 @@ __all__ = [
     "path_of",
     "render_probe",
     "run_probe",
+    "source_excerpt",
     "source_passage",
     "write_packets",
     "write_skeleton_report",

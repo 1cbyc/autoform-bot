@@ -41,6 +41,7 @@ from autoform_cli.skeleton import (
     _stage_output,
     _hash_module_files,
     _local_safety_issue,
+    _project_control_snapshot,
     _without_comments,
     _probe_record_issue,
     extract_skeletons,
@@ -52,6 +53,7 @@ from autoform_cli.skeleton import (
     path_of,
     render_probe,
     run_probe,
+    source_excerpt,
     write_packets,
     write_skeleton_report,
 )
@@ -833,6 +835,16 @@ def test_lake_configuration_snapshot_uses_content_not_file_identity(
     assert library.name == "Skel"
 
 
+def test_project_control_snapshot_retains_only_fingerprints(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    content = (project / "lakefile.toml").read_bytes()
+
+    snapshot = dict(_project_control_snapshot(project))
+
+    assert snapshot["lakefile.toml"] == (len(content), hashlib.sha256(content).hexdigest())
+    assert snapshot["lakefile.lean"] is None
+
+
 def test_lake_configuration_snapshot_rejects_content_changed_between_reads(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1359,6 +1371,7 @@ def test_report_round_trips_through_json_deterministically(tmp_path: Path) -> No
 
     first = report.to_json()
     assert first == report.to_json()
+    assert report.as_dict() == json.loads(first)
     assert json.loads(first)["schema"] == SKELETON_SCHEMA
     assert str(tmp_path) not in first
 
@@ -1370,6 +1383,24 @@ def test_report_round_trips_through_json_deterministically(tmp_path: Path) -> No
         legacy = report.as_dict()
         legacy["schema"] = schema
         _assert_load_rejects(path, legacy)
+
+
+def test_public_skeleton_compatibility_helpers(tmp_path: Path) -> None:
+    report = _fake_report(tmp_path)
+    node = report.nodes[0]
+    declaration = node.declarations[0]
+
+    assert report.declarations(node.node_id) == node.declarations
+    assert report.declarations("missing") == ()
+    assert not declaration.defines
+    assert replace(declaration, kind="def").defines
+    assert not replace(declaration, kind="axiom").defines
+
+    project = tmp_path / "project"
+    excerpt = source_excerpt(declaration, project)
+    assert excerpt is not None and excerpt.endswith("  sorry")
+    assert source_excerpt(replace(declaration, path="../outside.lean"), project) is None
+    assert source_excerpt(replace(declaration, end_line=10_000), project) is None
 
 
 def test_report_states_shared_material_once(tmp_path: Path) -> None:
@@ -2947,6 +2978,39 @@ def test_packet_publication_refuses_unmanaged_or_symlink_output(tmp_path: Path) 
 
     with pytest.raises(SkeletonError, match="non-Autoform packet output"):
         write_packets(report, unmanaged)
+
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    (legacy / PACKET_MANIFEST).write_text(
+        json.dumps(
+            {
+                "kind": "packets",
+                "packets": [],
+                "schema": "autoform-skeleton-packets/v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    valuable_legacy = legacy / "valuable.txt"
+    valuable_legacy.write_text("keep me\n", encoding="utf-8")
+    with pytest.raises(SkeletonError, match="non-Autoform packet output"):
+        write_packets(report, legacy)
+    assert valuable_legacy.read_text(encoding="utf-8") == "keep me\n"
+
+    legacy_passages = tmp_path / "legacy-passages"
+    legacy_passages.mkdir()
+    (legacy_passages / PACKET_MANIFEST).write_text(
+        json.dumps(
+            {
+                "kind": "passages",
+                "passages": [],
+                "schema": "autoform-skeleton-passages/v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SkeletonError, match="non-Autoform packet output"):
+        write_packets(report, tmp_path / "fresh-packets", passages=legacy_passages)
 
     outside = tmp_path / "outside"
     outside.mkdir()

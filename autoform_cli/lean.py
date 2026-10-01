@@ -29,10 +29,17 @@ _DECLARATION = re.compile(
     r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+(.+)$"
 )
 _IGNORED_DIRECTORIES = frozenset({".lake", ".git", "lake-packages", "build"})
-#: Schemas of the skeleton command's packet and passage manifests.
+#: Known schemas of the skeleton command's packet and passage manifests.
 PACKET_SCHEMA = "autoform-skeleton-packets/v2"
 PASSAGE_SCHEMA = "autoform-skeleton-passages/v2"
-MANAGED_OUTPUT_SCHEMAS = frozenset({("packets", PACKET_SCHEMA), ("passages", PASSAGE_SCHEMA)})
+MANAGED_OUTPUT_SCHEMAS = frozenset(
+    {
+        ("packets", "autoform-skeleton-packets/v1"),
+        ("packets", PACKET_SCHEMA),
+        ("passages", "autoform-skeleton-passages/v1"),
+        ("passages", PASSAGE_SCHEMA),
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +238,14 @@ def _without_lean_comments(text: str) -> str:
     return "".join(out)
 
 
+def strip_lean_comments(text: str) -> str:
+    """Remove every line and block comment, docstrings included, from Lean source."""
+
+    return "\n".join(
+        line.rstrip() for line in _without_lean_comments(text).splitlines() if line.strip()
+    )
+
+
 _DECLARATION_NAME = re.compile(r"(?:«[^»]*(?:»|$)|[^\s,«])+")
 
 
@@ -331,4 +346,5 @@ __all__ = [
     "detect_ref",
     "detect_repository_url",
     "index_project",
+    "strip_lean_comments",
 ]
