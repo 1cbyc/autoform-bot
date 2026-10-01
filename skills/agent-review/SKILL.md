@@ -20,6 +20,9 @@ Select the rubric from the artifact under review.
   and [Mathlib style](references/mathlib-style.md). Compile the relevant target,
   inspect the proof chain, and compare the complete public statement with the
   original source.
+- For a read-back, an auditor's English account of what Lean declarations
+  assert, read [read-back faithfulness](references/readback-faithfulness.md).
+  Judge it against the cited source passage, without the Lean.
 
 Keep objective evidence separate from judgment. Never claim compilation,
 declaration resolution, axiom cleanliness, source coverage, or dependency
