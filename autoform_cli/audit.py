@@ -434,7 +434,7 @@ def _source_spans(index: SourceIndex) -> dict[str, int]:
     tails: dict[Path, int] = {}
     for path, lines in starts.items():
         lines.sort()
-        tails[path] = index.line_counts[path]
+        tails[path] = index.line_counts.get(path, 0)
 
     spans: dict[str, int] = {}
     for declaration in index.declarations.values():

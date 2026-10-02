@@ -57,7 +57,8 @@ _PUBLICATION_MANIFEST = "publication.json"
 _PUBLICATION_SCHEMAS = frozenset({"autoform-publication/v1", "autoform-publication/v2"})
 _PUBLICATION_MANIFEST_BYTE_LIMIT = 1024 * 1024
 _MANAGED_OUTPUT_MANIFEST = "manifest.json"
-_MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT = 1024 * 1024
+# Skeleton manifests grow with the declaration set, and their sorted schema key
+# follows the entries, so classification must consume the complete file.
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_DIRECTORY", 0)
@@ -150,11 +151,36 @@ def index_project(
     root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
 ) -> SourceIndex:
     """Scan ``*.lean`` beneath *root* and index declarations by full name."""
-    root_path = Path(root).expanduser().resolve()
+    requested_root = directory_binding.lexical_absolute_path(root)
+    root_path = requested_root.resolve()
     if not root_path.is_dir():
         digest = hashlib.sha256(b"autoform-lean-source-index/v1\0").hexdigest()
         return SourceIndex(root=root_path, declarations={}, source_digest=digest)
-    return snapshot_project_sources(root_path, exclude_roots=exclude_roots).index
+    remapped_exclusions = tuple(
+        _remap_resolved_root_exclusion(requested_root, root_path, value)
+        for value in exclude_roots
+    )
+    return snapshot_project_sources(
+        root_path,
+        exclude_roots=remapped_exclusions,
+    ).index
+
+
+def _remap_resolved_root_exclusion(
+    requested_root: Path,
+    resolved_root: Path,
+    value: str | Path,
+) -> Path:
+    """Keep absolute descendant exclusions attached when a root alias resolves."""
+
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        return candidate
+    try:
+        relative = candidate.relative_to(requested_root)
+    except ValueError:
+        return candidate
+    return resolved_root / relative
 
 
 def snapshot_project_sources(
@@ -265,11 +291,7 @@ def _lean_tree_selection(
         byte_limit=lambda path: (
             _PUBLICATION_MANIFEST_BYTE_LIMIT
             if _is_publication_manifest_name(path.name)
-            else (
-                _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT
-                if _is_managed_output_manifest_name(path.name)
-                else None
-            )
+            else None
         ),
         record_omitted=False,
     )
@@ -365,9 +387,7 @@ def _indexed_source_snapshot(
         recognized_roots,
         key=lambda path: (len(path.parts), path.as_posix()),
     ):
-        if not any(
-            parent == root or parent.is_relative_to(root) for root in ignored_roots
-        ):
+        if not _path_is_within_roots(parent, ignored_roots):
             ignored_roots.add(parent)
 
     for label, groups, _recognizes in manifest_groups:
@@ -375,10 +395,7 @@ def _indexed_source_snapshot(
             groups.items(),
             key=lambda item: (len(item[0].parts), item[0].as_posix()),
         ):
-            if any(
-                parent == root or parent.is_relative_to(root)
-                for root in ignored_roots
-            ):
+            if _path_is_within_roots(parent, ignored_roots):
                 continue
             if len(manifests) != 1:
                 raise OSError(f"ambiguous {label} manifests in {parent.as_posix()}")
@@ -389,11 +406,7 @@ def _indexed_source_snapshot(
                 )
 
     def in_ignored_root(relative_text: str) -> bool:
-        relative = PurePosixPath(relative_text)
-        return any(
-            relative == ignored or relative.is_relative_to(ignored)
-            for ignored in ignored_roots
-        )
+        return _path_is_within_roots(PurePosixPath(relative_text), ignored_roots)
 
     unsupported = [
         (relative, reason)
@@ -415,10 +428,7 @@ def _indexed_source_snapshot(
             excluded,
         ):
             continue
-        if any(
-            relative == ignored or relative.is_relative_to(ignored)
-            for ignored in ignored_roots
-        ):
+        if _path_is_within_roots(relative, ignored_roots):
             continue
         relative_path = Path(relative.as_posix())
         _update_source_digest(digest, relative_path, data)
@@ -450,9 +460,9 @@ def _lean_generation_revision(
 
     def retained_entry(relative_text: str) -> bool:
         relative = PurePosixPath(relative_text)
-        return relative.suffix.casefold() == ".lean" and not any(
-            relative == ignored or relative.is_relative_to(ignored)
-            for ignored in ignored_roots
+        return relative.suffix.casefold() == ".lean" and not _path_is_within_roots(
+            relative,
+            ignored_roots,
         )
 
     files = tuple(entry for entry in snapshot.files if retained_entry(entry[0]))
@@ -496,7 +506,7 @@ def _is_publication_manifest_bytes(data: bytes) -> bool:
         return False
     try:
         value = json.loads(data.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
+    except (UnicodeError, ValueError):
         return False
     return isinstance(value, dict) and value.get("schema") in _PUBLICATION_SCHEMAS
 
@@ -506,11 +516,9 @@ def _is_publication_manifest_name(name: str) -> bool:
 
 
 def _is_managed_output_manifest_bytes(data: bytes) -> bool:
-    if len(data) > _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT:
-        return False
     try:
         value = json.loads(data.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
+    except (UnicodeError, ValueError):
         return False
     return isinstance(value, dict) and (
         value.get("kind"), value.get("schema")
@@ -519,6 +527,13 @@ def _is_managed_output_manifest_bytes(data: bytes) -> bool:
 
 def _is_managed_output_manifest_name(name: str) -> bool:
     return unicodedata.normalize("NFC", name).casefold() == _MANAGED_OUTPUT_MANIFEST
+
+
+def _path_is_within_roots(
+    path: PurePosixPath,
+    roots: set[PurePosixPath],
+) -> bool:
+    return any(candidate in roots for candidate in (path, *path.parents))
 
 
 def _update_source_digest(digest, relative: Path, data: bytes) -> None:
@@ -884,17 +899,25 @@ def build_linker(
     source_index: SourceIndex | None = None,
     detect_missing: bool = True,
 ) -> SourceLinker:
-    """Index *lean_root* and resolve the repository coordinates to link against."""
+    """Index *lean_root* and resolve repository coordinates.
+
+    A supplied source snapshot never inherits a live Git ref; callers must bind
+    that ref explicitly if they want permalinks.
+    """
+    root = Path(lean_root).expanduser().resolve()
+    if source_index is not None and source_index.root != root:
+        raise ValueError("captured source index belongs to a different Lean root")
     resolved_repository_url = repository_url
     resolved_ref = ref
     if detect_missing:
-        resolved_repository_url = repository_url or detect_repository_url(lean_root)
-        resolved_ref = ref or detect_ref(lean_root)
+        resolved_repository_url = repository_url or detect_repository_url(root)
+        if source_index is None:
+            resolved_ref = ref or detect_ref(root)
     return SourceLinker(
         index=(
             source_index
             if source_index is not None
-            else index_project(lean_root, exclude_roots=exclude_roots)
+            else index_project(root, exclude_roots=exclude_roots)
         ),
         repository_url=resolved_repository_url,
         ref=resolved_ref,

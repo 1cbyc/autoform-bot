@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -254,6 +255,26 @@ def test_index_project_keeps_supporting_a_symlinked_root(tmp_path: Path) -> None
     assert index.find("retainedCompatibility") is not None
 
 
+def test_symlinked_root_preserves_an_absolute_descendant_exclusion(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    _index(project, "def kept : Nat := 0\n", "Keep.lean")
+    generated = project / "generated"
+    generated.mkdir()
+    (generated / "Leak.lean").write_text("def leaked : Nat := 0\n", encoding="utf-8")
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(project, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    index = index_project(alias, exclude_roots=(alias / "generated",))
+
+    assert index.find("kept") is not None
+    assert index.find("leaked") is None
+
+
 def test_source_binding_rejects_root_replacement(tmp_path: Path) -> None:
     if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
         pytest.skip("directory descriptors are unavailable")
@@ -476,6 +497,57 @@ def test_portable_capture_does_not_require_path_stat_no_follow(
     snapshot = snapshot_project_sources(root)
 
     assert snapshot.index.find("portable") is not None
+
+
+def test_portable_capture_rejects_repeatable_nested_directory_redirection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "project"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "Local.lean").write_text("def local : Nat := 0\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Escaped.lean").write_text("def escaped : Nat := 0\n", encoding="utf-8")
+    displaced = root / "nested-displaced"
+
+    def restore() -> None:
+        if nested.is_symlink():
+            nested.unlink()
+            displaced.rename(nested)
+
+    def descend(path) -> bool:
+        if path.as_posix() == "nested" and not nested.is_symlink():
+            nested.rename(displaced)
+            nested.symlink_to(outside, target_is_directory=True)
+        return True
+
+    def checkpoint(event: str, _relative: str) -> None:
+        if event == "between-portable-captures":
+            restore()
+
+    original_signature = tree_snapshot_module._stat_signature
+
+    def coarse_directory_signature(metadata):
+        signature = original_signature(metadata)
+        if stat.S_ISDIR(metadata.st_mode):
+            return (*signature[:3], 0, 0, 0, 0)
+        return signature
+
+    monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", checkpoint)
+    monkeypatch.setattr(tree_snapshot_module, "_stat_signature", coarse_directory_signature)
+    bound = BoundDirectoryTree(
+        root,
+        selection=TreeSelection(include=lambda _path, _mode: True, descend=descend),
+    )
+    try:
+        with pytest.raises(TreeSnapshotError, match="changed while it was captured"):
+            bound.capture()
+    finally:
+        restore()
+        bound.close()
 
 
 def test_portable_capture_rejects_a_file_swapped_to_fifo_without_blocking(
@@ -912,6 +984,24 @@ def test_oversized_publication_manifest_read_is_bounded(
     assert observed_lengths == [lean_module._PUBLICATION_MANIFEST_BYTE_LIMIT + 1]
 
 
+@pytest.mark.parametrize("manifest_name", ["publication.json", "manifest.json"])
+def test_manifest_integer_limit_error_does_not_escape_source_indexing(
+    tmp_path: Path,
+    manifest_name: str,
+) -> None:
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / manifest_name).write_text(
+        '{"kind":"packets","schema":' + "1" * 5000 + "}\n",
+        encoding="utf-8",
+    )
+    (generated / "Visible.lean").write_text("def visible : Nat := 0\n", encoding="utf-8")
+
+    index = index_project(tmp_path)
+
+    assert index.find("visible") is not None
+
+
 def test_bounded_publication_manifest_capture_fills_short_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1281,6 +1371,29 @@ def test_managed_skeleton_output_does_not_change_source_revisions(
     assert after.generation_revision == before.generation_revision
 
 
+def test_large_managed_skeleton_manifest_still_excludes_generated_sources(
+    tmp_path: Path,
+) -> None:
+    _index(tmp_path, "def target : Nat := 1\n", name="Actual.lean")
+    packets = tmp_path / "000-review-packets"
+    packet = packets / "node" / "target.lean"
+    packet.parent.mkdir(parents=True)
+    packet.write_text("def target : Nat := 2\n", encoding="utf-8")
+    payload = json.dumps(
+        {
+            "kind": "packets",
+            "packets": ["x" * (lean_module._PUBLICATION_MANIFEST_BYTE_LIMIT + 1)],
+            "schema": "autoform-skeleton-packets/v2",
+        },
+        sort_keys=True,
+    )
+    (packets / "manifest.json").write_text(payload, encoding="utf-8")
+
+    index = index_project(tmp_path)
+
+    assert index.find("target").path == Path("Actual.lean")
+
+
 def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
     index = _index(tmp_path, "instance : Inhabited Nat := ⟨0⟩\n")
 
@@ -1369,3 +1482,34 @@ def test_build_linker_can_use_a_captured_index_without_live_detection(
     assert linker.index is index
     assert linker.repository_url is None
     assert linker.ref is None
+
+
+def test_build_linker_never_pairs_a_captured_index_with_a_live_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index = _index(tmp_path)
+
+    def unexpected_ref(_root):
+        raise AssertionError("a captured source index requires an explicit ref")
+
+    monkeypatch.setattr(lean_module, "detect_ref", unexpected_ref)
+
+    linker = build_linker(
+        tmp_path,
+        repository_url="https://github.com/owner/repo",
+        source_index=index,
+    )
+
+    assert linker.ref is None
+    assert linker.url("Outer.alpha") is None
+
+
+def test_build_linker_rejects_a_captured_index_from_another_root(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    index = _index(first)
+    second.mkdir()
+
+    with pytest.raises(ValueError, match="different Lean root"):
+        build_linker(second, source_index=index, detect_missing=False)

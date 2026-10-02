@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import threading
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -75,6 +77,62 @@ def test_capture_limit_error_exposes_a_stable_discriminator() -> None:
     assert error.limit == "max_entries"
     assert error.maximum == 3
     assert str(error) == "directory tree exceeds max_entries=3"
+
+
+def test_capture_and_close_are_serialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "payload").write_bytes(b"payload")
+    entered = threading.Event()
+    release = threading.Event()
+    close_started = threading.Event()
+    closed = threading.Event()
+    captured: list[TreeSnapshot] = []
+    failures: list[BaseException] = []
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+
+    def checkpoint(event: str, relative: str) -> None:
+        original_checkpoint(event, relative)
+        if event == "after-directory-list" and relative == "":
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("capture test did not release its checkpoint")
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", checkpoint)
+    bound = BoundDirectoryTree(root)
+
+    def capture() -> None:
+        try:
+            captured.append(bound.capture())
+        except BaseException as error:
+            failures.append(error)
+
+    def close() -> None:
+        close_started.set()
+        bound.close()
+        closed.set()
+
+    capture_thread = threading.Thread(target=capture)
+    close_thread = threading.Thread(target=close)
+    capture_thread.start()
+    assert entered.wait(5)
+    close_thread.start()
+    try:
+        assert close_started.wait(5)
+        assert not closed.wait(0.1)
+    finally:
+        release.set()
+        capture_thread.join(5)
+        close_thread.join(5)
+
+    assert failures == []
+    assert len(captured) == 1
+    assert not capture_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert closed.is_set()
 
 
 @pytest.mark.parametrize("portable", [False, True])
@@ -210,6 +268,26 @@ def test_file_byte_limit_accepts_the_boundary_and_rejects_one_more_byte(
         )
     assert captured.value.limit == "max_file_bytes"
     assert captured.value.maximum == len(payload) - 1
+
+
+@pytest.mark.parametrize("portable", [False, True])
+def test_maximum_python_file_limit_does_not_overflow_the_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    portable: bool,
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "payload").write_bytes(b"payload")
+
+    snapshot = _capture(
+        root,
+        _all_entries(TreeCaptureLimits(max_file_bytes=sys.maxsize)),
+        portable=portable,
+        monkeypatch=monkeypatch,
+    )
+
+    assert snapshot.files == (("payload", b"payload"),)
 
 
 @pytest.mark.parametrize("portable", [False, True])

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import threading
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ _FILE_FLAGS = (
     | getattr(os, "O_NONBLOCK", 0)
     | getattr(os, "O_BINARY", 0)
 )
+_READ_CHUNK_BYTES = 1024 * 1024
 _DESCRIPTOR_CAPTURE_SUPPORTED = (
     os.listdir in getattr(os, "supports_fd", ())
     and os.readlink in getattr(os, "supports_dir_fd", ())
@@ -434,6 +436,7 @@ class BoundDirectoryTree:
         expected_children: dict[str, tuple[int, int]] | None = None,
         selection: TreeSelection = ALL_ENTRIES,
     ) -> None:
+        self._lock = threading.RLock()
         self.root = lexical_absolute_path(root)
         self.expected_identity = expected_identity
         self.expected_children = dict(expected_children or {})
@@ -481,12 +484,13 @@ class BoundDirectoryTree:
 
     @property
     def identity(self) -> tuple[int, int]:
-        if self._closed:
-            raise TreeSnapshotError("directory tree binding is closed")
-        if self._binding is not None:
-            return self._binding.identity
-        assert self._portable_identity is not None
-        return self._portable_identity
+        with self._lock:
+            if self._closed:
+                raise TreeSnapshotError("directory tree binding is closed")
+            if self._binding is not None:
+                return self._binding.identity
+            assert self._portable_identity is not None
+            return self._portable_identity
 
     def _verify_expected_children(
         self,
@@ -553,7 +557,8 @@ class BoundDirectoryTree:
     def verify(self) -> None:
         """Verify the retained generation is still selected by its public path."""
 
-        self._verify(self._verification_limits or self.selection.limits)
+        with self._lock:
+            self._verify(self._verification_limits or self.selection.limits)
 
     def _verify(self, limits: TreeCaptureLimits) -> None:
         """Verify the retained generation under the active capture bounds."""
@@ -587,6 +592,10 @@ class BoundDirectoryTree:
     def capture(self, *, selection: TreeSelection | None = None) -> TreeSnapshot:
         """Capture one stable tree through the retained directory generation."""
 
+        with self._lock:
+            return self._capture_locked(selection)
+
+    def _capture_locked(self, selection: TreeSelection | None) -> TreeSnapshot:
         active_selection = self.selection if selection is None else selection
         previous_limits = self._verification_limits
         self._verification_limits = active_selection.limits
@@ -628,12 +637,13 @@ class BoundDirectoryTree:
             self._verification_limits = previous_limits
 
     def close(self) -> None:
-        if self._closed:
-            return
-        if self._binding is not None:
-            self._binding.close()
-            self._binding = None
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            if self._binding is not None:
+                self._binding.close()
+                self._binding = None
+            self._closed = True
 
 
 @contextmanager
@@ -918,7 +928,7 @@ def _read_prefix(stream, length: int) -> bytes:
     chunks: list[bytes] = []
     remaining = length
     while remaining:
-        chunk = stream.read(remaining)
+        chunk = stream.read(min(remaining, _READ_CHUNK_BYTES))
         if not chunk:
             break
         chunks.append(chunk)
@@ -1079,6 +1089,15 @@ def _capture_portable(
                 directories.append(child_relative)
                 identities.append((child_relative, _stat_signature(metadata)))
                 visit(path, child_relative, depth + 1)
+                final = os.lstat(path)
+                if (
+                    not stat.S_ISDIR(final.st_mode)
+                    or _is_reparse_point(final)
+                    or _stat_signature(final) != _stat_signature(metadata)
+                ):
+                    raise TreeSnapshotError(
+                        "directory tree changed while it was captured"
+                    )
             elif stat.S_ISREG(metadata.st_mode) and not _is_reparse_point(metadata):
                 if not selection.include(relative_path, metadata.st_mode):
                     if selection.placeholder(relative_path, metadata.st_mode):
