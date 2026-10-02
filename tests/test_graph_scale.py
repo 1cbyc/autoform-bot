@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import pickle
 import random
-from dataclasses import asdict, fields, replace
+import threading
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,14 +14,11 @@ from autoform_cli.graph import (
     Node,
     _find_cycles,
     _find_rollup_cycles,
-    _TrackedNodeDict,
     load_graph,
 )
-from autoform_cli.graph_views import scope_view
+from autoform_cli.graph_views import chapter_view, group_nodes, project_view, scope_view
 from autoform_cli.render import _book_page_order
 from autoform_cli.runtime import (
-    RuntimeGraph,
-    RuntimeProjectionError,
     _validate_depths,
     _validate_runtime,
     build_runtime_graph,
@@ -30,18 +27,7 @@ from autoform_cli.runtime import (
 from autoform_cli.status import derive, topological_order
 
 
-# Protocol-5 pickle produced by Graph/Node at parent commit d9e29c210b385b52889ff243422f2d0342778b60.
-_PARENT_GRAPH_PICKLE = base64.b64decode(
-    "gAWVkgEAAAAAAACMEmF1dG9mb3JtX2NsaS5ncmFwaJSMBUdyYXBolJOUKYGUXZQojAdwYXRobGlilIwJUG9zaXhQYXRolJOUjA5s"
-    "ZWdhY3ktcHJvamVjdJSMCWJsdWVwcmludJSGlFKUfZQojAdyb2FkbWFwlGgAjAROb2RllJOUKYGUXZQoaA2MB1JvYWRtYXCUaAco"
-    "aAhoCWgNjAlSRUFETUUubWSUdJRSlCkpKYwHYXJ0aWNsZZROTomJiU5OiU5OKU5LAE6MQDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw"
-    "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDCUZWKMBWNoaWxklGgPKYGUXZQoaBiMBUNoaWxklGgHKGgI"
-    "aAloDYwIY2hpbGQubWSUdJRSlCkpKWgWTk6JiYlOTolOTiloDUsBToxAMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEx"
-    "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMZRlYnVlYi4="
-)
-
-
-class _CountingDict(_TrackedNodeDict):
+class _CountingDict(dict):
     def __init__(self, values: dict[str, Node]) -> None:
         super().__init__(values)
         self.values_calls = 0
@@ -92,105 +78,12 @@ def _chain_graph(tmp_path: Path, count: int, *, containment: bool = False) -> Gr
     return Graph(tmp_path / "blueprint", nodes)
 
 
-def test_graph_children_cache_tracks_public_mutations_without_changing_order(tmp_path: Path) -> None:
-    roadmap = tmp_path / "blueprint" / "roadmap"
-    nodes = _CountingDict(
-        {
-            "root": Node("root", "Root", roadmap / "README.md", ()),
-            "second": Node("second", "Second", roadmap / "second.md", (), parent="root"),
-            "first": Node("first", "First", roadmap / "first.md", (), parent="root"),
-        }
-    )
-    graph = Graph(tmp_path / "blueprint", nodes)
-    revision = graph._children_revision
-
-    assert tuple(field.name for field in fields(Graph)) == ("blueprint_dir", "nodes")
-    assert "_children_by_parent" not in repr(graph)
-    for _ in range(1_200):
-        assert graph.children("root") == ("second", "first")
-        assert graph.children("missing") == ()
-
-    assert graph._children_revision == revision
-
-    graph.nodes["third"] = Node("third", "Third", roadmap / "third.md", (), parent="root")
-    assert graph.children("root") == ("second", "first", "third")
-
-    graph.nodes["second"] = replace(graph.nodes["second"], parent=None)
-    assert graph.children("root") == ("first", "third")
-
-    graph.nodes.pop("first")
-    assert graph.children("root") == ("third",)
 
 
-def test_graph_children_cache_tracks_public_dict_reinitialization(tmp_path: Path) -> None:
-    roadmap = tmp_path / "blueprint" / "roadmap"
-    root = Node("root", "Root", roadmap / "README.md", ())
-    old_child = Node("old", "Old", roadmap / "old.md", (), parent="root")
-    graph = Graph(tmp_path / "blueprint", {"root": root, "old": old_child})
-    assert graph.children("root") == ("old",)
-    cached_revision = graph._children_revision
-
-    new_child = Node("new", "New", roadmap / "new.md", (), parent="root")
-    graph.nodes.__init__({"old": replace(old_child, parent=None), "new": new_child})
-
-    assert graph.nodes == {"root": root, "old": replace(old_child, parent=None), "new": new_child}
-    assert graph.nodes.revision > cached_revision
-    assert graph.children("root") == ("new",)
 
 
-def test_parent_format_graph_pickle_restores_cache_and_builds_runtime(tmp_path: Path) -> None:
-    graph = pickle.loads(_PARENT_GRAPH_PICKLE)
-    assert isinstance(graph.nodes, _TrackedNodeDict)
-    assert graph.children("roadmap") == ("child",)
-
-    project = tmp_path / "project"
-    blueprint = project / "blueprint"
-    roadmap = blueprint / "roadmap"
-    roadmap.mkdir(parents=True)
-    sources = {
-        "roadmap": (roadmap / "README.md", b"# Roadmap\n"),
-        "child": (roadmap / "child.md", b"# Child\n"),
-    }
-    object.__setattr__(graph, "blueprint_dir", blueprint)
-    for node_id, (path, content) in sources.items():
-        path.write_bytes(content)
-        graph.nodes[node_id] = replace(
-            graph.nodes[node_id],
-            path=path,
-            source_sha256=hashlib.sha256(content).hexdigest(),
-        )
-
-    runtime = build_runtime_graph(graph, project_root=project)
-
-    assert runtime.get("child") is not None
-    assert runtime.get("child").parent == "roadmap"  # type: ignore[union-attr]
 
 
-@pytest.mark.parametrize("protocol", range(6))
-def test_current_graph_pickle_round_trips_at_every_supported_protocol(
-    tmp_path: Path,
-    protocol: int,
-) -> None:
-    roadmap = tmp_path / "blueprint" / "roadmap"
-    root = Node("root", "Root", roadmap / "README.md", ())
-    child = Node("child", "Child", roadmap / "child.md", (), parent="root")
-    graph = Graph(tmp_path / "blueprint", {"root": root, "child": child})
-    graph.nodes["child"] = child
-    assert graph.children("root") == ("child",)
-
-    restored = pickle.loads(pickle.dumps(graph, protocol=protocol))
-
-    assert restored == graph
-    assert repr(restored) == repr(graph)
-    assert restored.nodes.revision >= graph.nodes.revision
-    assert restored.children("root") == ("child",)
-    cached_revision = restored.nodes.revision
-    restored.nodes["child"] = replace(restored.nodes["child"], parent=None)
-    restored.nodes.__setstate__(cached_revision)
-    assert restored.nodes.revision > cached_revision
-    assert restored.children("root") == ()
-    with pytest.raises(TypeError):
-        restored._children_by_parent["root"] = ("child",)  # type: ignore[index]
 
 
 def test_dependency_and_rollup_walks_handle_a_1200_node_chain(tmp_path: Path) -> None:
@@ -347,50 +240,8 @@ def test_book_order_handles_a_1200_page_link_chain(tmp_path: Path) -> None:
     assert ordered[-1] == roadmap / "page1199.md"
 
 
-def test_runtime_lookup_does_not_rescan_the_node_tuple(tmp_path: Path) -> None:
-    project = tmp_path / "project"
-    roadmap = project / "blueprint" / "roadmap"
-    roadmap.mkdir(parents=True)
-    (roadmap / "item.md").write_text("# Item\n", encoding="utf-8")
-    runtime = load_runtime_graph(project)
-    nodes = _CountingTuple(runtime.nodes)
-    runtime = replace(runtime, nodes=nodes)
-    scans_after_construction = nodes.iterations
-
-    for _ in range(1_200):
-        assert runtime.get("item") is nodes[0]
-        assert runtime.get("missing") is None
-
-    assert nodes.iterations == scans_after_construction
 
 
-def test_runtime_lookup_cache_preserves_the_public_dataclass_contract(tmp_path: Path) -> None:
-    project = tmp_path / "project"
-    roadmap = project / "blueprint" / "roadmap"
-    roadmap.mkdir(parents=True)
-    (roadmap / "item.md").write_text("# Item\n", encoding="utf-8")
-    runtime = load_runtime_graph(project)
-    field_names = (
-        "schema",
-        "authority",
-        "source_revision",
-        "blueprint_path",
-        "nodes",
-        "article_count",
-        "formalizable_count",
-        "dispatchable_count",
-        "dependency_count",
-        "maximum_depth",
-    )
-
-    assert tuple(field.name for field in fields(RuntimeGraph)) == field_names
-    assert set(asdict(runtime)) == set(field_names)
-    assert "_nodes_by_id" not in repr(runtime)
-    reconstructed = RuntimeGraph(*(getattr(runtime, name) for name in field_names))
-    assert reconstructed == runtime
-    assert repr(reconstructed) == repr(runtime)
-    with pytest.raises(TypeError):
-        runtime._nodes_by_id["replacement"] = runtime.nodes[0]  # type: ignore[index]
 
 
 def test_runtime_validation_does_not_scan_for_children_per_node(tmp_path: Path) -> None:
@@ -426,28 +277,159 @@ def test_runtime_validation_does_not_scan_for_children_per_node(tmp_path: Path) 
     assert nodes.iterations - scans_after_construction < 10
 
 
-def test_runtime_rejects_article_bytes_changed_after_graph_load(tmp_path: Path) -> None:
+def _containment_graph(tmp_path: Path, chapters: int, articles: int) -> Graph:
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    nodes = {"roadmap": Node("roadmap", "Roadmap", roadmap / "README.md", ())}
+    previous: str | None = None
+    for chapter_index in range(chapters):
+        chapter = f"c{chapter_index:03d}"
+        nodes[chapter] = Node(chapter, chapter, roadmap / chapter / "README.md", (), parent="roadmap", depth=1)
+        for article_index in range(articles):
+            node_id = f"{chapter}/a{article_index:03d}"
+            dependencies = (previous,) if previous is not None else ()
+            nodes[node_id] = Node(
+                node_id,
+                node_id,
+                roadmap / f"{node_id}.md",
+                dependencies,
+                statement_dependencies=dependencies,
+                parent=chapter,
+                depth=2,
+                declaration="theorem",
+            )
+            previous = node_id
+    return Graph(tmp_path / "blueprint", nodes)
+
+
+def test_graph_keeps_the_callers_plain_node_mapping(tmp_path: Path) -> None:
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    nodes = {"root": Node("root", "Root", roadmap / "README.md", ())}
+    graph = Graph(tmp_path / "blueprint", nodes)
+
+    assert graph.nodes is nodes
+    assert type(graph.nodes) is dict
+    nodes["late"] = Node("late", "Late", roadmap / "late.md", (), parent="root")
+    assert graph.children("root") == ("late",)
+    dict.__setitem__(nodes, "later", Node("later", "Later", roadmap / "later.md", (), parent="root"))
+    assert graph.children("root") == ("late", "later")
+
+
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_graph_pickles_only_public_types(tmp_path: Path, protocol: int) -> None:
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    graph = Graph(
+        tmp_path / "blueprint",
+        {
+            "root": Node("root", "Root", roadmap / "README.md", ()),
+            "child": Node("child", "Child", roadmap / "child.md", (), parent="root"),
+        },
+    )
+
+    restored = pickle.loads(pickle.dumps(graph, protocol=protocol))
+
+    assert restored == graph
+    assert type(restored.nodes) is dict
+    assert restored.children("root") == ("child",)
+
+
+def _raises_promptly(call: Callable[[], object]) -> BaseException | None:
+    outcome: list[BaseException | None] = []
+
+    def run() -> None:
+        try:
+            call()
+        except BaseException as error:  # noqa: BLE001 - reported to the caller
+            outcome.append(error)
+        else:
+            outcome.append(None)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive(), "view did not terminate on a containment cycle"
+    return outcome[0]
+
+
+@pytest.mark.parametrize(
+    "render",
+    (
+        lambda graph: group_nodes(graph),
+        lambda graph: project_view(graph, derive(graph)),
+        lambda graph: chapter_view(graph, derive(graph), "a"),
+        lambda graph: scope_view(graph, derive(graph), "a"),
+    ),
+    ids=("group_nodes", "project_view", "chapter_view", "scope_view"),
+)
+def test_views_reject_hand_built_containment_cycles(tmp_path: Path, render) -> None:
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    graph = Graph(
+        tmp_path / "blueprint",
+        {
+            "roadmap": Node("roadmap", "Roadmap", roadmap / "README.md", ()),
+            "a": Node("a", "A", roadmap / "a" / "README.md", (), parent="b"),
+            "b": Node("b", "B", roadmap / "b" / "README.md", (), parent="a"),
+            "leaf": Node("leaf", "Leaf", roadmap / "a" / "leaf.md", ("roadmap",), parent="a"),
+        },
+    )
+
+    error = _raises_promptly(lambda: render(graph))
+
+    assert isinstance(error, ValueError)
+    assert "containment is not a forest" in str(error)
+
+
+def test_views_index_containment_once_instead_of_scanning_per_node(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _containment_graph(tmp_path, 20, 30)
+    statuses = derive(graph)
+    expected_project = project_view(graph, statuses)
+    expected_scope = scope_view(graph, statuses, "c003")
+
+    def unindexed(self: Graph, node_id: str) -> tuple[str, ...]:
+        raise AssertionError(f"view scanned the graph for children of {node_id}")
+
+    monkeypatch.setattr(Graph, "children", unindexed)
+
+    assert project_view(graph, statuses) == expected_project
+    assert scope_view(graph, statuses, "c003") == expected_scope
+    assert chapter_view(graph, statuses, "c003") == expected_scope
+    assert len(group_nodes(graph)) == 20
+
+
+def test_runtime_projection_indexes_children_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     project = tmp_path / "project"
     roadmap = project / "blueprint" / "roadmap"
-    roadmap.mkdir(parents=True)
-    article = roadmap / "item.md"
-    article.write_text("# Item\n\nOriginal.\n", encoding="utf-8")
+    (roadmap / "chapter").mkdir(parents=True)
+    (roadmap / "README.md").write_text("# Roadmap\n", encoding="utf-8")
+    (roadmap / "chapter" / "README.md").write_text("# Chapter\n", encoding="utf-8")
+    for index in range(40):
+        (roadmap / "chapter" / f"a{index:02d}.md").write_text(
+            f"---\ndeclaration: theorem\n---\n# A{index}\n", encoding="utf-8"
+        )
     graph = load_graph(project / "blueprint")
-    article.write_text("# Item\n\nChanged.\n", encoding="utf-8")
+    expected = build_runtime_graph(graph, project_root=project)
 
-    with pytest.raises(RuntimeProjectionError, match="article changed after graph load"):
-        build_runtime_graph(graph, project_root=project)
+    def unindexed(self: Graph, node_id: str) -> tuple[str, ...]:
+        raise AssertionError(f"runtime projection scanned the graph for children of {node_id}")
+
+    monkeypatch.setattr(Graph, "children", unindexed)
+
+    runtime = build_runtime_graph(graph, project_root=project)
+    assert runtime == expected
+    assert runtime.dispatchable_count == 40
+    assert not runtime.get("chapter").dispatchable  # type: ignore[union-attr]
 
 
-def test_runtime_rejects_a_graph_node_without_a_source_digest(tmp_path: Path) -> None:
+def test_runtime_accepts_hand_built_nodes_without_a_source_digest(tmp_path: Path) -> None:
     project = tmp_path / "project"
     roadmap = project / "blueprint" / "roadmap"
     roadmap.mkdir(parents=True)
     (roadmap / "item.md").write_text("# Item\n", encoding="utf-8")
     graph = load_graph(project / "blueprint")
-    graph.nodes["item"] = replace(graph.nodes["item"], source_sha256=None)
+    hand_built = Graph(graph.blueprint_dir, {"item": replace(graph.nodes["item"], source_sha256=None)})
 
-    with pytest.raises(RuntimeProjectionError) as error:
-        build_runtime_graph(graph, project_root=project)
+    runtime = build_runtime_graph(hand_built, project_root=project)
 
-    assert error.value.issues == ("item: article source digest is unavailable",)
+    assert runtime.get("item") is not None

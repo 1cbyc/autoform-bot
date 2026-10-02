@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from autoform_cli.lean import (
     index_project,
     open_project_sources,
     snapshot_project_sources,
+    strip_lean_comments,
 )
 
 _SOURCE = """import Mathlib
@@ -1120,6 +1122,41 @@ def test_outer_publication_marker_ignores_ambiguous_descendant_markers(
     assert index.index.find("hiddenByOuterMarker") is None
 
 
+@pytest.mark.parametrize("outer_kind", ["publication", "managed"])
+def test_outer_output_marker_ignores_other_manifest_type_below_it(
+    tmp_path: Path,
+    outer_kind: str,
+) -> None:
+    if outer_kind == "publication":
+        outer_name = "publication.json"
+        outer_data = b'{"schema":"autoform-publication/v2"}\n'
+        nested_name = "manifest.json"
+    else:
+        outer_name = "manifest.json"
+        outer_data = (
+            b'{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+        )
+        nested_name = "publication.json"
+    snapshot = TreeSnapshot(
+        root_identity=(1, 1),
+        directories=("", "generated", "generated/nested"),
+        files=(
+            ("generated/nested/Copied.lean", b"def hiddenByOuterMarker : Nat := 0\n"),
+            (f"generated/nested/{nested_name}", b"{}\n"),
+            (f"generated/{outer_name}", outer_data),
+        ),
+        symlinks=((f"generated/nested/{nested_name.upper()}", "elsewhere"),),
+        special=(),
+        placeholders=(),
+        omitted=(),
+        identities=(),
+    )
+
+    index = lean_module._indexed_source_snapshot(tmp_path, snapshot, ())
+
+    assert index.index.find("hiddenByOuterMarker") is None
+
+
 def test_generated_publication_descendants_do_not_change_lean_generation(
     tmp_path: Path,
 ) -> None:
@@ -1162,6 +1199,8 @@ def test_replaced_source_changes_only_the_generation_revision(tmp_path: Path) ->
     after = snapshot_project_sources(tmp_path)
 
     assert after.revision == before.revision
+    assert before.index.source_digest == before.revision
+    assert after.index.source_digest == after.revision
     assert after.generation_revision != before.generation_revision
     assert after.index.line_counts == {Path("A.lean"): 1}
 
@@ -1189,6 +1228,59 @@ def test_outer_publication_marker_deterministically_excludes_nested_markers(
     assert after.generation_revision == before.generation_revision
 
 
+@pytest.mark.parametrize(
+    ("kind", "schema"),
+    [
+        ("packets", "autoform-skeleton-packets/v1"),
+        ("packets", "autoform-skeleton-packets/v2"),
+        ("passages", "autoform-skeleton-passages/v1"),
+        ("passages", "autoform-skeleton-passages/v2"),
+    ],
+)
+def test_managed_skeleton_output_is_not_indexed_as_project_source(
+    tmp_path: Path, kind: str, schema: str
+) -> None:
+    packets = tmp_path / "000-review-packets"
+    packet = packets / "node" / "target.lean"
+    packet.parent.mkdir(parents=True)
+    packet.write_text("def target : Nat := 2\n", encoding="utf-8")
+    (packets / "manifest.json").write_text(
+        json.dumps({"kind": kind, "packets": [], "schema": schema}) + "\n",
+        encoding="utf-8",
+    )
+
+    index = _index(tmp_path, "def target : Nat := 1\n", name="Actual.lean")
+
+    assert index.find("target").path == Path("Actual.lean")
+
+
+def test_managed_skeleton_output_does_not_change_source_revisions(
+    tmp_path: Path,
+) -> None:
+    _index(tmp_path, "def target : Nat := 1\n", name="Actual.lean")
+    before = snapshot_project_sources(tmp_path)
+    packets = tmp_path / "review-packets"
+    packet = packets / "node" / "target.lean"
+    packet.parent.mkdir(parents=True)
+    packet.write_text("def target : Nat := 2\n", encoding="utf-8")
+    (packets / "manifest.json").write_text(
+        json.dumps(
+            {
+                "kind": "packets",
+                "packets": [],
+                "schema": "autoform-skeleton-packets/v2",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    after = snapshot_project_sources(tmp_path)
+
+    assert after.revision == before.revision
+    assert after.generation_revision == before.generation_revision
+
+
 def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
     index = _index(tmp_path, "instance : Inhabited Nat := ⟨0⟩\n")
 
@@ -1198,6 +1290,37 @@ def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
 def test_declaration_names_splits_a_list() -> None:
     assert declaration_names("A.b, C.d  E.f") == ["A.b", "C.d", "E.f"]
     assert declaration_names("") == []
+
+
+def test_quoted_names_keep_spaces_and_dots_inside_one_component(tmp_path: Path) -> None:
+    index = _index(tmp_path, "namespace A\ntheorem «b c.d» : True := trivial\nend A\n")
+
+    assert declaration_names("A.«b c.d», X.y") == ["A.«b c.d»", "X.y"]
+    assert index.find("A.«b c.d»") is not None
+
+
+def test_comment_stripping_preserves_comment_markers_inside_strings() -> None:
+    source = (
+        'def a := "a--b /- c -/" -- remove me\n'
+        'def b := r#"d--e /- f -/"# /- remove me -/\n'
+        'def c := s!"value {"a--b"}" -- remove me\n'
+        'def d := s!"brace {\'{\'} and {"a/-b"}" -- remove me\n'
+        "def «e--f» : Char := '-'"
+    )
+
+    assert strip_lean_comments(source) == (
+        'def a := "a--b /- c -/"\n'
+        'def b := r#"d--e /- f -/"#\n'
+        'def c := s!"value {"a--b"}"\n'
+        'def d := s!"brace {\'{\'} and {"a/-b"}"\n'
+        "def «e--f» : Char := '-'"
+    )
+
+
+def test_comment_stripping_reads_slash_dash_dash_slash_as_a_docstring() -> None:
+    # Lean reads `/--` as a docstring opener, so `/--/ ... -/` is one comment.
+    assert strip_lean_comments("/--/ KEEPOUT -/\ndef d : Nat := 6") == "def d : Nat := 6"
+    assert strip_lean_comments("/-!/ KEEPOUT -/\ndef d : Nat := 6") == "def d : Nat := 6"
 
 
 def test_permalink_pins_the_commit(tmp_path: Path) -> None:

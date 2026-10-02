@@ -92,6 +92,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
         assert {
             "autoform_cli/__main__.py",
             "autoform_cli/graph.py",
+            "autoform_cli/probes/skeleton_probe.lean",
             "autoform_cli/visualize.py",
             "servers/lean_client.py",
             "servers/lean_runtime.py",
@@ -113,7 +114,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             next(name for name in names if name.endswith(".dist-info/METADATA"))
         ).decode()
         assert "Requires-Dist: psutil>=5.9" in metadata
-        assert "Requires-Dist: tomli" not in metadata
+        assert "Requires-Dist: tomli>=2.0.1; python_version < '3.11'" in metadata
         assert "Provides-Extra: repl" in metadata
         archive.extractall(site)
 

@@ -32,15 +32,13 @@ from ._tree_snapshot import (
     TreeSnapshotError,
 )
 
-_LINE_COMMENT = re.compile(r"--.*$")
-_NAMESPACE = re.compile(r"^\s*namespace\s+(\S+)")
+_NAMESPACE = re.compile(r"^\s*namespace\s+(.+)$")
 _SECTION = re.compile(r"^\s*section\b\s*(\S*)")
 _END = re.compile(r"^\s*end\b\s*(\S*)")
 _DECLARATION = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)*"
     r"(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*"
-    r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+"
-    r"([^\s:(){}\[\]⦃⦄,]+)"
+    r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+(.+)$"
 )
 _IGNORED_DIRECTORIES = frozenset(
     {
@@ -58,6 +56,8 @@ _IGNORED_DIRECTORY_PREFIXES = (".autoform-publication-",)
 _PUBLICATION_MANIFEST = "publication.json"
 _PUBLICATION_SCHEMAS = frozenset({"autoform-publication/v1", "autoform-publication/v2"})
 _PUBLICATION_MANIFEST_BYTE_LIMIT = 1024 * 1024
+_MANAGED_OUTPUT_MANIFEST = "manifest.json"
+_MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT = 1024 * 1024
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_DIRECTORY", 0)
@@ -65,6 +65,17 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
 )
 _DESCRIPTOR_LISTING_SUPPORTED = os.listdir in getattr(os, "supports_fd", ())
+#: Schemas of the skeleton command's packet and passage manifests.
+PACKET_SCHEMA = "autoform-skeleton-packets/v2"
+PASSAGE_SCHEMA = "autoform-skeleton-passages/v2"
+MANAGED_OUTPUT_SCHEMAS = frozenset(
+    {
+        ("packets", "autoform-skeleton-packets/v1"),
+        ("packets", PACKET_SCHEMA),
+        ("passages", "autoform-skeleton-passages/v1"),
+        ("passages", PASSAGE_SCHEMA),
+    }
+)
 
 @dataclass(frozen=True, slots=True)
 class Declaration:
@@ -82,6 +93,7 @@ class SourceIndex:
 
     root: Path
     declarations: dict[str, Declaration]
+    source_digest: str
     line_counts: dict[Path, int] = field(default_factory=dict)
 
     def find(self, name: str) -> Declaration | None:
@@ -140,7 +152,8 @@ def index_project(
     """Scan ``*.lean`` beneath *root* and index declarations by full name."""
     root_path = Path(root).expanduser().resolve()
     if not root_path.is_dir():
-        return SourceIndex(root=root_path, declarations={})
+        digest = hashlib.sha256(b"autoform-lean-source-index/v1\0").hexdigest()
+        return SourceIndex(root=root_path, declarations={}, source_digest=digest)
     return snapshot_project_sources(root_path, exclude_roots=exclude_roots).index
 
 
@@ -252,7 +265,11 @@ def _lean_tree_selection(
         byte_limit=lambda path: (
             _PUBLICATION_MANIFEST_BYTE_LIMIT
             if _is_publication_manifest_name(path.name)
-            else None
+            else (
+                _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT
+                if _is_managed_output_manifest_name(path.name)
+                else None
+            )
         ),
         record_omitted=False,
     )
@@ -276,6 +293,7 @@ def _lean_snapshot_includes(
         or stat.S_ISLNK(mode)
         or relative.suffix.casefold() == ".lean"
         or _is_publication_manifest_name(relative.name)
+        or _is_managed_output_manifest_name(relative.name)
     )
 
 
@@ -306,11 +324,17 @@ def _indexed_source_snapshot(
         PurePosixPath,
         list[tuple[str, bytes | None]],
     ] = {}
+    managed_output_manifests: dict[
+        PurePosixPath,
+        list[tuple[str, bytes | None]],
+    ] = {}
 
     def add_manifest(relative: str, kind: str, data: bytes | None = None) -> None:
         path = PurePosixPath(relative)
         if _is_publication_manifest_name(path.name):
             publication_manifests.setdefault(path.parent, []).append((kind, data))
+        if _is_managed_output_manifest_name(path.name):
+            managed_output_manifests.setdefault(path.parent, []).append((kind, data))
 
     for relative, data in snapshot.files:
         add_manifest(relative, "file", data)
@@ -323,34 +347,58 @@ def _indexed_source_snapshot(
     for relative in snapshot.directories:
         add_manifest(relative, "directory")
 
-    publication_roots: set[PurePosixPath] = set()
-    for parent, manifests in sorted(
-        publication_manifests.items(),
-        key=lambda item: (len(item[0].parts), item[0].as_posix()),
+    manifest_groups = (
+        ("publication", publication_manifests, _is_publication_manifest_bytes),
+        ("managed output", managed_output_manifests, _is_managed_output_manifest_bytes),
+    )
+    recognized_roots = {
+        parent
+        for _label, groups, recognizes in manifest_groups
+        for parent, manifests in groups.items()
+        if len(manifests) == 1
+        and manifests[0][0] == "file"
+        and manifests[0][1] is not None
+        and recognizes(manifests[0][1])
+    }
+    ignored_roots: set[PurePosixPath] = set()
+    for parent in sorted(
+        recognized_roots,
+        key=lambda path: (len(path.parts), path.as_posix()),
     ):
-        if any(parent == root or parent.is_relative_to(root) for root in publication_roots):
-            continue
-        if len(manifests) != 1:
-            raise OSError(f"ambiguous publication manifests in {parent.as_posix()}")
-        kind, data = manifests[0]
-        if kind != "file" or data is None:
-            raise OSError(
-                f"publication manifest is not a regular file in {parent.as_posix()}"
-            )
-        if _is_publication_manifest_bytes(data):
-            publication_roots.add(parent)
+        if not any(
+            parent == root or parent.is_relative_to(root) for root in ignored_roots
+        ):
+            ignored_roots.add(parent)
 
-    def in_publication(relative_text: str) -> bool:
+    for label, groups, _recognizes in manifest_groups:
+        for parent, manifests in sorted(
+            groups.items(),
+            key=lambda item: (len(item[0].parts), item[0].as_posix()),
+        ):
+            if any(
+                parent == root or parent.is_relative_to(root)
+                for root in ignored_roots
+            ):
+                continue
+            if len(manifests) != 1:
+                raise OSError(f"ambiguous {label} manifests in {parent.as_posix()}")
+            kind, data = manifests[0]
+            if kind != "file" or data is None:
+                raise OSError(
+                    f"{label} manifest is not a regular file in {parent.as_posix()}"
+                )
+
+    def in_ignored_root(relative_text: str) -> bool:
         relative = PurePosixPath(relative_text)
         return any(
-            relative == publication or relative.is_relative_to(publication)
-            for publication in publication_roots
+            relative == ignored or relative.is_relative_to(ignored)
+            for ignored in ignored_roots
         )
 
     unsupported = [
         (relative, reason)
         for relative, reason in snapshot.unsupported_entries()
-        if not in_publication(relative)
+        if not in_ignored_root(relative)
         and PurePosixPath(relative).suffix.casefold() == ".lean"
     ]
     if unsupported:
@@ -368,8 +416,8 @@ def _indexed_source_snapshot(
         ):
             continue
         if any(
-            relative == publication or relative.is_relative_to(publication)
-            for publication in publication_roots
+            relative == ignored or relative.is_relative_to(ignored)
+            for ignored in ignored_roots
         ):
             continue
         relative_path = Path(relative.as_posix())
@@ -381,24 +429,30 @@ def _indexed_source_snapshot(
         line_counts[relative_path] = len(text.splitlines())
         for declaration in _scan(text, relative_path):
             declarations.setdefault(declaration.name, declaration)
+    source_digest = digest.hexdigest()
     return IndexedSourceSnapshot(
-        SourceIndex(root=root, declarations=declarations, line_counts=line_counts),
-        digest.hexdigest(),
-        _lean_generation_revision(snapshot, publication_roots),
+        SourceIndex(
+            root=root,
+            declarations=declarations,
+            source_digest=source_digest,
+            line_counts=line_counts,
+        ),
+        source_digest,
+        _lean_generation_revision(snapshot, ignored_roots),
     )
 
 
 def _lean_generation_revision(
     snapshot: TreeSnapshot,
-    publication_roots: set[PurePosixPath],
+    ignored_roots: set[PurePosixPath],
 ) -> str:
     """Hash only effective Lean inputs and their ancestor directories."""
 
     def retained_entry(relative_text: str) -> bool:
         relative = PurePosixPath(relative_text)
         return relative.suffix.casefold() == ".lean" and not any(
-            relative == publication or relative.is_relative_to(publication)
-            for publication in publication_roots
+            relative == ignored or relative.is_relative_to(ignored)
+            for ignored in ignored_roots
         )
 
     files = tuple(entry for entry in snapshot.files if retained_entry(entry[0]))
@@ -449,6 +503,22 @@ def _is_publication_manifest_bytes(data: bytes) -> bool:
 
 def _is_publication_manifest_name(name: str) -> bool:
     return unicodedata.normalize("NFC", name).casefold() == _PUBLICATION_MANIFEST
+
+
+def _is_managed_output_manifest_bytes(data: bytes) -> bool:
+    if len(data) > _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT:
+        return False
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(value, dict) and (
+        value.get("kind"), value.get("schema")
+    ) in MANAGED_OUTPUT_SCHEMAS
+
+
+def _is_managed_output_manifest_name(name: str) -> bool:
+    return unicodedata.normalize("NFC", name).casefold() == _MANAGED_OUTPUT_MANIFEST
 
 
 def _update_source_digest(digest, relative: Path, data: bytes) -> None:
@@ -647,16 +717,16 @@ def _scan(text: str, relative: Path) -> list[Declaration]:
     found: list[Declaration] = []
     namespaces: list[str] = []
     scopes: list[str | None] = []
-    comment_depth = 0
 
-    for number, raw in enumerate(text.splitlines(), start=1):
-        line, comment_depth = _strip_comments(raw, comment_depth)
+    for number, line in enumerate(_without_lean_comments(text).splitlines(), start=1):
         if not line.strip():
             continue
 
         namespace_match = _NAMESPACE.match(line)
         if namespace_match:
-            name = namespace_match.group(1)
+            name = _name_token(namespace_match.group(1))
+            if name is None:
+                continue
             namespaces.append(name)
             scopes.append(name)
             continue
@@ -676,41 +746,228 @@ def _scan(text: str, relative: Path) -> list[Declaration]:
 
         declaration_match = _DECLARATION.match(line)
         if declaration_match:
-            keyword, name = declaration_match.group(1), declaration_match.group(2)
+            keyword = declaration_match.group(1)
+            name = _name_token(declaration_match.group(2))
+            if name is None:
+                continue
             qualified = ".".join([*namespaces, name])
             found.append(Declaration(qualified, relative, number, keyword))
     return found
 
 
-def _strip_comments(line: str, depth: int) -> tuple[str, int]:
-    """Remove Lean comments from *line*, carrying block-comment depth across."""
+def _name_token(text: str) -> str | None:
+    """Read one possibly guillemet-quoted Lean identifier from ``text``."""
+
+    quoted = False
+    for index, character in enumerate(text):
+        if character == "«":
+            if quoted:
+                return None
+            quoted = True
+        elif character == "»":
+            if not quoted:
+                return None
+            quoted = False
+        elif not quoted and (character.isspace() or character in ":(){}[]⦃⦄,"):
+            return text[:index] or None
+    return None if quoted else text or None
+
+
+def _raw_string_close(text: str, index: int) -> str | None:
+    """Return the closing delimiter when ``text[index:]`` starts a raw string."""
+
+    if text[index : index + 1] != "r":
+        return None
+    cursor = index + 1
+    while text[cursor : cursor + 1] == "#":
+        cursor += 1
+    if text[cursor : cursor + 1] != '"':
+        return None
+    return '"' + "#" * (cursor - index - 1)
+
+
+@dataclass(slots=True)
+class _LexContext:
+    kind: str
+    close: str = ""
+    interpolated: bool = False
+    escaped: bool = False
+    depth: int = 0
+
+
+def _interpolated_quote(text: str, index: int) -> bool:
+    """Whether the quote at ``index`` starts an interpolated string macro."""
+
+    if index < 2 or text[index - 1] != "!":
+        return False
+    cursor = index - 2
+    if not (text[cursor].isalnum() or text[cursor] == "_"):
+        return False
+    while cursor >= 0 and (text[cursor].isalnum() or text[cursor] in {"_", "'"}):
+        cursor -= 1
+    return cursor < index - 2
+
+
+def _starts_char_literal(text: str, index: int) -> bool:
+    """Distinguish a character literal from the apostrophe in a Lean name."""
+
+    if index > 0 and (text[index - 1].isalnum() or text[index - 1] in {"_", "'"}):
+        return False
+    escaped = False
+    for character in text[index + 1 :]:
+        if character == "\n":
+            return False
+        if not escaped and character == "'":
+            return True
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+    return False
+
+
+def _without_lean_comments(text: str) -> str:
+    """Remove nested Lean comments without treating string contents as comments.
+
+    Newlines inside comments are retained so declaration line numbers remain
+    coordinates into the original file.
+    """
+
     out: list[str] = []
     index = 0
-    while index < len(line):
-        pair = line[index : index + 2]
-        if depth:
+    block_depth = 0
+    contexts = [_LexContext("code")]
+    while index < len(text):
+        pair = text[index : index + 2]
+        if block_depth:
             if pair == "-/":
-                depth -= 1
+                block_depth -= 1
                 index += 2
                 continue
             if pair == "/-":
-                depth += 1
+                block_depth += 1
                 index += 2
                 continue
+            if text[index] == "\n":
+                out.append("\n")
             index += 1
             continue
-        if pair == "/-":
-            depth += 1
-            index += 2
+        context = contexts[-1]
+        if context.kind == "string":
+            if not context.escaped and text.startswith(context.close, index):
+                out.append(context.close)
+                index += len(context.close)
+                contexts.pop()
+                continue
+            char = text[index]
+            if context.interpolated and not context.escaped and char == "{":
+                if text[index : index + 2] == "{{":
+                    out.append("{{")
+                    index += 2
+                    continue
+                out.append(char)
+                index += 1
+                contexts.append(_LexContext("interpolation", depth=1))
+                continue
+            out.append(char)
+            index += 1
+            if context.close in {'"', "'"}:
+                if context.escaped:
+                    context.escaped = False
+                elif char == "\\":
+                    context.escaped = True
             continue
-        out.append(line[index])
+        raw_close = _raw_string_close(text, index)
+        if raw_close is not None:
+            prefix_length = len(raw_close) + 1
+            out.append(text[index : index + prefix_length])
+            index += prefix_length
+            contexts.append(_LexContext("string", close=raw_close))
+            continue
+        if text[index] == '"':
+            out.append('"')
+            index += 1
+            contexts.append(
+                _LexContext(
+                    "string",
+                    close='"',
+                    interpolated=_interpolated_quote(text, index - 1),
+                )
+            )
+            continue
+        if text[index] == "«":
+            out.append("«")
+            index += 1
+            contexts.append(_LexContext("string", close="»"))
+            continue
+        if text[index] == "'" and _starts_char_literal(text, index):
+            out.append("'")
+            index += 1
+            contexts.append(_LexContext("string", close="'"))
+            continue
+        if pair == "--":
+            newline = text.find("\n", index + 2)
+            if newline < 0:
+                break
+            out.append("\n")
+            index = newline + 1
+            continue
+        if pair == "/-":
+            block_depth = 1
+            out.append(" ")
+            # `/--` and `/-!` open a docstring whose body starts after the
+            # marker, so `/--/ text -/` is closed only by the final `-/`.
+            index += 3 if text[index + 2 : index + 3] in {"-", "!"} else 2
+            continue
+        if context.kind == "interpolation":
+            if text[index] == "{":
+                context.depth += 1
+            elif text[index] == "}":
+                context.depth -= 1
+                if context.depth == 0:
+                    out.append("}")
+                    index += 1
+                    contexts.pop()
+                    continue
+        out.append(text[index])
         index += 1
-    return _LINE_COMMENT.sub("", "".join(out)), depth
+    return "".join(out)
+
+
+def strip_lean_comments(text: str) -> str:
+    """Remove every line and block comment, docstrings included, from Lean source.
+
+    Blank lines left behind are dropped, so the result is what the kernel sees
+    and nothing an author wrote for a reader.
+    """
+
+    kept: list[str] = []
+    for line in _without_lean_comments(text).splitlines():
+        if line.strip():
+            kept.append(line.rstrip())
+    return "\n".join(kept)
 
 
 def declaration_names(lean: str) -> list[str]:
     """Split a ``lean:`` frontmatter value into individual declaration names."""
-    return [name.strip() for name in lean.replace(",", " ").split() if name.strip()]
+
+    names: list[str] = []
+    current: list[str] = []
+    quoted = False
+    for character in lean:
+        if character == "«":
+            quoted = True
+        elif character == "»":
+            quoted = False
+        if not quoted and (character == "," or character.isspace()):
+            if current:
+                names.append("".join(current))
+                current = []
+        else:
+            current.append(character)
+    if current:
+        names.append("".join(current))
+    return names
 
 
 @dataclass(frozen=True, slots=True)
@@ -807,6 +1064,9 @@ def _git(root: str | Path, *arguments: str) -> str | None:
 __all__ = [
     "IndexedSourceSnapshot",
     "Declaration",
+    "MANAGED_OUTPUT_SCHEMAS",
+    "PACKET_SCHEMA",
+    "PASSAGE_SCHEMA",
     "SourceIndex",
     "SourceLinker",
     "build_linker",
@@ -816,4 +1076,5 @@ __all__ = [
     "index_project",
     "project_source_revision",
     "snapshot_project_sources",
+    "strip_lean_comments",
 ]
