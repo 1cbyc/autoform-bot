@@ -39,8 +39,10 @@ from autoform_cli.skeleton import (
     _run_bounded_command,
     _replace_outputs,
     _stage_output,
+    _terminate_process_tree,
     _hash_module_files,
     _local_safety_issue,
+    _process_is_alive,
     _project_control_snapshot,
     _without_comments,
     _probe_record_issue,
@@ -511,6 +513,70 @@ def _pid_is_live(pid: int) -> bool:
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
     except psutil.NoSuchProcess:
         return False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="termination signals are POSIX-specific")
+def test_bounded_command_finishes_failure_teardown_when_signalled_during_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A timeout starts teardown and SIGTERM arrives as it begins. Cleanup must still
+    # reach the child that ignores SIGTERM, then report the timeout and re-deliver.
+    parent_pid, child_pid = tmp_path / "parent.pid", tmp_path / "child.pid"
+
+    def publish_pid(path: Path) -> str:
+        return (
+            f"pathlib.Path({str(path)!r} + '.tmp').write_text(str(os.getpid())); "
+            f"os.replace({str(path)!r} + '.tmp', {str(path)!r}); "
+        )
+
+    child = (
+        "import os, pathlib, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        + publish_pid(child_pid)
+        + "time.sleep(60)"
+    )
+    program = (
+        "import os, pathlib, subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}]); "
+        + publish_pid(parent_pid)
+        + "time.sleep(60)"
+    )
+    tree: list[psutil.Process] = []
+    monotonic = time.monotonic
+
+    def time_out_once_both_run() -> float:
+        if not tree and parent_pid.exists() and child_pid.exists():
+            tree.extend(psutil.Process(int(path.read_text(encoding="utf-8"))) for path in (parent_pid, child_pid))
+            return monotonic() + 3600
+        return monotonic()
+
+    def signal_then_terminate(*args: object, **kwargs: object) -> None:
+        signal.raise_signal(signal.SIGTERM)
+        _terminate_process_tree(*args, **kwargs)  # type: ignore[arg-type]
+
+    delivered: list[int] = []
+    previous = signal.signal(signal.SIGTERM, lambda signum, frame: delivered.append(signum))
+    survivors = tree
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr("autoform_cli.skeleton.time.monotonic", time_out_once_both_run)
+            patch.setattr("autoform_cli.skeleton._terminate_process_tree", signal_then_terminate)
+            with pytest.raises(SkeletonError) as failure:
+                _bounded(tmp_path, program, timeout=60)
+        deadline = monotonic() + 5
+        while survivors and monotonic() < deadline:
+            survivors = [process for process in survivors if _process_is_alive(process)]
+            time.sleep(0.01)
+        assert len(tree) == 2
+        assert not survivors
+        assert "test command timed out" in str(failure.value)
+        assert delivered == [signal.SIGTERM]
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        for process in survivors:
+            try:
+                process.kill()
+            except psutil.Error:
+                pass
 
 
 def test_bounded_command_cleanup_reserves_time_and_reuses_final_deadline(
