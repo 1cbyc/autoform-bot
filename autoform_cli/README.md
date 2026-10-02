@@ -373,6 +373,8 @@ tree, so removed declarations cannot leave stale packets behind. A concurrent
 change detected before commit aborts publication instead of being overwritten.
 If the isolated old tree changes later, Autoform preserves it at a reported
 recovery path instead of deleting it.
+Packet and passage manifests use their v2 schemas; v1 output trees are still
+recognized and replaced during an upgrade.
 
 An unresolved selected declaration makes the report incomplete and prevents
 all packet and passage publication; `--output` alone can still record that

@@ -1623,6 +1623,20 @@ def test_cli_rejects_passages_without_packets(tmp_path: Path, capsys) -> None:
     assert captured.err == "error: --passages requires --packets\n"
 
 
+def test_cli_reports_unsafe_packet_output_without_a_traceback(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    packets = tmp_path / "packets"
+    packets.mkdir()
+    (packets / "keep.txt").write_text("mine\n", encoding="utf-8")
+
+    assert _cli(tmp_path, monkeypatch, "--packets", packets) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "refusing to overwrite non-Autoform packet output" in captured.err
+
+
 def test_cli_rejects_a_report_path_inside_the_packet_tree(tmp_path: Path, capsys) -> None:
     packets = tmp_path / "packets"
     assert main(
@@ -2950,7 +2964,16 @@ def test_cli_does_not_publish_packets_for_unresolved_declarations(
     assert "refusing to publish review packets" in capsys.readouterr().err
 
 
-def test_packet_publication_replaces_stale_managed_output(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("packet_schema", "passage_schema"),
+    [
+        (PACKET_SCHEMA, PASSAGE_SCHEMA),
+        ("autoform-skeleton-packets/v1", "autoform-skeleton-passages/v1"),
+    ],
+)
+def test_packet_publication_replaces_stale_managed_output(
+    tmp_path: Path, packet_schema: str, passage_schema: str
+) -> None:
     report = _fake_report(tmp_path)
     packets = tmp_path / "packets"
     passages = tmp_path / "passages"
@@ -2960,6 +2983,12 @@ def test_packet_publication_replaces_stale_managed_output(tmp_path: Path) -> Non
     stale_passage = passages / "stale.txt"
     stale_packet.write_text("stale\n", encoding="utf-8")
     stale_passage.write_text("stale\n", encoding="utf-8")
+    for root, schema in ((packets, packet_schema), (passages, passage_schema)):
+        manifest_path = root / PACKET_MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["schema"] = schema
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
     write_packets(report, packets, passages=passages)
 
     assert not stale_packet.exists()
@@ -2978,39 +3007,6 @@ def test_packet_publication_refuses_unmanaged_or_symlink_output(tmp_path: Path) 
 
     with pytest.raises(SkeletonError, match="non-Autoform packet output"):
         write_packets(report, unmanaged)
-
-    legacy = tmp_path / "legacy"
-    legacy.mkdir()
-    (legacy / PACKET_MANIFEST).write_text(
-        json.dumps(
-            {
-                "kind": "packets",
-                "packets": [],
-                "schema": "autoform-skeleton-packets/v1",
-            }
-        ),
-        encoding="utf-8",
-    )
-    valuable_legacy = legacy / "valuable.txt"
-    valuable_legacy.write_text("keep me\n", encoding="utf-8")
-    with pytest.raises(SkeletonError, match="non-Autoform packet output"):
-        write_packets(report, legacy)
-    assert valuable_legacy.read_text(encoding="utf-8") == "keep me\n"
-
-    legacy_passages = tmp_path / "legacy-passages"
-    legacy_passages.mkdir()
-    (legacy_passages / PACKET_MANIFEST).write_text(
-        json.dumps(
-            {
-                "kind": "passages",
-                "passages": [],
-                "schema": "autoform-skeleton-passages/v1",
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(SkeletonError, match="non-Autoform packet output"):
-        write_packets(report, tmp_path / "fresh-packets", passages=legacy_passages)
 
     outside = tmp_path / "outside"
     outside.mkdir()

@@ -36,6 +36,7 @@ import psutil
 
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import (
+    MANAGED_OUTPUT_SCHEMAS,
     PACKET_SCHEMA,
     PASSAGE_SCHEMA,
     SourceIndex,
@@ -50,9 +51,6 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 SKELETON_SCHEMA = "autoform-skeleton/v4"
 SEMANTIC_SCHEMA = "autoform-lean-expr/v4"
-_WRITABLE_OUTPUT_SCHEMAS = frozenset(
-    {("packets", PACKET_SCHEMA), ("passages", PASSAGE_SCHEMA)}
-)
 
 #: Every line the probe wants read back starts with this marker, so Lean's own
 #: informational output can never be mistaken for a result.
@@ -2509,7 +2507,7 @@ def _validate_managed_output(path: Path, *, kind: str) -> tuple[int, int, str] |
     if not (
         isinstance(payload, dict)
         and payload.get("kind") == kind
-        and (kind, payload.get("schema")) in _WRITABLE_OUTPUT_SCHEMAS
+        and (kind, payload.get("schema")) in MANAGED_OUTPUT_SCHEMAS
         and isinstance(payload.get(kind), list)
     ):
         raise SkeletonError([f"refusing to overwrite non-Autoform packet output: {path}"])
