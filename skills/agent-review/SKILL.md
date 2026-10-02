@@ -32,16 +32,23 @@ correctness without showing how it was checked. If required sources are absent,
 return insufficient evidence rather than guessing.
 
 Except in the isolated read-back-judge role, regenerate skeleton evidence from
-the exact candidate after its Lean build, and only in a trusted checkout or an
-operating-system sandbox: extraction runs Lake configuration and project
-metaprograms, which can forge its report. A read-back judge must not regenerate
-or inspect that evidence; its coordinator does so before dispatch. Treat a
-stale-build refusal as insufficient evidence; never pair current source with an
-older build. Record the skeleton hash as a drift checksum, the evidence hash for
-the packet read, and, for a faithfulness verdict, the article review hash. These
-are advisory provenance, not reviewer authentication or an approval key. A
-read-back verdict also copies its manifest and raw read-back hashes as specified
-by its rubric.
+the exact candidate after its Lean build.
+Do that only in a trusted checkout or an operating-system sandbox: the command
+evaluates Lake configuration and project Lean metaprograms, and its resource
+bounds are not a security boundary.
+A read-back judge must not regenerate or inspect that evidence; its coordinator
+does so before dispatch.
+Treat a stale-build refusal as insufficient evidence; never approve a current
+source excerpt paired with an older compiled declaration. Record the skeleton
+hash as a drift checksum for the elaborated declaration and trust context, and
+the evidence hash for the exact packet that was read. For a
+source-faithfulness verdict, record the article review hash that binds the joint
+packet to the cited passage, its locator, and the skeleton hash. These hashes
+are provenance evidence, not reviewer authentication or an approval key.
+A read-back verdict also copies its manifest and raw read-back hashes as
+specified by its rubric.
+Candidate code runs during extraction and can forge process output, so treat
+its report as advisory when the checkout is not trusted.
 
 Report findings first, ordered by severity and tied to files or nodes. Then give
 the rubric scores, weighted verdict, commands run, unresolved questions, and a

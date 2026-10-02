@@ -327,9 +327,14 @@ report identifies the exact blueprint, its complete target set, and whether
 the extraction covered all targets or an explicit `--node` selection. It
 quotes each trusted definition's source and records theorem
 dependencies by elaborated signature, so it stands on its own without ever
-copying a theorem proof. Shared material is stated once, in the top-level
-`trusted`, `semantics`, and `boundary_modules` tables, and each declaration
-names the entries it uses.
+copying a theorem proof. Declarations in one project share most of what they
+trust, so the report states each trusted declaration, each external
+constant's semantic material, and each boundary module's identity once, in the
+top-level `trusted`, `semantics`, and `boundary_modules` tables, and each
+declaration names the entries it uses; the probe's own output is shared the
+same way. The probe also states each elaborated subterm of 256 bytes or more
+once, since proof terms repeat large subterms heavily; the report keeps each
+material's full text.
 
 Run skeleton extraction only in a trusted checkout or an operating-system
 sandbox. Lake evaluates `lakefile.lean`, and the generated probe imports project
@@ -348,8 +353,11 @@ build writes) for the transitive external boundary. Local source spelling and
 comments do not enter the hash, while macro expansion, synthesized instance
 bodies, types, and definition bodies do. Proof axioms, toolchain changes, and
 unrelated edits in an external module or its imports may also rotate it.
-A dependency library rooted at `Init`, `Lean`, or `Std` hides the toolchain's
-copy from the probe, so extraction stops with an error.
+Only modules whose `.olean` lies in the toolchain's own `lib/lean` count as
+core and stay outside the boundary; a dependency module named `Lake.Foo` is
+external like any other. A dependency library rooted at `Init`, `Lean`, or
+`Std` hides the toolchain's copy from the probe, so extraction stops with an
+error.
 Compiler-generated matcher and recursor bodies stay in the hash even though
 they are folded out of the human reading list.
 An article with several `lean:` names has one hash over all of them, printed as
@@ -373,6 +381,8 @@ tree, so removed declarations cannot leave stale packets behind. A concurrent
 change detected before commit aborts publication instead of being overwritten.
 If the isolated old tree changes later, Autoform preserves it at a reported
 recovery path instead of deleting it.
+Packet and passage manifests use their v2 schemas; v1 output trees are still
+recognized and replaced during an upgrade.
 
 An unresolved selected declaration makes the report incomplete and prevents
 all packet and passage publication; `--output` alone can still record that
@@ -391,7 +401,8 @@ every module the run imports but not the file's `local` notation.
 A source it cannot parse there (a body that uses `local notation`) is withheld
 if it may hold a comment. Source containing a known non-builtin token with
 `--` or `/-` is also withheld unless that token was globally active through an
-import. A withheld source leaves the declaration's
+import, since the probe cannot reconstruct when a same-module token was declared
+or where a scoped token was active. A withheld source leaves the declaration's
 signatures and kernel material in the packet and does not make the article
 unresolved. A `local` token containing `--` is invisible to the probe: the
 packet can then show code as a comment or a comment as code.
