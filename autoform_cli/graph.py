@@ -11,10 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
 
 
@@ -98,90 +96,12 @@ class Node:
         return self.declaration is not None
 
 
-class _TrackedNodeDict(dict[str, Node]):
-    """A normal mutable node dictionary with a cheap structural revision."""
-
-    __slots__ = ("_revision",)
-
-    def __init__(self, *args, **kwargs) -> None:
-        self._revision = getattr(self, "_revision", -1) + 1
-        super().__init__(*args, **kwargs)
-
-    @property
-    def revision(self) -> int:
-        return getattr(self, "_revision", 0)
-
-    def _touch(self) -> None:
-        self._revision = getattr(self, "_revision", 0) + 1
-
-    def __setitem__(self, key: str, value: Node) -> None:
-        self._touch()
-        super().__setitem__(key, value)
-
-    def __delitem__(self, key: str) -> None:
-        self._touch()
-        super().__delitem__(key)
-
-    def clear(self) -> None:
-        self._touch()
-        super().clear()
-
-    def pop(self, key, *args):
-        self._touch()
-        return super().pop(key, *args)
-
-    def popitem(self):
-        self._touch()
-        return super().popitem()
-
-    def setdefault(self, key, default=None):
-        self._touch()
-        return super().setdefault(key, default)
-
-    def update(self, *args, **kwargs) -> None:
-        self._touch()
-        super().update(*args, **kwargs)
-
-    def __ior__(self, other):
-        self._touch()
-        return super().__ior__(other)
-
-    def __getstate__(self) -> int:
-        return self._revision
-
-    def __setstate__(self, state: int) -> None:
-        self._revision = max(self.revision, state)
-
-
-class _GraphCache:
-    __slots__ = ("_children_by_parent", "_children_revision")
-
-    _children_by_parent: Mapping[str | None, tuple[str, ...]]
-    _children_revision: int
-
-
 @dataclass(frozen=True, slots=True)
-class Graph(_GraphCache):
+class Graph:
     """A validated blueprint graph, keyed by stable node id."""
 
     blueprint_dir: Path
     nodes: dict[str, Node]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.nodes, _TrackedNodeDict):
-            object.__setattr__(self, "nodes", _TrackedNodeDict(self.nodes))
-        self._refresh_children()
-
-    def _refresh_children(self) -> None:
-        children: dict[str | None, list[str]] = {}
-        for node in self.nodes.values():
-            children.setdefault(node.parent, []).append(node.id)
-        object.__setattr__(
-            self,
-            "_children_by_parent",
-            MappingProxyType({parent: tuple(node_ids) for parent, node_ids in children.items()}),
-        )
-        object.__setattr__(self, "_children_revision", self.nodes.revision)
 
     @property
     def edge_count(self) -> int:
@@ -189,23 +109,7 @@ class Graph(_GraphCache):
 
     def children(self, node_id: str) -> tuple[str, ...]:
         """Return the direct contained articles of *node_id*."""
-        if getattr(self, "_children_revision", -1) != self.nodes.revision:
-            self._refresh_children()
-        return self._children_by_parent.get(node_id, ())
-
-
-def _restore_graph_state(graph: Graph, state: list[object]) -> None:
-    """Restore legacy slot pickles through the current cache initializer."""
-    blueprint_dir, nodes = state
-    object.__setattr__(graph, "blueprint_dir", blueprint_dir)
-    object.__setattr__(graph, "nodes", nodes)
-    graph.__post_init__()
-
-
-# Python 3.10's ``dataclass(slots=True, frozen=True)`` replaces a class-defined
-# pickle hook. Installing it after decoration keeps old Graph pickles compatible
-# on every supported interpreter.
-setattr(Graph, "__setstate__", _restore_graph_state)
+        return tuple(node.id for node in self.nodes.values() if node.parent == node_id)
 
 
 @dataclass(frozen=True, slots=True)

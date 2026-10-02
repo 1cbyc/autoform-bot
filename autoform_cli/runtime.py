@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
 
 from .graph import Graph, load_graph
@@ -141,14 +139,8 @@ class RuntimeNode:
         }
 
 
-class _RuntimeGraphCache:
-    __slots__ = ("_nodes_by_id",)
-
-    _nodes_by_id: Mapping[str, RuntimeNode]
-
-
 @dataclass(frozen=True, slots=True)
-class RuntimeGraph(_RuntimeGraphCache):
+class RuntimeGraph:
     """The complete versioned runtime view of an authored roadmap."""
 
     schema: str
@@ -162,21 +154,10 @@ class RuntimeGraph(_RuntimeGraphCache):
     dependency_count: int
     maximum_depth: int
 
-    def __post_init__(self) -> None:
-        index: dict[str, RuntimeNode] = {}
-        for node in self.nodes:
-            index.setdefault(node.id, node)
-        object.__setattr__(self, "_nodes_by_id", MappingProxyType(index))
-
     def get(self, node_id: str) -> RuntimeNode | None:
         """Return a node without exposing mutable lookup state."""
 
-        try:
-            index = self._nodes_by_id
-        except AttributeError:
-            self.__post_init__()
-            index = self._nodes_by_id
-        return index.get(node_id)
+        return next((node for node in self.nodes if node.id == node_id), None)
 
     def as_dict(self) -> dict[str, object]:
         """Return a canonical JSON-compatible compatibility snapshot."""
@@ -301,10 +282,6 @@ def build_runtime_graph(
         except OSError:
             issues.append(f"{node.id}: article cannot be read")
             continue
-        if node.source_sha256 is None:
-            issues.append(f"{node.id}: article source digest is unavailable")
-        elif hashlib.sha256(content).hexdigest() != node.source_sha256:
-            issues.append(f"{node.id}: article changed after graph load")
         article_path = relative_project.as_posix()
         if article_path in seen_article_paths:
             issues.append(f"{node.id}: article path is duplicated")
@@ -331,6 +308,7 @@ def build_runtime_graph(
             raise RuntimeProjectionError(["Lean root does not exist or is not a directory"])
         lean_index = index_project(root)
 
+    parents = {node.parent for node in graph.nodes.values() if node.parent is not None}
     runtime_nodes: list[RuntimeNode] = []
     for node_id in sorted(graph.nodes):
         node = graph.nodes[node_id]
@@ -341,7 +319,6 @@ def build_runtime_graph(
             and can_state
             and all(statuses[dependency].proved for dependency in node.proof_dependencies)
         )
-        children = graph.children(node_id)
         lean_targets: list[RuntimeLeanTarget] = []
         for name in declaration_names(node.lean or ""):
             declaration = lean_index.find(name) if lean_index is not None else None
@@ -359,7 +336,7 @@ def build_runtime_graph(
                 depth=node.depth,
                 declaration=node.declaration,
                 formalizable=node.formalizable,
-                dispatchable=node.formalizable and not children,
+                dispatchable=node.formalizable and node_id not in parents,
                 statement_dependencies=node.statement_dependencies,
                 proof_dependencies=node.proof_dependencies,
                 dependencies=node.dependencies,
