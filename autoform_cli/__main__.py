@@ -331,7 +331,10 @@ def _project(args: argparse.Namespace) -> int:
                     suffix = " [recommended]" if release.recommended else ""
                     print(f"  {release.id}{suffix}")
                     print(f"    Lean: {release.lean.toolchain}")
-                    print(f"    Mathlib: {release.mathlib.revision} ({release.mathlib.git})")
+                    print(
+                        f"    Mathlib: {release.mathlib.input_revision}"
+                        f" @ {release.mathlib.resolved_revision} ({release.mathlib.git})"
+                    )
             return 0
     except ProjectCatalogError:
         if getattr(args, "json", False):
@@ -382,13 +385,18 @@ def _print_project_inspection(result) -> None:
         declared = (
             f", declared {result.mathlib.declared_revision}"
             if result.mathlib.declared_revision
-            and result.mathlib.declared_revision != result.mathlib.revision
+            and result.mathlib.declared_revision != result.mathlib.input_revision
             else ""
         )
+        location = (
+            f"path {result.mathlib.path}"
+            if result.mathlib.path is not None
+            else result.mathlib.git or "none"
+        )
         print(
-            f"Mathlib: {identity} {result.mathlib.revision or 'none'}"
+            f"Mathlib: {identity} {result.mathlib.input_revision or 'none'}"
             f" @ {result.mathlib.resolved_revision or 'none'}{declared}"
-            f" ({result.mathlib.git or 'none'})"
+            f" ({location})"
         )
     print(
         f"Compatibility: {result.compatibility.status}"

@@ -10,6 +10,7 @@ import re
 import stat
 import unicodedata
 from dataclasses import dataclass
+from decimal import Decimal, DecimalException
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
@@ -49,6 +50,7 @@ _DECISION_FILES = {
     "lakefile.lean": ("lake-config", "error"),
     "lean-toolchain": ("lean-toolchain", "error"),
     "lake-manifest.json": ("lake-manifest", "error"),
+    ".lake/package-overrides.json": ("package-overrides", "error"),
 }
 _DECISION_NODES = (
     *_DECISION_FILES,
@@ -97,6 +99,19 @@ class _MathlibRequirement:
     subdirectory: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _MaterializedMathlib:
+    scope: str
+    package_type: str
+    git: str | None
+    resolved_revision: str | None
+    input_revision: str | None
+    subdirectory: str | None
+    config_file: str
+    manifest_file: str | None
+    path: str | None
+
+
 def inspect_project(target: str | Path, *, catalog: ReleaseCatalog | None = None) -> ProjectInspection:
     release_catalog = catalog or load_release_catalog()
     diagnostics: list[ProjectDiagnostic] = []
@@ -115,12 +130,50 @@ def inspect_project(target: str | Path, *, catalog: ReleaseCatalog | None = None
         return _inspection(diagnostics, release_catalog)
     lake, declared_mathlib = _inspect_lake(snapshot, diagnostics)
     lean = _inspect_toolchain(snapshot, diagnostics)
-    manifest_path, manifest_digest, mathlib = _inspect_manifest(
+    manifest_path, manifest_digest, manifest_valid, manifest_mathlib = _inspect_manifest(
         snapshot,
         declared_mathlib,
         diagnostics,
     )
-    if any(diagnostic.code == "lake-config-case-alias" for diagnostic in diagnostics):
+    (
+        overrides_path,
+        overrides_digest,
+        overrides_valid,
+        override_mathlib,
+    ) = _inspect_overrides(snapshot, declared_mathlib, diagnostics)
+    mathlib = None
+    if manifest_valid and overrides_valid:
+        mathlib = override_mathlib if override_mathlib is not None else manifest_mathlib
+        if override_mathlib is not None:
+            _issue(
+                diagnostics,
+                "warning",
+                "mathlib-overridden",
+                "Lake overrides the manifest's Mathlib package for this workspace.",
+                ".lake/package-overrides.json",
+            )
+    if mathlib is not None and declared_mathlib is None:
+        if lake is not None and lake.format == "toml":
+            _issue(
+                diagnostics,
+                "warning",
+                "mathlib-manifest-unused",
+                "The manifest contains Mathlib, but the active Lake configuration does not require it.",
+                mathlib.source,
+            )
+        elif lake is not None and lake.format == "lean":
+            _issue(
+                diagnostics,
+                "warning",
+                "mathlib-config-unevaluated",
+                "Offline inspection cannot confirm that lakefile.lean uses the manifest's Mathlib entry.",
+                "lakefile.lean",
+            )
+        mathlib = None
+    if any(
+        diagnostic.code in {"lake-config-case-alias", "lake-state-case-alias"}
+        for diagnostic in diagnostics
+    ):
         lake = None
         mathlib = None
     autoform = _inspect_autoform(snapshot, diagnostics)
@@ -133,6 +186,8 @@ def inspect_project(target: str | Path, *, catalog: ReleaseCatalog | None = None
         lake=lake,
         lake_manifest_path=manifest_path,
         lake_manifest_sha256=manifest_digest,
+        package_overrides_path=overrides_path,
+        package_overrides_sha256=overrides_digest,
         lean=lean,
         mathlib=mathlib,
         autoform=autoform,
@@ -152,6 +207,8 @@ def _inspection(
         lake=None,
         lake_manifest_path=None,
         lake_manifest_sha256=None,
+        package_overrides_path=None,
+        package_overrides_sha256=None,
         lean=None,
         mathlib=None,
         autoform=AutoformProject(False, None, None, None, None),
@@ -340,7 +397,12 @@ def _snapshot_project(
         try:
             config_aliases = {
                 relative: _case_aliases(root_descriptor, relative)
-                for relative in ("lakefile.lean", "lakefile.toml")
+                for relative in (
+                    "lakefile.lean",
+                    "lakefile.toml",
+                    ".lake",
+                    ".lake/package-overrides.json",
+                )
             }
         except OSError:
             _issue(
@@ -352,11 +414,16 @@ def _snapshot_project(
             return None
         for expected, aliases in config_aliases.items():
             for alias in aliases:
+                code = (
+                    "lake-state-case-alias"
+                    if expected == ".lake" or expected.startswith(".lake/")
+                    else "lake-config-case-alias"
+                )
                 _issue(
                     attempt_diagnostics,
                     "error",
-                    "lake-config-case-alias",
-                    f"{alias} differs in case from the portable Lake name {expected}.",
+                    code,
+                    f"{alias} differs in case from the portable Lake path {expected}.",
                     alias,
                 )
         lean_config_status, lean_config_metadata = _relative_info(
@@ -426,13 +493,22 @@ def _snapshot_project(
 
 
 def _case_aliases(root_descriptor: int, expected: str) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            name
-            for name in os.listdir(root_descriptor)
-            if name != expected and name.casefold() == expected.casefold()
+    try:
+        parent, name = _open_parent_descriptor(root_descriptor, expected)
+    except FileNotFoundError:
+        return ()
+    try:
+        parent_path = PurePosixPath(expected).parent
+        prefix = "" if parent_path == PurePosixPath(".") else f"{parent_path}/"
+        return tuple(
+            sorted(
+                f"{prefix}{entry}"
+                for entry in os.listdir(parent)
+                if entry != name and entry.casefold() == name.casefold()
+            )
         )
-    )
+    finally:
+        os.close(parent)
 
 
 def _capture_file(
@@ -893,7 +969,8 @@ def _compatibility(
     matched = None
     resolved = (
         mathlib is not None
-        and mathlib.revision is not None
+        and mathlib.package_type == "git"
+        and mathlib.git is not None
         and mathlib.resolved_revision is not None
     )
     if lean is not None and resolved:
@@ -904,17 +981,34 @@ def _compatibility(
                 for release in catalog.releases
                 if release.lean.toolchain == lean.toolchain
                 and release.mathlib.name == mathlib.name
+                and release.mathlib.package_type == mathlib.package_type
                 and release.mathlib.git == mathlib.git
-                and release.mathlib.revision == mathlib.revision
                 and release.mathlib.resolved_revision == mathlib.resolved_revision
                 and release.mathlib.subdirectory == mathlib.subdirectory
-                and mathlib.scope in {"", release.mathlib.scope}
+                and release.mathlib.config_file == mathlib.config_file
+                and release.mathlib.manifest_file == mathlib.manifest_file
             ),
             None,
         )
     if matched is not None:
         status = "supported"
         release_id = matched.id
+        if mathlib is not None and mathlib.input_revision != matched.mathlib.input_revision:
+            _issue(
+                diagnostics,
+                "warning",
+                "mathlib-input-revision-alias",
+                "Mathlib resolves to the catalog commit through a different input revision.",
+                mathlib.source,
+            )
+        if mathlib is not None and mathlib.scope not in {"", matched.mathlib.scope}:
+            _issue(
+                diagnostics,
+                "warning",
+                "mathlib-scope-alias",
+                "Mathlib resolves to the catalog source through a different package scope.",
+                mathlib.source,
+            )
     elif lean is not None and resolved:
         status = "unlisted"
         release_id = None
@@ -940,7 +1034,7 @@ def _inspect_manifest(
     snapshot: dict[str, _SnapshotEntry],
     declared: _MathlibRequirement | None,
     diagnostics: list[ProjectDiagnostic],
-) -> tuple[str | None, str | None, MathlibProject | None]:
+) -> tuple[str | None, str | None, bool, MathlibProject | None]:
     relative = "lake-manifest.json"
     if snapshot[relative].status == "missing":
         _issue(
@@ -950,16 +1044,21 @@ def _inspect_manifest(
             "The project has no resolved Lake manifest; dependency compatibility is indeterminate.",
             relative,
         )
-        return None, None, None
+        return None, None, False, None
     content = snapshot[relative].content
     if content is None:
-        return relative, None, None
+        return relative, None, False, None
     digest = hashlib.sha256(content).hexdigest()
     try:
         text = content.decode("utf-8")
         if _json_nesting_exceeds(text, _MAX_STRUCTURAL_DEPTH):
             raise _InvalidJson
-        payload = json.loads(text, object_pairs_hook=_unique_json_object)
+        payload = json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_float=Decimal,
+            parse_constant=_reject_json_constant,
+        )
         mathlib = _resolved_mathlib(payload, declared, diagnostics)
     except _UnsupportedManifest:
         _issue(
@@ -969,8 +1068,15 @@ def _inspect_manifest(
             "Lake accepts this legacy manifest, but offline compatibility inspection does not decode it.",
             relative,
         )
-        return relative, digest, None
-    except (UnicodeError, ValueError, RecursionError, MemoryError, _InvalidJson):
+        return relative, digest, False, None
+    except (
+        UnicodeError,
+        ValueError,
+        RecursionError,
+        MemoryError,
+        DecimalException,
+        _InvalidJson,
+    ):
         _issue(
             diagnostics,
             "error",
@@ -978,8 +1084,64 @@ def _inspect_manifest(
             "lake-manifest.json is not a supported Lake manifest.",
             relative,
         )
-        return relative, digest, None
-    return relative, digest, mathlib
+        return relative, digest, False, None
+    return relative, digest, True, mathlib
+
+
+def _inspect_overrides(
+    snapshot: dict[str, _SnapshotEntry],
+    declared: _MathlibRequirement | None,
+    diagnostics: list[ProjectDiagnostic],
+) -> tuple[str | None, str | None, bool, MathlibProject | None]:
+    relative = ".lake/package-overrides.json"
+    if snapshot[relative].status == "missing":
+        return None, None, True, None
+    content = snapshot[relative].content
+    if content is None:
+        return relative, None, False, None
+    digest = hashlib.sha256(content).hexdigest()
+    try:
+        text = content.decode("utf-8")
+        if _json_nesting_exceeds(text, _MAX_STRUCTURAL_DEPTH):
+            raise _InvalidJson
+        payload = json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_float=Decimal,
+            parse_constant=_reject_json_constant,
+        )
+        mathlib = _resolved_mathlib(
+            payload,
+            declared,
+            diagnostics,
+            source=relative,
+        )
+    except _UnsupportedManifest:
+        _issue(
+            diagnostics,
+            "warning",
+            "unsupported-package-overrides",
+            "Lake accepts this legacy override file, but offline compatibility inspection does not decode it.",
+            relative,
+        )
+        return relative, digest, False, None
+    except (
+        UnicodeError,
+        ValueError,
+        RecursionError,
+        MemoryError,
+        DecimalException,
+        _InvalidJson,
+    ):
+        _issue(
+            diagnostics,
+            "error",
+            "invalid-package-overrides",
+            "package-overrides.json is not a supported Lake override file.",
+            relative,
+        )
+        return relative, digest, False, None
+    return relative, digest, True, mathlib
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -989,6 +1151,10 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise _InvalidJson
         result[key] = value
     return result
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise _InvalidJson
 
 
 def _manifest_version(value: object) -> tuple[int, int, int]:
@@ -1021,83 +1187,140 @@ def _manifest_string(value: object, *, empty: bool = False) -> str:
     return value
 
 
+def _manifest_path(
+    value: object,
+    *,
+    optional: bool = False,
+    root_is_none: bool = False,
+) -> str | None:
+    if value is None:
+        if optional:
+            return None
+        raise _InvalidJson
+    text = _manifest_string(value)
+    posix = PurePosixPath(text)
+    windows = PureWindowsPath(text)
+    if (
+        "\\" in text
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or windows.root
+        or ".." in posix.parts
+    ):
+        raise _InvalidJson
+    normalized = posix.as_posix()
+    if normalized == ".":
+        if root_is_none:
+            return None
+        raise _InvalidJson
+    return normalized
+
+
 def _resolved_mathlib(
     payload: object,
     declared: _MathlibRequirement | None,
     diagnostics: list[ProjectDiagnostic],
+    *,
+    source: str = "lake-manifest.json",
 ) -> MathlibProject | None:
     if type(payload) is not dict:
         raise _InvalidJson
     _manifest_version(payload.get("version", payload.get("schemaVersion")))
     if "name" in payload:
-        _manifest_string(payload["name"], empty=True)
+        root_name = _manifest_string(payload["name"])
+        if root_name != "[anonymous]" and _canonical_module_name(root_name) is None:
+            raise _InvalidJson
     if "lakeDir" in payload:
-        _manifest_string(payload["lakeDir"])
+        _manifest_path(payload["lakeDir"])
     if "fixedToolchain" in payload and type(payload["fixedToolchain"]) is not bool:
         raise _InvalidJson
     if "packagesDir" in payload and payload["packagesDir"] is not None:
-        _manifest_string(payload["packagesDir"])
+        _manifest_path(payload["packagesDir"])
     packages = payload.get("packages", [])
     if type(packages) is not list:
         raise _InvalidJson
-    matches: list[tuple[str, str, str, str | None, str | None]] = []
-    direct_path_mathlib = False
+    matches: list[_MaterializedMathlib] = []
+    seen_names: set[str] = set()
     for package in packages:
         if type(package) is not dict:
             raise _InvalidJson
         name = _canonical_module_name(_manifest_string(package.get("name")))
         if name is None:
             raise _InvalidJson
+        if name in seen_names:
+            raise _InvalidJson
+        seen_names.add(name)
         scope = _manifest_string(package.get("scope", ""), empty=True)
         inherited = package.get("inherited")
         source_type = package.get("type")
         if type(inherited) is not bool or source_type not in {"git", "path"}:
             raise _InvalidJson
-        _manifest_string(package.get("configFile", "lakefile.lean"))
+        config_file = _manifest_path(package.get("configFile", "lakefile"))
+        assert config_file is not None
         manifest_file = package.get("manifestFile", "lake-manifest.json")
-        if manifest_file is not None:
-            _manifest_string(manifest_file)
+        manifest_file = _manifest_path(manifest_file, optional=True)
         if source_type == "path":
-            _manifest_string(package.get("dir"))
-            if name == "mathlib" and not inherited:
-                direct_path_mathlib = True
+            directory = _manifest_path(package.get("dir"))
+            assert directory is not None
+            if name == "mathlib":
+                matches.append(
+                    _MaterializedMathlib(
+                        scope,
+                        "path",
+                        None,
+                        None,
+                        None,
+                        None,
+                        config_file,
+                        manifest_file,
+                        directory,
+                    )
+                )
             continue
-        git = _normalize_mathlib_git(
-            _manifest_string(package.get("url")),
-            diagnostics,
-            "lake-manifest.json",
-        )
-        if git is None:
-            raise _InvalidJson
+        raw_git = _manifest_string(package.get("url"))
         revision = _manifest_string(package.get("rev"))
-        if _GIT_REVISION.fullmatch(revision) is None:
-            raise _InvalidJson
         input_revision = package.get("inputRev")
         if input_revision is not None:
             input_revision = _manifest_string(input_revision)
         subdirectory = package.get("subDir")
-        if subdirectory not in (None, "", "."):
-            subdirectory = _manifest_string(subdirectory)
-        else:
-            subdirectory = None
-        if name == "mathlib" and not inherited:
-            matches.append((scope, git, revision, input_revision, subdirectory))
-    if len(matches) + int(direct_path_mathlib) > 1:
-        raise _InvalidJson
-    if direct_path_mathlib:
-        return None
+        subdirectory = (
+            None
+            if subdirectory in (None, "")
+            else _manifest_path(subdirectory, root_is_none=True)
+        )
+        if name == "mathlib":
+            git = _normalize_mathlib_git(raw_git, diagnostics, source)
+            if git is None or _GIT_REVISION.fullmatch(revision) is None:
+                raise _InvalidJson
+            matches.append(
+                _MaterializedMathlib(
+                    scope,
+                    "git",
+                    git,
+                    revision,
+                    input_revision,
+                    subdirectory,
+                    config_file,
+                    manifest_file,
+                    None,
+                )
+            )
     if not matches:
         return None
-    scope, git, resolved_revision, input_revision, subdirectory = matches[0]
-    if declared is not None and (
-        (declared.revision is not None and declared.revision != input_revision)
-        or (declared.git is not None and declared.git != git)
-        or (declared.scope and declared.scope != scope)
+    materialized = matches[-1]
+    if source == "lake-manifest.json" and declared is not None and (
+        (
+            declared.revision is not None
+            and declared.revision != materialized.input_revision
+        )
+        or (declared.git is not None and declared.git != materialized.git)
+        or (declared.scope and declared.scope != materialized.scope)
         or declared.source_kind == "path"
-        or declared.subdirectory != subdirectory
+        or declared.subdirectory != materialized.subdirectory
     ):
         _issue(
-            diagnostics,
+        diagnostics,
             "warning",
             "mathlib-manifest-stale",
             "The resolved Mathlib manifest does not match the current Lake requirement.",
@@ -1105,13 +1328,17 @@ def _resolved_mathlib(
         )
     return MathlibProject(
         name="mathlib",
-        scope=scope,
-        git=git,
-        revision=input_revision,
-        resolved_revision=resolved_revision,
+        scope=materialized.scope,
+        package_type=materialized.package_type,
+        git=materialized.git,
+        input_revision=materialized.input_revision,
+        resolved_revision=materialized.resolved_revision,
         declared_revision=declared.revision if declared is not None else None,
-        subdirectory=subdirectory,
-        source="lake-manifest.json",
+        subdirectory=materialized.subdirectory,
+        config_file=materialized.config_file,
+        manifest_file=materialized.manifest_file,
+        path=materialized.path,
+        source=source,
     )
 
 

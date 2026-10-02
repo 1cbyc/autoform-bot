@@ -140,10 +140,17 @@ nearest project root; parses bounded `lakefile.toml`, `lake-manifest.json`,
 `lean-toolchain`, and known Autoform paths; records configuration hashes; and
 reports whether the resolved Lean/Mathlib pair exactly matches the bundled
 catalog. The Lake configuration records requested intent; the manifest's
-direct Mathlib entry is authoritative for the URL, input revision, and commit
-Lake actually builds. A missing manifest makes compatibility indeterminate; an
-invalid manifest fails inspection; disagreement with the current requirement
-is reported as stale. Decision-bearing files are read from one validated
+effective selected Mathlib lock entry is authoritative for the URL, input
+revision, and commit Lake is instructed to materialize under the default
+invocation, unless `.lake/package-overrides.json` replaces it. An active
+Mathlib override is reported and becomes the effective source; a local path
+override is necessarily outside the release catalog. A missing manifest
+makes compatibility indeterminate; an invalid manifest or override file fails
+inspection; disagreement with the current requirement is reported as stale.
+This is the effective lock entry for Lake's default invocation, not a claim
+about a dirty materialized checkout, `LAKE_PKG_URL_MAP`, or command-line
+`--packages` overrides that are not recorded in the project files.
+Decision-bearing files are read from one validated
 filesystem generation. It does not run Lake, Lean, Git, subprocesses, network
 operations, or named-user home-directory lookup. A `lakefile.lean` is reported
 as present but unevaluated and takes precedence over `lakefile.toml`, matching
