@@ -73,13 +73,16 @@ Reconcile every affected source and milestone page, the coverage contract,
 
 ## Finish
 
-Use the CLI reference to validate and audit the blueprint, refresh its Mermaid
-graph, and resolve findings caused by this work. Commit the vault once
-`autoform check` passes; pushing is outward-facing and requires a user request.
+After the final edit, use the CLI reference to run `autoform check` and
+`autoform audit`, refresh the Mermaid graph, and resolve every finding introduced
+by this work or inside the adopted boundary. Report unrelated pre-existing
+findings instead of silently widening scope. Commit the vault and refreshed
+graph only after this final validation; pushing is outward-facing and requires
+a user request.
 
-Finish only when every source area is explicitly dispositioned, every
-`DECOMPOSED` area links to a source-grounded fine DAG, affected pages and the
-graph agree, and the commit exists. Do not stop after discovery, a coarse
-proposal, one chapter, or unchanged validation. Report the material delta,
-evidence, remaining explicit blockers, and next execution frontier. Mark an
-active Goal complete only after these conditions hold.
+Finish only when the adopted boundary has no `MAPPED` rows, every `DECOMPOSED`
+area links to a source-grounded fine DAG, affected pages and the graph agree,
+and the latest commit contains every change from the pass. Do not stop after
+discovery, a coarse proposal, one chapter, or unchanged validation. Report the
+material delta, evidence, remaining explicit blockers, and next execution
+frontier. Mark an active Goal complete only after these conditions hold.

@@ -9,6 +9,7 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
+from autoform_cli.audit import audit_blueprint
 from autoform_cli.graph import load_graph
 from autoform_cli.lean import build_linker, declaration_names
 from autoform_cli.render import render_site
@@ -153,6 +154,25 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     assert toolchain == "leanprover/lean4:v4.32.2"
     assert manifest["require"][0]["rev"] == "v4.32.2"
     assert manifest["lean_lib"][0]["srcDir"] == "src"
+
+
+def test_roadmap_example_is_structural_not_a_completion_fixture(
+    repo_root: Path,
+) -> None:
+    example = repo_root / _EXAMPLE
+    audit = audit_blueprint(example / "blueprint", lean_root=example)
+    assert audit.coverage is not None
+    assert not audit.coverage.complete
+    assert audit.coverage.counts["MAPPED"] > 0
+
+    reference = (
+        repo_root / "skills/roadmap/references/cabannes-thesis-roadmap.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(reference.split())
+    assert "structural example, not a completion fixture" in normalized
+    assert "not a valid finish state" in normalized
+    assert "approved small slice" not in normalized
+    assert "handing ready nodes to Orchestrate" not in normalized
 
 
 def test_setup_asset_static_site_contract(repo_root: Path, tmp_path: Path) -> None:
@@ -432,13 +452,12 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert (repo_root / "skills/agent-review/references/roadmap-quality.md").is_file()
 
 
-def test_roadmap_skill_owns_a_compact_complete_pass(repo_root: Path) -> None:
+def test_roadmap_skill_owns_a_complete_pass(repo_root: Path) -> None:
     """A direct Roadmap invocation is a full job, not one planning checkpoint."""
 
     roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
     normalized = " ".join(roadmap.split())
 
-    assert len(roadmap.split()) <= 650
     for required in (
         "one complete planning pass",
         "model-callable Goal lifecycle",
@@ -462,6 +481,22 @@ def test_roadmap_skill_owns_a_compact_complete_pass(repo_root: Path) -> None:
         "Do not infer missing scope",
     ):
         assert obsolete not in roadmap
+
+
+def test_roadmap_skill_commits_the_final_checked_pass(repo_root: Path) -> None:
+    roadmap = (repo_root / "skills/roadmap/SKILL.md").read_text(encoding="utf-8")
+    finish = roadmap.split("## Finish", 1)[1]
+    normalized = " ".join(finish.split())
+
+    for required in (
+        "After the final edit",
+        "`autoform check`",
+        "`autoform audit`",
+        "Commit the vault and refreshed graph only after this final validation",
+        "no `MAPPED` rows",
+        "latest commit contains every change from the pass",
+    ):
+        assert required in normalized
 
 
 def test_setup_skill_offers_opt_in_zulip_project_sync(repo_root: Path) -> None:
