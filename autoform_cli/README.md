@@ -139,11 +139,15 @@ autoform project versions --json
 nearest project root; parses bounded `lakefile.toml`, `lean-toolchain`, and
 known Autoform paths; records configuration
 hashes; and reports whether the configured Lean/Mathlib pair exactly matches
-the bundled catalog. It does not run Lake, Lean, Git, subprocesses, or network
-operations. A `lakefile.lean` is reported as present but unevaluated. Symlinked
-decision-bearing configuration and malformed consumed fields fail inspection.
+the bundled catalog. Decision-bearing files are read from one validated
+filesystem generation. It does not run Lake, Lean, Git, subprocesses, network
+operations, or named-user home-directory lookup. A `lakefile.lean` is reported
+as present but unevaluated and takes precedence over `lakefile.toml`, matching
+Lake. Symlinked decision-bearing configuration and malformed consumed fields fail inspection.
 Reports contain only project-relative paths, never the host's absolute project
-location.
+location. Secure inspection currently requires POSIX directory-descriptor and
+no-follow support; unsupported platforms, including Windows, return
+`secure-file-inspection-unavailable` without reading project configuration.
 
 `project versions` reads the catalog packaged with the installed wheel. The
 catalog is an explicit known-good allowlist, not a resolver. The command never
