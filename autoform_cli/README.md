@@ -139,7 +139,12 @@ autoform project versions --json
 nearest project root; parses bounded `lakefile.toml`, `lake-manifest.json`,
 `lean-toolchain`, and known Autoform paths; records configuration hashes; and
 reports whether the resolved Lean/Mathlib pair exactly matches the bundled
-catalog. The Lake configuration records requested intent; the manifest's
+catalog's material source identity. That identity consists of the Lean
+toolchain and Mathlib package name, source kind, canonical Git URL, resolved
+commit, subdirectory, configuration file, and manifest file. Scope and input
+revision are recorded as descriptive aliases; differences produce warnings
+when the material identity still matches. The Lake configuration records
+requested intent; the manifest's
 effective selected Mathlib lock entry is authoritative for the URL, input
 revision, and commit Lake is instructed to materialize under the default
 invocation, unless `.lake/package-overrides.json` replaces it. An active
@@ -154,18 +159,18 @@ Decision-bearing files are read from one validated
 filesystem generation. It does not run Lake, Lean, Git, subprocesses, network
 operations, or named-user home-directory lookup. A `lakefile.lean` is reported
 as present but unevaluated and takes precedence over `lakefile.toml`, matching
-Lake. Case aliases, symlinked configuration, and malformed consumed fields
-fail inspection.
+Lake. Case aliases of decision-bearing paths, symlinked configuration, and
+malformed consumed fields fail inspection.
 Reports contain only project-relative paths, never the host's absolute project
 location. Secure inspection currently requires POSIX directory-descriptor and
 no-follow support; unsupported platforms, including Windows, return
 `secure-file-inspection-unavailable` without reading project configuration.
 
 `project versions` reads the catalog packaged with the installed wheel. Each
-entry binds a Lean toolchain to Mathlib's scope/name, canonical Git URL, input
-revision, and resolved commit. The catalog is an explicit known-good allowlist,
-not a resolver. The command never contacts a registry, selects a version, or
-mutates a project.
+entry binds a Lean toolchain to Mathlib's material source identity and records
+its usual scope and input revision. The catalog is an explicit known-good
+allowlist, not a resolver. The command never contacts a registry, selects a
+version, or mutates a project.
 
 Publishing a project runs four steps in order: validate, write the Mermaid
 graph into the vault, render the site source, then strict-build the site.

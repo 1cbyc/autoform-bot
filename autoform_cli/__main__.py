@@ -393,10 +393,15 @@ def _print_project_inspection(result) -> None:
             if result.mathlib.path is not None
             else result.mathlib.git or "none"
         )
+        load_identity = (
+            f"subDir={result.mathlib.subdirectory or '.'}, "
+            f"configFile={result.mathlib.config_file}, "
+            f"manifestFile={result.mathlib.manifest_file or 'none'}"
+        )
         print(
             f"Mathlib: {identity} {result.mathlib.input_revision or 'none'}"
             f" @ {result.mathlib.resolved_revision or 'none'}{declared}"
-            f" ({location})"
+            f" ({location}; {load_identity})"
         )
     print(
         f"Compatibility: {result.compatibility.status}"

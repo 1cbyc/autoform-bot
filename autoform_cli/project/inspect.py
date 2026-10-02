@@ -40,7 +40,7 @@ _LAKE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[^ \t\r\n]+)?")
 _MANIFEST_VERSION = re.compile(
     r"(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\.(?P<patch>[0-9]+)(?:-[^ \t\r\n]+)?"
 )
-_GIT_REVISION = re.compile(r"[0-9a-f]{40}")
+_FULL_GIT_REVISION = re.compile(r"[0-9a-fA-F]{40}")
 _SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
 _LEAN_ID_BEGIN_ESCAPE = "«"
 _LEAN_ID_END_ESCAPE = "»"
@@ -59,6 +59,16 @@ _DECISION_NODES = (
     "mkdocs.yml",
     ".github/workflows/autoform-verify.yml",
     ".github/workflows/blueprint-pages.yml",
+)
+_CASE_SENSITIVE_NODES = tuple(
+    dict.fromkeys(
+        (
+            *_DECISION_NODES,
+            ".lake",
+            ".github",
+            ".github/workflows",
+        )
+    )
 )
 
 
@@ -354,12 +364,11 @@ def _has_project_marker(descriptor: int) -> bool:
     for marker in _PROJECT_MARKERS:
         if _relative_status(descriptor, marker) != "missing":
             return True
-        if marker in {"lakefile.lean", "lakefile.toml"}:
-            try:
-                if _case_aliases(descriptor, marker):
-                    return True
-            except OSError:
+        try:
+            if _case_aliases(descriptor, marker):
                 return True
+        except OSError:
+            return True
     return False
 
 
@@ -395,14 +404,9 @@ def _snapshot_project(
         snapshot: dict[str, _SnapshotEntry] = {}
         changed = False
         try:
-            config_aliases = {
+            case_aliases = {
                 relative: _case_aliases(root_descriptor, relative)
-                for relative in (
-                    "lakefile.lean",
-                    "lakefile.toml",
-                    ".lake",
-                    ".lake/package-overrides.json",
-                )
+                for relative in _CASE_SENSITIVE_NODES
             }
         except OSError:
             _issue(
@@ -412,18 +416,26 @@ def _snapshot_project(
                 "The project root cannot be inspected safely.",
             )
             return None
-        for expected, aliases in config_aliases.items():
+        for expected, aliases in case_aliases.items():
             for alias in aliases:
-                code = (
-                    "lake-state-case-alias"
-                    if expected == ".lake" or expected.startswith(".lake/")
-                    else "lake-config-case-alias"
-                )
+                if expected in {"lakefile.lean", "lakefile.toml"}:
+                    code = "lake-config-case-alias"
+                elif (
+                    expected == "lake-manifest.json"
+                    or expected == ".lake"
+                    or expected.startswith(".lake/")
+                ):
+                    code = "lake-state-case-alias"
+                elif expected == "lean-toolchain":
+                    code = "lean-toolchain-case-alias"
+                else:
+                    code = "project-path-case-alias"
+                path_kind = "Lake path" if code.startswith("lake-") else "project path"
                 _issue(
                     attempt_diagnostics,
                     "error",
                     code,
-                    f"{alias} differs in case from the portable Lake path {expected}.",
+                    f"{alias} differs in case from the portable {path_kind} {expected}.",
                     alias,
                 )
         lean_config_status, lean_config_metadata = _relative_info(
@@ -434,7 +446,7 @@ def _snapshot_project(
             _metadata_identity(lean_config_metadata),
         )
         lean_config_present = (
-            lean_config_status != "missing" or bool(config_aliases["lakefile.lean"])
+            lean_config_status != "missing" or bool(case_aliases["lakefile.lean"])
         )
         for relative in _DECISION_NODES:
             kind, severity = _DECISION_FILES.get(relative, ("project-path", "error"))
@@ -469,7 +481,7 @@ def _snapshot_project(
         try:
             if any(
                 _case_aliases(root_descriptor, relative) != aliases
-                for relative, aliases in config_aliases.items()
+                for relative, aliases in case_aliases.items()
             ):
                 changed = True
         except OSError:
@@ -497,6 +509,10 @@ def _case_aliases(root_descriptor: int, expected: str) -> tuple[str, ...]:
         parent, name = _open_parent_descriptor(root_descriptor, expected)
     except FileNotFoundError:
         return ()
+    except OSError:
+        if "/" in expected:
+            return ()
+        raise
     try:
         parent_path = PurePosixPath(expected).parent
         prefix = "" if parent_path == PurePosixPath(".") else f"{parent_path}/"
@@ -983,7 +999,8 @@ def _compatibility(
                 and release.mathlib.name == mathlib.name
                 and release.mathlib.package_type == mathlib.package_type
                 and release.mathlib.git == mathlib.git
-                and release.mathlib.resolved_revision == mathlib.resolved_revision
+                and release.mathlib.resolved_revision
+                == _git_revision_identity(mathlib.resolved_revision)
                 and release.mathlib.subdirectory == mathlib.subdirectory
                 and release.mathlib.config_file == mathlib.config_file
                 and release.mathlib.manifest_file == mathlib.manifest_file
@@ -1016,7 +1033,7 @@ def _compatibility(
             diagnostics,
             "warning",
             "release-unlisted",
-            "The configured Lean and Mathlib revisions are not in the bundled release catalog.",
+            "The resolved Lean and effective Mathlib source identity are not in the bundled release catalog.",
         )
     else:
         status = "indeterminate"
@@ -1187,6 +1204,10 @@ def _manifest_string(value: object, *, empty: bool = False) -> str:
     return value
 
 
+def _git_revision_identity(value: str) -> str:
+    return value.lower() if _FULL_GIT_REVISION.fullmatch(value) is not None else value
+
+
 def _manifest_path(
     value: object,
     *,
@@ -1210,6 +1231,8 @@ def _manifest_path(
     ):
         raise _InvalidJson
     normalized = posix.as_posix()
+    if normalized != text:
+        raise _InvalidJson
     if normalized == ".":
         if root_is_none:
             return None
@@ -1227,39 +1250,57 @@ def _resolved_mathlib(
     if type(payload) is not dict:
         raise _InvalidJson
     _manifest_version(payload.get("version", payload.get("schemaVersion")))
-    if "name" in payload:
-        root_name = _manifest_string(payload["name"])
-        if root_name != "[anonymous]" and _canonical_module_name(root_name) is None:
+    if source == "lake-manifest.json":
+        root_name_value = payload.get("name")
+        if root_name_value is not None:
+            root_name = _manifest_string(root_name_value)
+            if (
+                root_name != "[anonymous]"
+                and _canonical_module_name(root_name) is None
+            ):
+                raise _InvalidJson
+        lake_dir = payload.get("lakeDir")
+        if lake_dir is not None:
+            _manifest_path(lake_dir)
+        fixed_toolchain = payload.get("fixedToolchain")
+        if fixed_toolchain is not None and type(fixed_toolchain) is not bool:
             raise _InvalidJson
-    if "lakeDir" in payload:
-        _manifest_path(payload["lakeDir"])
-    if "fixedToolchain" in payload and type(payload["fixedToolchain"]) is not bool:
-        raise _InvalidJson
-    if "packagesDir" in payload and payload["packagesDir"] is not None:
-        _manifest_path(payload["packagesDir"])
-    packages = payload.get("packages", [])
+        packages_dir = payload.get("packagesDir")
+        if packages_dir is not None:
+            _manifest_path(packages_dir)
+    packages = payload.get("packages")
+    if packages is None:
+        packages = []
     if type(packages) is not list:
         raise _InvalidJson
     matches: list[_MaterializedMathlib] = []
-    seen_names: set[str] = set()
     for package in packages:
         if type(package) is not dict:
             raise _InvalidJson
         name = _canonical_module_name(_manifest_string(package.get("name")))
         if name is None:
             raise _InvalidJson
-        if name in seen_names:
-            raise _InvalidJson
-        seen_names.add(name)
-        scope = _manifest_string(package.get("scope", ""), empty=True)
+        scope_value = package.get("scope")
+        scope = (
+            ""
+            if scope_value is None
+            else _manifest_string(scope_value, empty=True)
+        )
         inherited = package.get("inherited")
         source_type = package.get("type")
         if type(inherited) is not bool or source_type not in {"git", "path"}:
             raise _InvalidJson
-        config_file = _manifest_path(package.get("configFile", "lakefile"))
+        config_file_value = package.get("configFile")
+        config_file = _manifest_path(
+            "lakefile" if config_file_value is None else config_file_value
+        )
         assert config_file is not None
-        manifest_file = package.get("manifestFile", "lake-manifest.json")
-        manifest_file = _manifest_path(manifest_file, optional=True)
+        manifest_file_value = package.get("manifestFile")
+        manifest_file = _manifest_path(
+            "lake-manifest.json"
+            if manifest_file_value is None
+            else manifest_file_value
+        )
         if source_type == "path":
             directory = _manifest_path(package.get("dir"))
             assert directory is not None
@@ -1291,7 +1332,7 @@ def _resolved_mathlib(
         )
         if name == "mathlib":
             git = _normalize_mathlib_git(raw_git, diagnostics, source)
-            if git is None or _GIT_REVISION.fullmatch(revision) is None:
+            if git is None:
                 raise _InvalidJson
             matches.append(
                 _MaterializedMathlib(

@@ -152,6 +152,36 @@ def test_recommended_release_matches_the_shipped_example() -> None:
     assert len(catalog.releases) == 1
 
 
+def test_release_catalog_v1_serialization_contract() -> None:
+    assert load_release_catalog().as_dict() == {
+        "schema": "autoform-project-release-catalog/v1",
+        "releases": [
+            {
+                "id": "lean-v4.32.2-mathlib-v4.32.2",
+                "channel": "stable",
+                "recommended": True,
+                "lean": {
+                    "toolchain": "leanprover/lean4:v4.32.2",
+                    "version": "v4.32.2",
+                },
+                "mathlib": {
+                    "name": "mathlib",
+                    "scope": "leanprover-community",
+                    "package_type": "git",
+                    "git": "https://github.com/leanprover-community/mathlib4",
+                    "input_revision": "v4.32.2",
+                    "resolved_revision": (
+                        "905b95818eb32af7874a58b427f50c1711a5e96c"
+                    ),
+                    "subdirectory": None,
+                    "config_file": "lakefile.lean",
+                    "manifest_file": "lake-manifest.json",
+                },
+            }
+        ],
+    }
+
+
 @pytest.mark.parametrize(
     ("git", "resolved_revision"),
     [
@@ -209,6 +239,43 @@ def test_recommended_release_matches_a_project_pinned_to_it(tmp_path: Path) -> N
     assert result.ok
     assert result.compatibility.status == "supported"
     assert result.compatibility.release == recommended.id
+
+
+def test_project_inspection_v1_git_serialization_contract(tmp_path: Path) -> None:
+    result = inspect_project(_project(tmp_path))
+    payload = json.loads(result.to_json())
+
+    assert set(payload) == {
+        "autoform",
+        "compatibility",
+        "diagnostics",
+        "git_path",
+        "lake",
+        "lake_manifest_path",
+        "lake_manifest_sha256",
+        "lean",
+        "mathlib",
+        "ok",
+        "package_overrides_path",
+        "package_overrides_sha256",
+        "project_root",
+        "schema",
+    }
+    assert payload["schema"] == "autoform-project-inspection/v1"
+    assert payload["mathlib"] == {
+        "config_file": "lakefile.lean",
+        "declared_revision": "v4.32.2",
+        "git": "https://github.com/leanprover-community/mathlib4",
+        "input_revision": "v4.32.2",
+        "manifest_file": "lake-manifest.json",
+        "name": "mathlib",
+        "package_type": "git",
+        "path": None,
+        "resolved_revision": "905b95818eb32af7874a58b427f50c1711a5e96c",
+        "scope": "",
+        "source": "lake-manifest.json",
+        "subdirectory": None,
+    }
 
 
 def test_catalog_loader_converts_decode_and_recursion_failures(
@@ -304,8 +371,15 @@ def test_release_catalog_rejects_unprintable_strings(value: str) -> None:
                             "version": "v4.32.2",
                         },
                         "mathlib": {
-                            "git": "https://github.com/leanprover-community/mathlib4.git",
-                            "revision": "v4.32.2",
+                            "name": "mathlib",
+                            "scope": "leanprover-community",
+                            "package_type": "git",
+                            "git": "https://github.com/leanprover-community/mathlib4",
+                            "input_revision": "v4.32.2",
+                            "resolved_revision": "9" * 40,
+                            "subdirectory": None,
+                            "config_file": "lakefile.lean",
+                            "manifest_file": "lake-manifest.json",
                         },
                     }
                 ],
@@ -824,7 +898,7 @@ def test_mathlib_manifest_subdirectory_is_not_the_catalog_release(tmp_path: Path
     ("config_file", "manifest_file"),
     [
         ("alternate.lean", "lake-manifest.json"),
-        ("lakefile.lean", None),
+        ("lakefile.lean", "alternate-manifest.json"),
     ],
 )
 def test_noncanonical_mathlib_load_files_are_not_the_catalog_release(
@@ -848,6 +922,34 @@ def test_noncanonical_mathlib_load_files_are_not_the_catalog_release(
     assert result.compatibility.status == "unlisted"
 
 
+def test_explicit_null_manifest_file_uses_lake_default(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    manifest = root / "lake-manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["packages"][0]["manifestFile"] = None
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.mathlib is not None
+    assert result.mathlib.manifest_file == "lake-manifest.json"
+    assert result.compatibility.status == "supported"
+
+
+@pytest.mark.parametrize("field", ["name", "lakeDir", "fixedToolchain"])
+def test_null_root_manifest_defaults_match_lake(field: str, tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    manifest = root / "lake-manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload[field] = None
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "supported"
+
+
 def test_omitted_mathlib_config_file_uses_lake_default(tmp_path: Path) -> None:
     root = _project(tmp_path)
     payload = json.loads((root / "lake-manifest.json").read_text(encoding="utf-8"))
@@ -859,6 +961,51 @@ def test_omitted_mathlib_config_file_uses_lake_default(tmp_path: Path) -> None:
     assert result.mathlib is not None
     assert result.mathlib.config_file == "lakefile"
     assert result.compatibility.status == "unlisted"
+
+
+@pytest.mark.parametrize(
+    ("field", "expected", "status"),
+    [
+        ("scope", "", "supported"),
+        ("configFile", "lakefile", "unlisted"),
+    ],
+)
+def test_null_package_fields_use_lake_defaults(
+    field: str, expected: str, status: str, tmp_path: Path
+) -> None:
+    root = _project(tmp_path)
+    manifest = root / "lake-manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["packages"][0][field] = None
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.mathlib is not None
+    assert getattr(
+        result.mathlib,
+        "config_file" if field == "configFile" else field,
+    ) == expected
+    assert result.compatibility.status == status
+
+
+def test_null_root_packages_are_an_empty_lake_manifest(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    manifest = root / "lake-manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["packages"] = None
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.mathlib is None
+    assert result.compatibility.status == "indeterminate"
+    assert not any(
+        diagnostic.code == "invalid-lake-manifest"
+        for diagnostic in result.diagnostics
+    )
 
 
 @pytest.mark.parametrize("field", ["configFile", "manifestFile", "subDir"])
@@ -878,6 +1025,51 @@ def test_manifest_load_paths_cannot_escape_the_package(
         diagnostic.code == "invalid-lake-manifest"
         for diagnostic in result.diagnostics
     )
+
+
+@pytest.mark.parametrize("value", ["lakefile.lean/", "dir/./lakefile.lean"])
+def test_noncanonical_manifest_load_paths_cannot_match_the_catalog(
+    value: str, tmp_path: Path
+) -> None:
+    root = _project(tmp_path)
+    manifest = root / "lake-manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["packages"][0]["configFile"] = value
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert any(
+        diagnostic.code == "invalid-lake-manifest"
+        for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.parametrize(
+    ("resolved_revision", "status"),
+    [
+        ("v4.32.2", "unlisted"),
+        ("905B95818EB32AF7874A58B427F50C1711A5E96C", "supported"),
+    ],
+)
+def test_lake_valid_git_revisions_are_not_manifest_errors(
+    resolved_revision: str, status: str, tmp_path: Path
+) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_manifest(
+        root,
+        scope="",
+        resolved_revision=resolved_revision,
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == status
+    assert result.mathlib is not None
+    assert result.mathlib.resolved_revision == resolved_revision
 
 
 @pytest.mark.parametrize(
@@ -978,6 +1170,20 @@ def test_mathlib_path_override_controls_actual_compatibility(tmp_path: Path) -> 
     assert result.mathlib is not None
     assert result.mathlib.source == ".lake/package-overrides.json"
     assert result.mathlib.path == "vendor/fake-mathlib"
+    assert result.mathlib.as_dict() == {
+        "name": "mathlib",
+        "scope": "",
+        "package_type": "path",
+        "git": None,
+        "input_revision": None,
+        "resolved_revision": None,
+        "declared_revision": "v4.32.2",
+        "subdirectory": None,
+        "config_file": "lakefile.toml",
+        "manifest_file": "lake-manifest.json",
+        "path": "vendor/fake-mathlib",
+        "source": ".lake/package-overrides.json",
+    }
     assert result.compatibility.status == "indeterminate"
     assert any(
         diagnostic.code == "mathlib-overridden"
@@ -998,6 +1204,62 @@ def test_invalid_package_overrides_block_manifest_compatibility(tmp_path: Path) 
         diagnostic.code == "invalid-package-overrides"
         for diagnostic in result.diagnostics
     )
+
+
+def test_git_override_controls_catalog_compatibility(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_git_override(root)
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.mathlib is not None
+    assert result.mathlib.source == ".lake/package-overrides.json"
+    assert result.compatibility.status == "supported"
+    assert any(
+        diagnostic.code == "mathlib-overridden"
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_null_override_packages_fall_back_to_the_root_manifest(
+    tmp_path: Path,
+) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_git_override(root)
+    override = root / ".lake/package-overrides.json"
+    payload = json.loads(override.read_text(encoding="utf-8"))
+    payload["packages"] = None
+    override.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.mathlib is not None
+    assert result.mathlib.source == "lake-manifest.json"
+    assert result.compatibility.status == "supported"
+
+
+def test_override_ignores_unrelated_root_manifest_fields(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_git_override(root)
+    override = root / ".lake/package-overrides.json"
+    payload = json.loads(override.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "name": ".",
+            "lakeDir": None,
+            "fixedToolchain": "ignored",
+        }
+    )
+    override.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.mathlib is not None
+    assert result.mathlib.source == ".lake/package-overrides.json"
+    assert result.compatibility.status == "supported"
 
 
 @pytest.mark.parametrize("manifest_state", ["missing", "invalid"])
@@ -1092,7 +1354,7 @@ def test_unrelated_git_packages_do_not_receive_mathlib_url_policy(
     )
 
 
-def test_duplicate_manifest_package_name_cannot_override_mathlib(tmp_path: Path) -> None:
+def test_duplicate_manifest_package_name_uses_lakes_last_entry(tmp_path: Path) -> None:
     root = _project(tmp_path)
     payload = json.loads((root / "lake-manifest.json").read_text(encoding="utf-8"))
     payload["packages"].append(
@@ -1110,12 +1372,11 @@ def test_duplicate_manifest_package_name_cannot_override_mathlib(tmp_path: Path)
 
     result = inspect_project(root)
 
-    assert not result.ok
+    assert result.ok
+    assert result.mathlib is not None
+    assert result.mathlib.package_type == "path"
+    assert result.mathlib.path == "vendor/fake-mathlib"
     assert result.compatibility.status == "indeterminate"
-    assert any(
-        diagnostic.code == "invalid-lake-manifest"
-        for diagnostic in result.diagnostics
-    )
 
 
 def test_inherited_flag_does_not_change_materialized_mathlib_identity(
@@ -1369,6 +1630,10 @@ def test_human_output_composes_package_and_target_source_dirs(
     captured = capsys.readouterr()
     assert "srcDir: pkg/lib, roots: A" in captured.out
     assert "Mathlib: mathlib v4.32.2 @ 905b95818eb32af7874a58b427f50c1711a5e96c" in captured.out
+    assert (
+        "subDir=., configFile=lakefile.lean, manifestFile=lake-manifest.json"
+        in captured.out
+    )
 
 
 def test_lakefile_lean_is_never_executed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1467,6 +1732,43 @@ def test_case_variant_package_overrides_file_is_rejected(tmp_path: Path) -> None
     assert any(
         diagnostic.code == "lake-state-case-alias"
         and diagnostic.path == ".lake/Package-Overrides.json"
+        for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.parametrize(
+    ("exact", "alias", "code"),
+    [
+        ("lake-manifest.json", "Lake-Manifest.json", "lake-state-case-alias"),
+        ("lean-toolchain", "Lean-Toolchain", "lean-toolchain-case-alias"),
+    ],
+)
+def test_case_variant_root_decision_files_are_rejected(
+    exact: str, alias: str, code: str, tmp_path: Path
+) -> None:
+    root = _project(tmp_path)
+    (root / exact).rename(root / alias)
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert any(
+        diagnostic.code == code and diagnostic.path == alias
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_case_variant_autoform_decision_file_is_rejected(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "MkDocs.yml").write_text("site_name: Example\n", encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert any(
+        diagnostic.code == "project-path-case-alias"
+        and diagnostic.path == "MkDocs.yml"
         for diagnostic in result.diagnostics
     )
 
@@ -1680,9 +1982,14 @@ def test_blueprint_detection_requires_exact_directory_spelling(tmp_path: Path) -
 
     result = inspect_project(root)
 
-    assert result.ok
+    assert not result.ok
     assert result.autoform.detected is False
     assert result.autoform.blueprint_path is None
+    assert any(
+        diagnostic.code == "project-path-case-alias"
+        and diagnostic.path == "Blueprint"
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_decision_files_come_from_one_generation(
