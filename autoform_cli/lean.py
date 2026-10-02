@@ -57,8 +57,9 @@ _PUBLICATION_MANIFEST = "publication.json"
 _PUBLICATION_SCHEMAS = frozenset({"autoform-publication/v1", "autoform-publication/v2"})
 _PUBLICATION_MANIFEST_BYTE_LIMIT = 1024 * 1024
 _MANAGED_OUTPUT_MANIFEST = "manifest.json"
+_MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT = 16 * 1024 * 1024
 # Skeleton manifests grow with the declaration set, and their sorted schema key
-# follows the entries, so classification must consume the complete file.
+# follows the entries, so their classification bound is intentionally larger.
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_DIRECTORY", 0)
@@ -291,7 +292,11 @@ def _lean_tree_selection(
         byte_limit=lambda path: (
             _PUBLICATION_MANIFEST_BYTE_LIMIT
             if _is_publication_manifest_name(path.name)
-            else None
+            else (
+                _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT
+                if _is_managed_output_manifest_name(path.name)
+                else None
+            )
         ),
         record_omitted=False,
     )
@@ -373,29 +378,31 @@ def _indexed_source_snapshot(
         ("publication", publication_manifests, _is_publication_manifest_bytes),
         ("managed output", managed_output_manifests, _is_managed_output_manifest_bytes),
     )
-    recognized_roots = {
-        parent
-        for _label, groups, recognizes in manifest_groups
-        for parent, manifests in groups.items()
-        if len(manifests) == 1
-        and manifests[0][0] == "file"
-        and manifests[0][1] is not None
-        and recognizes(manifests[0][1])
-    }
     ignored_roots: set[PurePosixPath] = set()
     for parent in sorted(
-        recognized_roots,
+        publication_manifests.keys() | managed_output_manifests.keys(),
         key=lambda path: (len(path.parts), path.as_posix()),
     ):
-        if not _path_is_within_roots(parent, ignored_roots):
+        if _path_is_within_roots(parent, ignored_roots):
+            continue
+        recognized = False
+        for _label, groups, recognizes in manifest_groups:
+            manifests = groups.get(parent)
+            if (
+                manifests is not None
+                and len(manifests) == 1
+                and manifests[0][0] == "file"
+                and manifests[0][1] is not None
+                and recognizes(manifests[0][1])
+            ):
+                recognized = True
+                break
+        if recognized:
             ignored_roots.add(parent)
-
-    for label, groups, _recognizes in manifest_groups:
-        for parent, manifests in sorted(
-            groups.items(),
-            key=lambda item: (len(item[0].parts), item[0].as_posix()),
-        ):
-            if _path_is_within_roots(parent, ignored_roots):
+            continue
+        for label, groups, _recognizes in manifest_groups:
+            manifests = groups.get(parent)
+            if manifests is None:
                 continue
             if len(manifests) != 1:
                 raise OSError(f"ambiguous {label} manifests in {parent.as_posix()}")
@@ -503,12 +510,15 @@ def _lean_generation_revision(
 
 def _is_publication_manifest_bytes(data: bytes) -> bool:
     if len(data) > _PUBLICATION_MANIFEST_BYTE_LIMIT:
-        return False
+        raise OSError("publication manifest exceeds its inspection bound")
     try:
         value = json.loads(data.decode("utf-8"))
-    except (UnicodeError, ValueError):
+    except (UnicodeError, ValueError, RecursionError):
         return False
-    return isinstance(value, dict) and value.get("schema") in _PUBLICATION_SCHEMAS
+    if not isinstance(value, dict):
+        return False
+    schema = value.get("schema")
+    return isinstance(schema, str) and schema in _PUBLICATION_SCHEMAS
 
 
 def _is_publication_manifest_name(name: str) -> bool:
@@ -516,13 +526,21 @@ def _is_publication_manifest_name(name: str) -> bool:
 
 
 def _is_managed_output_manifest_bytes(data: bytes) -> bool:
+    if len(data) > _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT:
+        raise OSError("managed output manifest exceeds its inspection bound")
     try:
         value = json.loads(data.decode("utf-8"))
-    except (UnicodeError, ValueError):
+    except (UnicodeError, ValueError, RecursionError):
         return False
-    return isinstance(value, dict) and (
-        value.get("kind"), value.get("schema")
-    ) in MANAGED_OUTPUT_SCHEMAS
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("kind")
+    schema = value.get("schema")
+    return (
+        isinstance(kind, str)
+        and isinstance(schema, str)
+        and (kind, schema) in MANAGED_OUTPUT_SCHEMAS
+    )
 
 
 def _is_managed_output_manifest_name(name: str) -> bool:

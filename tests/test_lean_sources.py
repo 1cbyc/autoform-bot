@@ -979,20 +979,27 @@ def test_oversized_publication_manifest_read_is_bounded(
 
     monkeypatch.setattr(lean_module, "_is_publication_manifest_bytes", record_length)
 
-    index_project(tmp_path)
+    with pytest.raises(OSError, match="publication manifest exceeds"):
+        index_project(tmp_path)
 
     assert observed_lengths == [lean_module._PUBLICATION_MANIFEST_BYTE_LIMIT + 1]
 
 
 @pytest.mark.parametrize("manifest_name", ["publication.json", "manifest.json"])
-def test_manifest_integer_limit_error_does_not_escape_source_indexing(
+@pytest.mark.parametrize(
+    "invalid_value",
+    ["1" * 5000, "[" * 2000 + "0" + "]" * 2000],
+    ids=["integer-limit", "nested-value"],
+)
+def test_malformed_manifest_value_does_not_escape_source_indexing(
     tmp_path: Path,
     manifest_name: str,
+    invalid_value: str,
 ) -> None:
     generated = tmp_path / "generated"
     generated.mkdir()
     (generated / manifest_name).write_text(
-        '{"kind":"packets","schema":' + "1" * 5000 + "}\n",
+        '{"kind":"packets","schema":' + invalid_value + "}\n",
         encoding="utf-8",
     )
     (generated / "Visible.lean").write_text("def visible : Nat := 0\n", encoding="utf-8")
@@ -1392,6 +1399,29 @@ def test_large_managed_skeleton_manifest_still_excludes_generated_sources(
     index = index_project(tmp_path)
 
     assert index.find("target").path == Path("Actual.lean")
+
+
+def test_oversized_managed_manifest_fails_closed_at_its_read_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packets = tmp_path / "review-packets"
+    packets.mkdir()
+    (packets / "manifest.json").write_text(
+        json.dumps(
+            {
+                "kind": "packets",
+                "packets": ["x" * 256],
+                "schema": "autoform-skeleton-packets/v2",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(lean_module, "_MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT", 64)
+
+    with pytest.raises(OSError, match="managed output manifest exceeds"):
+        index_project(tmp_path)
 
 
 def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:
