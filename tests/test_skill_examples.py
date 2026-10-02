@@ -34,6 +34,17 @@ def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
     assert "VivienCabannes/autoform-bot" not in readme
 
 
+def test_development_guidance_requires_fail_closed_local_safety(repo_root: Path) -> None:
+    development = (repo_root / "skills" / "develop-plugin" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(development.split())
+
+    assert "private declaration safety as fail-closed evidence" in normalized
+    assert "official user name" in normalized
+    assert "by source coordinates" in normalized
+
+
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
     example = repo_root / _EXAMPLE
     blueprint = example / "blueprint"
