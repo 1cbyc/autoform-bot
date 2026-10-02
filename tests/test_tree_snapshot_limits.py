@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 import sys
 import threading
 from dataclasses import FrozenInstanceError
@@ -79,10 +81,23 @@ def test_capture_limit_error_exposes_a_stable_discriminator() -> None:
     assert str(error) == "directory tree exceeds max_entries=3"
 
 
+@pytest.mark.parametrize("portable", [False, True])
 def test_capture_and_close_are_serialized(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    portable: bool,
 ) -> None:
+    if portable:
+        monkeypatch.setattr(
+            directory_binding_module,
+            "DIRECTORY_BINDING_SUPPORTED",
+            False,
+        )
+    elif not (
+        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
+        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
+    ):
+        pytest.skip("directory descriptor capture is unavailable")
     root = tmp_path / "tree"
     root.mkdir()
     (root / "payload").write_bytes(b"payload")
@@ -133,6 +148,63 @@ def test_capture_and_close_are_serialized(
     assert not capture_thread.is_alive()
     assert not close_thread.is_alive()
     assert closed.is_set()
+
+
+def test_portable_file_capture_accepts_windows_path_and_handle_stat_views(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    payload = root / "payload.cmd"
+    payload.write_bytes(b"payload")
+    original_fstat = tree_snapshot_module.os.fstat
+    path_signature = tree_snapshot_module._stat_signature(os.lstat(payload))
+    handle_signatures: list[tuple[int, ...]] = []
+    inode_delta = 0
+
+    class WindowsHandleStat:
+        def __init__(self, metadata: os.stat_result) -> None:
+            self.st_dev = metadata.st_dev
+            self.st_ino = metadata.st_ino + inode_delta
+            self.st_mode = metadata.st_mode ^ stat.S_IXUSR
+            self.st_nlink = metadata.st_nlink
+            self.st_size = metadata.st_size
+            self.st_mtime_ns = metadata.st_mtime_ns
+            self.st_ctime_ns = metadata.st_ctime_ns + 1
+
+    def windows_handle_fstat(descriptor: int) -> WindowsHandleStat:
+        metadata = WindowsHandleStat(original_fstat(descriptor))
+        handle_signatures.append(tree_snapshot_module._stat_signature(metadata))
+        return metadata
+
+    monkeypatch.setattr(tree_snapshot_module.os, "fstat", windows_handle_fstat)
+    monkeypatch.setattr(tree_snapshot_module, "_WINDOWS_STAT_VIEWS", True)
+
+    snapshot = _capture(
+        root,
+        _all_entries(TreeCaptureLimits()),
+        portable=True,
+        monkeypatch=monkeypatch,
+    )
+
+    assert snapshot.files == (("payload.cmd", b"payload"),)
+    assert handle_signatures
+    assert handle_signatures[0][2] != path_signature[2]
+    assert handle_signatures[0][6] != path_signature[6]
+    assert (
+        tree_snapshot_module._cross_interface_signature(handle_signatures[0])
+        == tree_snapshot_module._cross_interface_signature(path_signature)
+    )
+
+    inode_delta = 1
+    with pytest.raises(TreeSnapshotError, match="changed while it was captured"):
+        _capture(
+            root,
+            _all_entries(TreeCaptureLimits()),
+            portable=True,
+            monkeypatch=monkeypatch,
+        )
 
 
 @pytest.mark.parametrize("portable", [False, True])

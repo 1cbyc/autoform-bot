@@ -179,10 +179,23 @@ def test_case_alias_of_publication_staging_prefix_is_not_scanned(
     assert index.find("leaked") is None
 
 
+@pytest.mark.parametrize("portable", [False, True])
 def test_changes_inside_an_excluded_build_directory_do_not_invalidate_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    portable: bool,
 ) -> None:
+    if portable:
+        monkeypatch.setattr(
+            directory_binding_module,
+            "DIRECTORY_BINDING_SUPPORTED",
+            False,
+        )
+    elif not (
+        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
+        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
+    ):
+        pytest.skip("directory descriptor capture is unavailable")
     _index(tmp_path, "def canonical : Nat := 0\n")
     build_state = tmp_path / ".lake" / "build-state"
     build_state.parent.mkdir()
@@ -296,10 +309,23 @@ def test_source_binding_rejects_root_replacement(tmp_path: Path) -> None:
         sources.close()
 
 
+@pytest.mark.parametrize("portable", [False, True])
 def test_source_capture_rejects_mid_capture_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    portable: bool,
 ) -> None:
+    if portable:
+        monkeypatch.setattr(
+            directory_binding_module,
+            "DIRECTORY_BINDING_SUPPORTED",
+            False,
+        )
+    elif not (
+        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
+        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
+    ):
+        pytest.skip("directory descriptor capture is unavailable")
     source = tmp_path / "Project" / "Basic.lean"
     _index(tmp_path, "def before : Nat := 0\n")
     original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint

@@ -34,6 +34,7 @@ _DESCRIPTOR_CAPTURE_SUPPORTED = (
     and os.readlink in getattr(os, "supports_dir_fd", ())
 )
 _DESCRIPTOR_SCANDIR_SUPPORTED = os.scandir in getattr(os, "supports_fd", ())
+_WINDOWS_STAT_VIEWS = os.name == "nt"
 _WINDOWS_DEVICE_NAMES = frozenset(
     {
         "AUX",
@@ -617,6 +618,7 @@ class BoundDirectoryTree:
                         selection=active_selection,
                     )
                     _tree_snapshot_checkpoint("between-portable-captures", "")
+                    _tree_snapshot_checkpoint("before-final-verification", "")
                     snapshot = _capture_portable(
                         self.root,
                         expected_identity=self.identity,
@@ -749,6 +751,29 @@ def _stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
+    )
+
+
+def _cross_interface_signature(signature: tuple[int, ...]) -> tuple[int, ...]:
+    """Return fields shared by path stat and descriptor fstat views.
+
+    On Windows, CPython gives path ``stat`` birth-time ``st_ctime_ns`` while
+    descriptor ``fstat`` keeps the filesystem change time.  Path stat can also
+    add executable permission bits based on the filename.  Normalize only those
+    Windows differences; callers still compare full signatures within each
+    interface, and other platforms require the complete signatures to agree.
+    """
+
+    if not _WINDOWS_STAT_VIEWS:
+        return signature
+    executable_bits = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    return (
+        signature[0],
+        signature[1],
+        signature[2] & ~executable_bits,
+        signature[3],
+        signature[4],
+        signature[5],
     )
 
 
@@ -1066,6 +1091,7 @@ def _capture_portable(
             budget=budget,
             depth=depth + 1,
         )
+        _tree_snapshot_checkpoint("after-directory-list", relative)
         for name in names:
             child_relative = f"{relative}/{name}" if relative else name
             path = directory / name
@@ -1165,7 +1191,12 @@ def _read_portable_file(
     try:
         descriptor = os.open(path, _FILE_FLAGS)
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or _stat_signature(opened) != expected:
+        opened_signature = _stat_signature(opened)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _cross_interface_signature(opened_signature)
+            != _cross_interface_signature(expected)
+        ):
             raise TreeSnapshotError("directory tree changed while it was captured")
         stream = os.fdopen(descriptor, "rb", buffering=0, closefd=False)
         try:
@@ -1175,7 +1206,7 @@ def _read_portable_file(
         final_opened = os.fstat(descriptor)
         final_named = os.lstat(path)
         if (
-            _stat_signature(final_opened) != expected
+            _stat_signature(final_opened) != opened_signature
             or _stat_signature(final_named) != expected
         ):
             raise TreeSnapshotError("directory tree changed while it was captured")
