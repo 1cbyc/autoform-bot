@@ -142,8 +142,9 @@ reports whether the resolved Lean/Mathlib pair exactly matches the bundled
 catalog's material source identity. That identity consists of the Lean
 toolchain and Mathlib package name, source kind, canonical Git URL, resolved
 commit, subdirectory, configuration file, and manifest file. Scope and input
-revision are recorded as descriptive aliases; differences produce warnings
-when the material identity still matches. The Lake configuration records
+revision are recorded as descriptive aliases; input-revision differences and
+nonempty scope differences produce warnings when the material identity still
+matches. The Lake configuration records
 requested intent; the manifest's
 effective selected Mathlib lock entry is authoritative for the URL, input
 revision, and commit Lake is instructed to materialize under the default

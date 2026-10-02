@@ -1262,6 +1262,38 @@ def test_override_ignores_unrelated_root_manifest_fields(tmp_path: Path) -> None
     assert result.compatibility.status == "supported"
 
 
+def test_duplicate_override_uses_lakes_last_entry(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    _write_mathlib_git_override(root)
+    override = root / ".lake/package-overrides.json"
+    payload = json.loads(override.read_text(encoding="utf-8"))
+    payload["packages"].insert(
+        0,
+        {
+            "name": "mathlib",
+            "scope": "",
+            "configFile": "lakefile.lean/",
+            "manifestFile": None,
+            "inherited": False,
+            "type": "git",
+            "url": "git@github.com:attacker/shadowed.git",
+            "rev": "shadowed",
+        },
+    )
+    override.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.mathlib is not None
+    assert result.mathlib.source == ".lake/package-overrides.json"
+    assert result.compatibility.status == "supported"
+    assert not any(
+        diagnostic.code in {"invalid-mathlib-url", "invalid-package-overrides"}
+        for diagnostic in result.diagnostics
+    )
+
+
 @pytest.mark.parametrize("manifest_state", ["missing", "invalid"])
 def test_override_cannot_certify_without_a_valid_root_manifest(
     manifest_state: str, tmp_path: Path
@@ -1357,6 +1389,8 @@ def test_unrelated_git_packages_do_not_receive_mathlib_url_policy(
 def test_duplicate_manifest_package_name_uses_lakes_last_entry(tmp_path: Path) -> None:
     root = _project(tmp_path)
     payload = json.loads((root / "lake-manifest.json").read_text(encoding="utf-8"))
+    payload["packages"][0]["url"] = "git@github.com:attacker/shadowed.git"
+    payload["packages"][0]["configFile"] = "lakefile.lean/"
     payload["packages"].append(
         {
             "name": "mathlib",
@@ -1377,6 +1411,10 @@ def test_duplicate_manifest_package_name_uses_lakes_last_entry(tmp_path: Path) -
     assert result.mathlib.package_type == "path"
     assert result.mathlib.path == "vendor/fake-mathlib"
     assert result.compatibility.status == "indeterminate"
+    assert not any(
+        diagnostic.code in {"invalid-mathlib-url", "invalid-lake-manifest"}
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_inherited_flag_does_not_change_materialized_mathlib_identity(

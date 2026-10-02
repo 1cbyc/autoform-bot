@@ -1204,6 +1204,12 @@ def _manifest_string(value: object, *, empty: bool = False) -> str:
     return value
 
 
+def _json_string(value: object) -> str:
+    if type(value) is not str:
+        raise _InvalidJson
+    return value
+
+
 def _git_revision_identity(value: str) -> str:
     return value.lower() if _FULL_GIT_REVISION.fullmatch(value) is not None else value
 
@@ -1281,29 +1287,23 @@ def _resolved_mathlib(
         if name is None:
             raise _InvalidJson
         scope_value = package.get("scope")
-        scope = (
-            ""
-            if scope_value is None
-            else _manifest_string(scope_value, empty=True)
-        )
+        scope = "" if scope_value is None else _json_string(scope_value)
         inherited = package.get("inherited")
         source_type = package.get("type")
         if type(inherited) is not bool or source_type not in {"git", "path"}:
             raise _InvalidJson
         config_file_value = package.get("configFile")
-        config_file = _manifest_path(
+        config_file = _json_string(
             "lakefile" if config_file_value is None else config_file_value
         )
-        assert config_file is not None
         manifest_file_value = package.get("manifestFile")
-        manifest_file = _manifest_path(
+        manifest_file = _json_string(
             "lake-manifest.json"
             if manifest_file_value is None
             else manifest_file_value
         )
         if source_type == "path":
-            directory = _manifest_path(package.get("dir"))
-            assert directory is not None
+            directory = _json_string(package.get("dir"))
             if name == "mathlib":
                 matches.append(
                     _MaterializedMathlib(
@@ -1319,26 +1319,20 @@ def _resolved_mathlib(
                     )
                 )
             continue
-        raw_git = _manifest_string(package.get("url"))
-        revision = _manifest_string(package.get("rev"))
+        raw_git = _json_string(package.get("url"))
+        revision = _json_string(package.get("rev"))
         input_revision = package.get("inputRev")
         if input_revision is not None:
-            input_revision = _manifest_string(input_revision)
+            input_revision = _json_string(input_revision)
         subdirectory = package.get("subDir")
-        subdirectory = (
-            None
-            if subdirectory in (None, "")
-            else _manifest_path(subdirectory, root_is_none=True)
-        )
+        if subdirectory is not None:
+            subdirectory = _json_string(subdirectory)
         if name == "mathlib":
-            git = _normalize_mathlib_git(raw_git, diagnostics, source)
-            if git is None:
-                raise _InvalidJson
             matches.append(
                 _MaterializedMathlib(
                     scope,
                     "git",
-                    git,
+                    raw_git,
                     revision,
                     input_revision,
                     subdirectory,
@@ -1349,7 +1343,52 @@ def _resolved_mathlib(
             )
     if not matches:
         return None
-    materialized = matches[-1]
+    selected = matches[-1]
+    scope = _manifest_string(selected.scope, empty=True)
+    config_file = _manifest_path(selected.config_file)
+    manifest_file = _manifest_path(selected.manifest_file)
+    assert config_file is not None and manifest_file is not None
+    if selected.package_type == "path":
+        directory = _manifest_path(selected.path)
+        assert directory is not None
+        materialized = _MaterializedMathlib(
+            scope,
+            "path",
+            None,
+            None,
+            None,
+            None,
+            config_file,
+            manifest_file,
+            directory,
+        )
+    else:
+        assert selected.git is not None and selected.resolved_revision is not None
+        git = _normalize_mathlib_git(selected.git, diagnostics, source)
+        if git is None:
+            raise _InvalidJson
+        revision = _manifest_string(selected.resolved_revision, empty=True)
+        input_revision = (
+            None
+            if selected.input_revision is None
+            else _manifest_string(selected.input_revision, empty=True)
+        )
+        subdirectory = (
+            None
+            if selected.subdirectory in (None, "")
+            else _manifest_path(selected.subdirectory, root_is_none=True)
+        )
+        materialized = _MaterializedMathlib(
+            scope,
+            "git",
+            git,
+            revision,
+            input_revision,
+            subdirectory,
+            config_file,
+            manifest_file,
+            None,
+        )
     if source == "lake-manifest.json" and declared is not None and (
         (
             declared.revision is not None
