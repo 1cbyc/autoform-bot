@@ -22,24 +22,31 @@ Select the rubric from the artifact under review.
   original source.
 - For a read-back, an auditor's English account of what Lean declarations
   assert, read [read-back faithfulness](references/readback-faithfulness.md).
-  Judge it against the cited source passage, without the Lean.
+  A trusted coordinator supplies its hash-bound review item. Judge only the
+  supplied testimony against the cited source passage, without opening Lean,
+  and return exactly the reference's JSON verdict.
 
 Keep objective evidence separate from judgment. Never claim compilation,
 declaration resolution, axiom cleanliness, source coverage, or dependency
 correctness without showing how it was checked. If required sources are absent,
 return insufficient evidence rather than guessing.
 
-Regenerate skeleton evidence from the exact candidate after its Lean build, and
-only in a trusted checkout or an operating-system sandbox: extraction runs Lake
-configuration and project metaprograms, which can forge its report. Treat a
+Except in the isolated read-back-judge role, regenerate skeleton evidence from
+the exact candidate after its Lean build, and only in a trusted checkout or an
+operating-system sandbox: extraction runs Lake configuration and project
+metaprograms, which can forge its report. A read-back judge must not regenerate
+or inspect that evidence; its coordinator does so before dispatch. Treat a
 stale-build refusal as insufficient evidence; never pair current source with an
 older build. Record the skeleton hash as a drift checksum, the evidence hash for
 the packet read, and, for a faithfulness verdict, the article review hash. These
-are advisory provenance, not reviewer authentication or an approval key.
+are advisory provenance, not reviewer authentication or an approval key. A
+read-back verdict also copies its manifest and raw read-back hashes as specified
+by its rubric.
 
 Report findings first, ordered by severity and tied to files or nodes. Then give
 the rubric scores, weighted verdict, commands run, unresolved questions, and a
-short remediation list. Do not edit the reviewed work unless the user separately
+short remediation list. The read-back rubric's exact JSON output replaces this
+general report layout. Do not edit the reviewed work unless the user separately
 asks for fixes.
 
 Use the short [Cabannes thesis review case](references/thesis-review-case.md)

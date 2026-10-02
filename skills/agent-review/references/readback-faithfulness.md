@@ -1,152 +1,237 @@
 # Read-back faithfulness rubric
 
-Judge whether a read-back asserts what the source passage asserts. Both sides
-are English. You never see Lean, and that is the point: a judge shown code can
-read a suggestive identifier as a promise, and every rubric that shows code has
-to warn against it. Here there is nothing to pattern-match on.
+Judge whether an independent read-back asserts the same mathematics as the
+source passage. The judge sees English evidence, not Lean. This is the blind
+half of [faithfulness](faithfulness.md): that rubric compares Lean with the
+source; this one compares testimony about Lean with the source.
 
-This rubric is the other half of [faithfulness](faithfulness.md). That one
-asks whether the Lean says what the source says. This one asks whether the
-read-back, which an auditor wrote from the Lean alone, says what the source
-says. A discrepancy here means either the formalization drifted or the auditor
-misread it, and the reviewer decides which.
+## Roles and artifacts
 
-## Evidence
+Keep the three roles separate.
 
-You receive exactly two things, and nothing else may be consulted.
+1. A **trusted coordinator** builds the exact candidate and runs skeleton
+   extraction once with its report, packets, and passages. Extraction produces
+   Lean packets, source passages, and their manifests. It does not produce a
+   read-back or a verdict.
+2. A **blind auditor** receives one declaration packet and no article, source,
+   locator, or statement of intent. The auditor returns a nonempty UTF-8
+   Markdown account of what that packet literally asserts. This returned text
+   is the read-back artifact.
+3. A **faithfulness judge** receives the source passage, the raw read-back text
+   for every declaration in the article, and the opaque provenance projection
+   below. The judge must not receive a packet, Lean name, article path, or
+   candidate checkout.
 
-1. **The source passage**, verbatim, at the locator the article cites.
-   `autoform skeleton --packets DIR --passages DIR` writes it.
-2. **The read-back**: a rendering in mathematical English of what one or more
-   Lean declarations *literally assert*, written by an auditor who was shown
-   only their blind packets, never the article, the source, or any statement
-   of intent.
+The coordinator, not either reviewing agent, records the artifacts. Durable
+asynchronous review requires an `article_id`. Store one read-back card per
+declaration under `blueprint/readbacks/<article_id>/`, with a versioned
+`manifest.json` that maps each card to its Lean declaration. Store the returned
+verdict as `faithfulness.json` in the same directory. The recorder owns
+collision-safe card filenames; consumers use the manifest rather than guessing
+paths. The judge only returns its JSON and never writes into the reviewed
+repository. The coordinator maps the packet manifest's `node_id` to that
+blueprint node's `article_id`; an absent or duplicate identity stops dispatch.
 
-Do not open any other file, and do not search for any name. If the read-back
-covers several declarations, judge them together against the passage: a source
-theorem is often an existence half and a uniqueness half, and each alone is
-honestly incomplete.
+The stored manifest is the full mapping. Store the read-back bytes exactly as
+the auditor returned them; do not render or normalize them before hashing.
 
-Read the read-back as raw text, exactly as the auditor wrote it, never as
-rendered output. A renderer shows what the text asks it to show, and a
-read-back can ask it to hide part of what it says.
+<!-- readback-manifest-template -->
+```json
+{
+  "schema": "autoform-readback-manifest/v1",
+  "article_id": "af_<24 lowercase hex digits>",
+  "node_id": "<current path-based node id>",
+  "declarations": [
+    {
+      "id": "d1",
+      "name": "<fully qualified Lean name>",
+      "card": "<collision-safe relative Markdown path>",
+      "auditor": "<model or reviewer label>",
+      "skeleton_hash": "sha256:<64 lowercase hex digits>",
+      "packet_hash": "sha256:<64 lowercase hex digits>",
+      "read_back_hash": "sha256:<64 lowercase hex digits>"
+    }
+  ],
+  "article_skeleton_hash": "sha256:<64 lowercase hex digits>",
+  "article_packet_hash": "sha256:<64 lowercase hex digits>",
+  "article_review_hash": "sha256:<64 lowercase hex digits>",
+  "passage": "<relative passage path>",
+  "passage_hash": "sha256:<64 lowercase hex digits>",
+  "passage_locator": "<source locator>",
+  "manifest_hash": "sha256:<64 lowercase hex digits>"
+}
+```
 
-## The read-back says more, on purpose
+This records the stable article identity and current node id as separate fields,
+so a rename is diagnosable rather than silently orphaning a review. The manifest
+is authoritative for card and passage paths. The manifest hash is SHA-256 over
+UTF-8 canonical JSON with sorted keys and compact separators, omitting only the
+`manifest_hash` field itself.
 
-A read-back is deliberately pedantic. It accounts for every binder, names
-typeclass assumptions, and surfaces degenerate cases the passage never
-discusses: what a definition means on the empty set, what a total function
-returns on junk input, whether a hypothesis silently forces nonemptiness.
+Before dispatching the judge, project that manifest to one opaque item:
 
-**None of that is a discrepancy.** The passage is prose for a human who
-supplies context; the read-back is a transcript of what a machine was told.
-Extra precision about the *same* claim is `elaboration`, and it is not
-penalized. Only a difference in what is *claimed* counts.
+<!-- readback-faithfulness-item-template -->
+```json
+{
+  "schema": "autoform-readback-faithfulness-item/v1",
+  "item": "af_<24 lowercase hex digits>",
+  "declarations": [
+    {
+      "id": "d1",
+      "skeleton_hash": "sha256:<64 lowercase hex digits>",
+      "packet_hash": "sha256:<64 lowercase hex digits>",
+      "read_back_hash": "sha256:<64 lowercase hex digits>"
+    }
+  ],
+  "article_skeleton_hash": "sha256:<64 lowercase hex digits>",
+  "article_packet_hash": "sha256:<64 lowercase hex digits>",
+  "article_review_hash": "sha256:<64 lowercase hex digits>",
+  "passage_hash": "sha256:<64 lowercase hex digits>",
+  "manifest_hash": "sha256:<64 lowercase hex digits>"
+}
+```
+
+`d1`, `d2`, and so on follow the declaration order in the packet manifest. The
+coordinator supplies read-backs in that same order. It verifies that the report
+and all packet entries agree on the node, declaration list, article skeleton,
+article packet, and review hashes, that the passage manifest has the same node
+and review hash, and that every packet, passage, and read-back file matches its
+recorded hash. A missing source passage, duplicate or unordered declaration, or
+disagreeing record makes the item unavailable; do not ask the judge to repair
+it.
+
+The declaration and article skeleton hashes bind elaborated meaning and trust
+context. The packet hash binds the exact declaration packet seen by its auditor.
+The article packet hash binds the joint packet. The article review hash also
+binds that joint packet to the cited passage and locator. None of those hashes
+binds the read-back, so the read-back hash is required. These are drift
+checksums, not reviewer authentication or an approval key.
+
+## Evidence boundary
+
+The judge receives exactly three kinds of input:
+
+1. the opaque item JSON;
+2. the cited source passage as raw text;
+3. each declaration's raw read-back text, labelled only `d1`, `d2`, and so on.
+
+Do not open other files, resolve a declaration name, inspect the stored mapping,
+or search the repository. Judge all read-backs for one item together: one source
+theorem may be split into existence and uniqueness declarations that are
+incomplete in isolation.
+
+Read both mathematical texts as raw text, not rendered output. A zero-width or
+bidirectional character, control code, or TeX construct such as `\phantom` can
+make rendered content differ from the bytes under review. Record `unreadable`
+rather than carding around hidden content.
 
 ## Procedure
 
-Work in three steps and show each.
+1. Copy the item's provenance fields into the verdict without changing them.
+2. Card the passage: objects and kinds, numbered hypotheses, conclusion, and
+   quantifier order. Mark a hypothesis implicit only when the passage actually
+   relies on it.
+3. Card the combined read-backs in the same form.
+4. List every discrepancy with exactly one category from the table. The worst
+   category determines the decision; implication in one direction is not
+   equivalence.
 
-1. **Card the passage.** Its objects with their kinds, its hypotheses
-   numbered, its conclusion, its quantifier structure. Mark a hypothesis
-   *implicit* when the passage uses it without stating it.
-2. **Card the read-back** the same way, from its prose alone.
-3. **List discrepancies**, each with one category below and one line of
-   detail, then read the decision off the list. Never adjust it by impression.
+A read-back is expected to spell out binders, conventions, and degenerate
+behavior already determined by the same claim. That is `elaboration`. Extending
+the domain, removing a hypothesis, strengthening a conclusion, or adding a
+nonredundant assumption changes the claim and is not elaboration.
 
-## Discrepancy vocabulary
+## Categories and decisions
 
-| Category | Meaning |
-|---|---|
-| `elaboration` | The read-back is more precise about the same claim: a degenerate case, a convention, a binder the passage leaves implicit. Not penalized. |
-| `hypothesis-missing` | A hypothesis the passage states has no counterpart, and the conclusion needs it. |
-| `hypothesis-missing: generalizes` | A hypothesis has no counterpart, yet every instance of the passage's setting is an instance of the read-back's. Say why in the detail line. |
-| `hypothesis-added` | The read-back assumes something the passage proves or constructs. |
-| `conclusion-weaker` / `conclusion-stronger` / `conclusion-different` | The conclusion says less, more, or something else. Existence in place of unique existence is `conclusion-weaker`. |
-| `quantifier` | Order, strength, or dependence of a quantifier changed. |
-| `strictness` | Strict against non-strict, open against closed, positive against nonnegative. |
-| `domain` | Type, domain, finiteness, or locality changed. |
-| `object-substituted` | A passage object is replaced by a proxy the read-back does not connect to it. |
-| `scope` | The read-back covers part of what the passage claims and is silent on the rest. Say which parts are covered. |
-| `vacuous` | The read-back says the hypotheses cannot all hold, or that the claim holds trivially. |
-| `unreadable` | The read-back does not state a mathematical claim you can card, or hides part of what it says from whoever reads it rendered. |
-| `none` | The cards agree. |
+| Category | Decision | Meaning |
+|---|---|---|
+| `none` | `agrees` | The cards state the same claim. |
+| `elaboration` | `agrees` | Extra wording makes an implicit binder, convention, or logically redundant implementation detail explicit without changing the mathematical instances or conclusion. |
+| `equivalent-reformulation` | `review` | The forms appear mathematically equivalent, but the equivalence needs independent confirmation. State it in words. |
+| `hypothesis-missing` | `disagrees` | A source hypothesis is absent from the read-back. This makes the read-back stronger unless another mismatch intervenes; a stronger theorem is still not the same statement. |
+| `hypothesis-added` | `disagrees` | The read-back has an additional nonredundant assumption that the passage neither states nor implicitly requires. This makes the read-back weaker. |
+| `conclusion-weaker` | `disagrees` | The read-back conclusion says less, such as existence instead of unique existence. |
+| `conclusion-stronger` | `disagrees` | The read-back conclusion says more. Proving more does not make the formalized statement identical to the cited one. |
+| `conclusion-different` | `disagrees` | Neither conclusion entails the other as stated. |
+| `quantifier` | `disagrees` | Quantifier order, strength, or dependence changed. |
+| `strictness` | `disagrees` | Strict became non-strict, open became closed, or positive became nonnegative, or conversely. |
+| `domain` | `disagrees` | Type, domain, finiteness, locality, or covered edge cases changed. |
+| `object-substituted` | `disagrees` | A passage object became a proxy that the read-back does not connect to it. |
+| `scope` | `disagrees` | The read-backs cover only part of what the passage claims. Name the omitted part. |
+| `vacuous` | `disagrees` | The read-back says the hypotheses cannot hold or the claim is trivial for an unintended reason. |
+| `unreadable` | `disagrees` | The text cannot be carded as supplied, including content hidden from rendered output. |
+| `evidence-missing` | `unknown` | The passage, a read-back, or required provenance is absent or malformed. |
 
-## Decision
+Use `elaboration` for an added assumption only when it is plainly redundant or
+an implementation-level restatement and the detail line says why it changes no
+mathematical instance. Otherwise use `hypothesis-added`. Use
+`equivalent-reformulation`, not `elaboration`, when equivalence itself needs an
+argument. There is no special pass for a missing hypothesis that generalizes
+the source: substantive strengthening is `hypothesis-missing` and disagrees.
 
-Three outcomes, bound to the list. A read-back takes the worst outcome any of
-its discrepancies binds it to.
+An item takes the worst decision among its discrepancies:
+`disagrees` outranks `unknown`, which outranks `review`, which outranks `agrees`.
+Use `unknown` only when evidence is unavailable. A present but unrelated claim
+is `conclusion-different`, not unknown.
 
-| Decision | Bound to |
-|---|---|
-| `agrees` | Only `none`, `elaboration`, or `hypothesis-missing: generalizes`. |
-| `review` | A difference you believe is only apparent — a cleared denominator, an equivalent reformulation, a coercion. State the equivalence in words; see below. A belief you cannot state is not `review`. |
-| `disagrees` | Any `hypothesis-missing`, `hypothesis-added`, plain `conclusion-*`, `quantifier`, `strictness`, `domain`, `object-substituted`, `scope`, `vacuous`, or `unreadable`. |
+## Exact output
 
-Return `unknown` instead when the passage is missing or the two cannot be
-aligned at all.
+Return one JSON object per item and nothing else. Copy all provenance values and
+the declaration order verbatim from the input item. Use `null` for
+`equivalence_to_settle` unless the decision is `review`.
 
-Where a report asks for rubric scores, `agrees` passes, `disagrees` rejects,
-and `review` is left to a human, like a 3 in [faithfulness](faithfulness.md).
-
-Anti-inflation guard: if your own detail lines say "meaningful",
-"significant", "roughly", or "not formally established", the decision is
-`disagrees`.
-
-## Settling a `review`
-
-`review` is the one decision you may not make alone, because you cannot see the
-Lean and so cannot check what you are claiming. You do not know which
-declarations the read-back covers either, and must not try to find out. State
-the equivalence in words, against the item, and hand it on to someone who can
-see the Lean. They settle it, for example by proving the equivalence in Lean,
-or reject it.
-
-Most `scope` findings need no such escalation and must not receive one. When a
-read-back honestly covers less than the passage it cites, the remedy is at the
-article — cite the part formalized, or formalize the rest.
-
-## Output
-
-One block per item, in this order, nothing else:
-
-```text
-item: <id>
-passage card:
-  objects: …
-  hypotheses: 1. … 2. … (implicit: …)
-  conclusion: …
-read-back card:
-  objects: …
-  hypotheses: 1. … 2. …
-  conclusion: …
-discrepancies:
-  - <category> — <one line>
-equivalence to settle: <the equivalence, in words | none>
-decision: <agrees | review | disagrees | unknown>
-verdict: <one sentence, naming the binding discrepancy or "cards agree">
+<!-- readback-faithfulness-verdict-template -->
+```json
+{
+  "schema": "autoform-readback-faithfulness-verdict/v1",
+  "item": "af_<24 lowercase hex digits>",
+  "declarations": [
+    {
+      "id": "d1",
+      "skeleton_hash": "sha256:<64 lowercase hex digits>",
+      "packet_hash": "sha256:<64 lowercase hex digits>",
+      "read_back_hash": "sha256:<64 lowercase hex digits>"
+    }
+  ],
+  "article_skeleton_hash": "sha256:<64 lowercase hex digits>",
+  "article_packet_hash": "sha256:<64 lowercase hex digits>",
+  "article_review_hash": "sha256:<64 lowercase hex digits>",
+  "passage_hash": "sha256:<64 lowercase hex digits>",
+  "manifest_hash": "sha256:<64 lowercase hex digits>",
+  "passage_card": {
+    "objects": ["<object and kind>"],
+    "hypotheses": ["1. <hypothesis>"],
+    "conclusion": "<conclusion>",
+    "quantifiers": "<order and dependence>"
+  },
+  "read_back_card": {
+    "objects": ["<object and kind>"],
+    "hypotheses": ["1. <hypothesis>"],
+    "conclusion": "<conclusion>",
+    "quantifiers": "<order and dependence>"
+  },
+  "discrepancies": [
+    {"category": "none", "detail": "cards agree"}
+  ],
+  "equivalence_to_settle": null,
+  "decision": "agrees",
+  "verdict": "cards agree"
+}
 ```
 
-## Traps
+The recorder validates the copied provenance and the decision/category mapping
+before storing `faithfulness.json`. A changed skeleton, packet, passage, locator,
+or read-back invalidates the recorded verdict. A valid hash match establishes
+artifact identity only; it does not establish who wrote or approved the
+verdict.
 
-- **Extra precision is not disagreement.** A read-back that explains what a
-  definition means on the empty set, where the passage says nothing, is doing
-  its job. Card the claim, not the word count.
-- **Silence is not agreement.** If the passage claims two things and the
-  read-back addresses one, that is `scope`, however well it treats the first.
-- **Existence for uniqueness, local for global, weak for strict.** These are
-  the quiet weakenings. Check each connective, not the shape of the sentence.
-- **A read-back that reports a vacuous statement is telling you something.**
-  Record `vacuous` and let the reviewer decide; do not rescue it.
-- **You cannot see the Lean, so do not guess at it.** Judge the English in
-  front of you. If the read-back is ambiguous, that ambiguity is the finding.
-- **What does not show is not said.** A zero-width, control, or
-  bidirectional-override character, or a TeX construct that hides what it
-  wraps — `\phantom`, `\hphantom`, `\vphantom`, or a colour or style that makes
-  text vanish — means the rendered read-back differs from the text you were
-  given. Record `unreadable`, quote the construct, and do not card around it:
-  a human reads the rendered version, not yours.
-- **A wide locator is the article's fault, not the auditor's.** When the
-  passage cites a whole section and the read-back renders one theorem from it,
-  record `scope` against the article and say so; the auditor never saw the
-  locator.
+## Review escalation
+
+For `equivalent-reformulation`, state the proposed equivalence in words and
+hand it to a reviewer allowed to inspect Lean. That reviewer may prove the
+equivalence or reject it. Do not use `review` for a partial result, a stronger
+result, or a claim described only as "roughly" or "essentially" the same.
+
+A wide source locator is an article defect, not an auditor defect. If the
+passage contains several claims and the read-backs cover only one, record
+`scope`; the remedy is to narrow the citation or formalize the rest.
