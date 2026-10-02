@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 from . import graph_pages, graph_views, mermaid, status
-from .coverage import CoverageSummary, load_coverage
+from .coverage import COVERAGE_DISPOSITIONS, CoverageSummary, load_coverage
 from .graph import Graph, Node, load_graph
 from .lean import SourceLinker, build_linker, declaration_names
 from .status import is_definition
@@ -1126,9 +1126,12 @@ def _render_landing_page(
 
 #: States a contributor could pick up today.
 _ACTIONABLE_STATES = frozenset({"can_prove", "can_state"})
-# Presentation starts with work expanded into the roadmap, then the remaining
-# author-declared source dispositions. The parser's canonical order is separate.
-_COVERAGE_SUMMARY_ORDER = ("DECOMPOSED", "MAPPED", "DEFERRED", "OUT")
+# Presentation starts with work expanded into the roadmap, then follows the
+# parser's canonical order. Deriving this tuple keeps newly added dispositions
+# visible instead of silently dropping them from the landing page.
+_COVERAGE_SUMMARY_ORDER = tuple(
+    sorted(COVERAGE_DISPOSITIONS, key=lambda disposition: disposition != "DECOMPOSED")
+)
 
 
 def _is_countable(graph: Graph, node_id: str) -> bool:
@@ -1148,13 +1151,13 @@ def _countable(graph: Graph) -> list[str]:
 
 
 def _completion_percentage(done: int, total: int) -> int:
-    """Round progress while reserving 100 percent for actual completion."""
+    """Round progress while reserving both endpoints for the exact endpoints."""
 
-    if not total:
+    if not total or not done:
         return 0
     if done == total:
         return 100
-    return min(99, round(100 * done / total))
+    return max(1, min(99, round(100 * done / total)))
 
 
 def _coverage_summary(coverage: CoverageSummary) -> str:
@@ -1186,11 +1189,10 @@ def _render_hero(
     """
     leaves = _countable(graph)
     selected = {node_id: statuses[node_id] for node_id in leaves}
-    # Presentation states change with dependency readiness: the same unproved
-    # theorem is ``stated`` while blocked and ``can_prove`` once unblocked.
-    # ``proved`` is the stable semantic boundary and also covers definitions
-    # (which have no separate proof obligation) and Mathlib targets.
-    done = sum(node_status.proved for node_status in selected.values())
+    # A target is complete only when it and every prerequisite are proved.
+    # ``proved`` alone covers its own proof, definition body, or authored
+    # Mathlib marker; ``fully_proved`` also closes the dependency chain.
+    done = sum(node_status.fully_proved for node_status in selected.values())
     actionable = sum(
         count for state, count in status.summarize(selected) if state.key in _ACTIONABLE_STATES
     )

@@ -8,11 +8,13 @@ from pathlib import Path
 
 import pytest
 
+from autoform_cli.coverage import COVERAGE_DISPOSITIONS
 from autoform_cli.graph import load_graph
 from autoform_cli.lean import _normalize_remote
 from autoform_cli.render import (
     PUBLICATION_MANIFEST,
     PublicationError,
+    _COVERAGE_SUMMARY_ORDER,
     _completion_percentage,
     render_site,
 )
@@ -403,6 +405,24 @@ def test_statement_only_theorems_never_count_as_complete(tmp_path: Path) -> None
     assert "2 of 3 targets complete" in ready
 
 
+def test_completion_requires_every_dependency_to_be_fully_proved(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / "blueprint/roadmap/base.md").write_text(
+        "---\n---\n\n# Base\n\nAn unfinished prerequisite.\n",
+        encoding="utf-8",
+    )
+
+    statuses = derive(load_graph(project / "blueprint"))
+    assert statuses["top"].proved
+    assert not statuses["top"].fully_proved
+
+    render_site(project / "blueprint", tmp_path / "out", lean_root=project)
+
+    overview = (tmp_path / "out/README.md").read_text(encoding="utf-8")
+    assert "0 of 1 target complete" in overview
+    assert '<div class="bp-figure-value">0%</div>' in overview
+
+
 def test_definitions_and_mathlib_marked_targets_count_as_complete(tmp_path: Path) -> None:
     project = _project(tmp_path)
     (project / "blueprint/roadmap/upstream.md").write_text(
@@ -421,9 +441,17 @@ def test_definitions_and_mathlib_marked_targets_count_as_complete(tmp_path: Path
 
 
 def test_completion_percentage_reserves_100_for_complete_work() -> None:
+    assert _completion_percentage(0, 200) == 0
+    assert _completion_percentage(1, 200) == 1
     assert _completion_percentage(199, 200) == 99
     assert _completion_percentage(200, 200) == 100
     assert _completion_percentage(0, 0) == 0
+
+
+def test_coverage_summary_tracks_every_canonical_disposition() -> None:
+    assert set(_COVERAGE_SUMMARY_ORDER) == set(COVERAGE_DISPOSITIONS)
+    assert len(_COVERAGE_SUMMARY_ORDER) == len(COVERAGE_DISPOSITIONS)
+    assert _COVERAGE_SUMMARY_ORDER[0] == "DECOMPOSED"
 
 
 def test_single_target_uses_singular_completion_copy(tmp_path: Path) -> None:

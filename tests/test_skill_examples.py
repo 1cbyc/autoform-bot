@@ -41,11 +41,15 @@ def test_human_review_distinguishes_roadmap_progress_from_source_scope(
 
     assert "`Scoped roadmap` percentage" in skill
     assert "formalizable leaf targets" in skill
+    assert "fully proved, including every dependency" in skill
     assert "bodies for definitions" in skill
-    assert "verified Mathlib targets" in skill
+    assert "`mathlib: true` follows the authored status contract" in skill
+    assert "not audit verification" in skill
     assert "never as whole-source completion" in skill
     assert "linked coverage contract" in skill
     assert "statement-only theorem remains incomplete" in skill
+    assert "landing-page progress summary" in skill
+    assert "overview, progress, project graph" not in skill
 
 
 def test_development_guidance_requires_fail_closed_local_safety(repo_root: Path) -> None:
