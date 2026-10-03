@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -594,6 +594,54 @@ def test_portable_capture_rejects_repeatable_nested_directory_redirection(
     finally:
         restore()
         bound.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-handle lock")
+def test_windows_portable_capture_locks_a_child_before_selection(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "Local.lean").write_text("def local : Nat := 0\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Escaped.lean").write_text(
+        "def escaped : Nat := 0\n",
+        encoding="utf-8",
+    )
+    displaced = tmp_path / "displaced"
+    attempted = False
+    blocked = False
+
+    def descend(path: PurePosixPath) -> bool:
+        nonlocal attempted, blocked
+        if path.as_posix() == "nested":
+            attempted = True
+            try:
+                nested.rename(displaced)
+            except OSError:
+                blocked = True
+                raise
+            nested.symlink_to(outside, target_is_directory=True)
+        return True
+
+    bound = BoundDirectoryTree(
+        root,
+        selection=TreeSelection(include=lambda _path, _mode: True, descend=descend),
+    )
+    try:
+        with pytest.raises(TreeSnapshotError, match="changed while it was captured"):
+            bound.capture()
+    finally:
+        if nested.is_symlink():
+            nested.unlink()
+            displaced.rename(nested)
+        bound.close()
+
+    assert attempted
+    assert blocked
+    assert (nested / "Local.lean").is_file()
 
 
 def test_portable_capture_rejects_a_file_swapped_to_fifo_without_blocking(

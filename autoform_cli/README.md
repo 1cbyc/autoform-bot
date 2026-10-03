@@ -509,11 +509,6 @@ absent from the sources, as `leanblueprint checkdecls` does for LaTeX
 blueprints. It validates structure and leaves mathematical correctness to the
 agent and the Lean kernel.
 
-Source-aware `--lean-root` inspection currently requires POSIX
-directory-descriptor APIs. On Windows it fails closed rather than treating
-repeatable path captures as a filesystem-generation boundary; commands that do
-not inspect Lean sources remain available.
-
 The Markdown files are the source of truth. Graphs and sites are derived views
 that may be regenerated at any time.
 
