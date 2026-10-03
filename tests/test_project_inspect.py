@@ -168,18 +168,39 @@ def test_last_duplicate_manifest_entry_wins(tmp_path: Path) -> None:
     assert result.compatibility.status == "supported"
 
 
-def test_unverified_transitive_mathlib_is_indeterminate(tmp_path: Path) -> None:
+LOOM_LAKEFILE = 'name = "Example"\n\n[[require]]\nname = "loom"\ngit = "https://example.com/loom"\n'
+
+
+def test_transitive_mathlib_still_decides_compatibility(tmp_path: Path) -> None:
     inherited = {**_mathlib(), "inherited": True}
-    lakefile = 'name = "Example"\n\n[[require]]\nname = "loom"\ngit = "https://example.com/loom"\n'
-    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(inherited,)))
+    result = inspect_project(_project(tmp_path, lakefile=LOOM_LAKEFILE, manifest=(inherited,)))
+
+    assert result.compatibility.status == "supported"
+    assert "mathlib-manifest-unused" not in _codes(result)
+
+
+def test_direct_lock_without_a_requirement_is_unused(tmp_path: Path) -> None:
+    result = inspect_project(_project(tmp_path, lakefile=LOOM_LAKEFILE))
 
     assert result.mathlib is None
     assert result.compatibility.status == "indeterminate"
     assert "mathlib-manifest-unused" in _codes(result)
 
 
-def test_direct_lock_without_a_requirement_is_unused(tmp_path: Path) -> None:
-    result = inspect_project(_project(tmp_path, lakefile='name = "Example"\n'))
+@pytest.mark.parametrize("inherited", [False, True])
+def test_lock_without_any_requirement_is_unused(tmp_path: Path, inherited: bool) -> None:
+    manifest = ({**_mathlib(), "inherited": inherited},)
+    result = inspect_project(_project(tmp_path, lakefile='name = "Example"\n', manifest=manifest))
+
+    assert result.mathlib is None
+    assert result.compatibility.status == "indeterminate"
+    assert "mathlib-manifest-unused" in _codes(result)
+
+
+def test_root_named_mathlib_also_satisfies_transitive_requirements(tmp_path: Path) -> None:
+    inherited = {**_mathlib(), "inherited": True}
+    lakefile = LOOM_LAKEFILE.replace('"Example"', '"mathlib"')
+    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(inherited,)))
 
     assert result.mathlib is None
     assert result.compatibility.status == "indeterminate"

@@ -149,9 +149,18 @@ unreadable, or required but missing, Mathlib is path-based, or a required
 configuration is not evaluated. When Lake can load the root manifest, a
 `.lake/package-overrides.json` entry for Mathlib replaces the manifest's, and
 a `lakefile.toml` that requests a different Mathlib than the lock gets a
-`lake-manifest-stale` warning. A lock entry without a direct Mathlib
-requirement stays `indeterminate`, because proving it is transitively active
-would require evaluating dependency configurations. `lakefile.lean` takes
+`lake-manifest-stale` warning. Lake resolves every requirement, direct or
+transitive, from the root manifest, so the Mathlib entry decides compatibility
+when `lakefile.toml` requires Mathlib, or requires other packages and the
+manifest records the entry as inherited from them. It is unused, with a
+`mathlib-manifest-unused` warning and an `indeterminate` answer, when
+`lakefile.toml` requires no packages, when the entry is not inherited and no
+require names Mathlib, or when the root package is itself named `mathlib`,
+which Lake reuses for every Mathlib requirement. Dependency lakefiles and
+manifests are not read: `lake update` records an inherited entry only while a
+dependency needs it, but an entry left behind after removing the require that
+pulled Mathlib in, without running `lake update`, is still taken as recorded.
+`lakefile.lean` takes
 precedence, as in Lake, but is never evaluated, so its projects stay
 `indeterminate`. The decision files are size-bounded and read twice as one
 snapshot; inspection retries or fails if their bytes, identities, presence, or

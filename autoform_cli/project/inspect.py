@@ -112,6 +112,19 @@ class LakeProject:
 
 
 @dataclass(frozen=True, slots=True)
+class _Requirements:
+    """What lakefile.toml's require entries say about the manifest's Mathlib entry.
+
+    ``mathlib`` is the direct Mathlib requirement Lake keeps, if Lake resolves it from the manifest.
+    ``transitive`` is whether another requirement may pull Mathlib in, which Lake then also resolves
+    from the root manifest; the dependencies' own lakefiles are not read to confirm it.
+    """
+
+    mathlib: dict | None
+    transitive: bool
+
+
+@dataclass(frozen=True, slots=True)
 class MathlibLock:
     """A Lake manifest or package-overrides entry for Mathlib."""
 
@@ -247,7 +260,8 @@ def _inspect_snapshot(
     project_root: str,
     autoform_paths: tuple[str, ...],
 ) -> ProjectInspection:
-    lake, requirement = _inspect_lake(snapshot, diagnostics)
+    lake, requirements = _inspect_lake(snapshot, diagnostics)
+    requirement = requirements.mathlib if requirements is not None else None
     toolchain = _inspect_toolchain(snapshot, diagnostics)
     has_manifest = snapshot.file(_MANIFEST).state != "missing"
     if not has_manifest:
@@ -287,16 +301,8 @@ def _inspect_snapshot(
         )
     if lake is not None and lake.config == "lakefile.lean":
         mathlib = None
-    elif mathlib is not None and lake is not None and requirement is None:
-        diagnostics.append(
-            ProjectDiagnostic(
-                "warning",
-                "mathlib-manifest-unused",
-                "The manifest contains Mathlib, but lakefile.toml does not require it; offline inspection cannot "
-                "establish a transitive path that makes it active.",
-                mathlib.source,
-            )
-        )
+    elif mathlib is not None and requirements is not None and (unused := _unused_mathlib(requirements, mathlib)):
+        diagnostics.append(ProjectDiagnostic("warning", "mathlib-manifest-unused", unused, mathlib.source))
         mathlib = None
     return _result(
         catalog,
@@ -359,7 +365,7 @@ def _result(
 
 def _inspect_lake(
     snapshot: _DecisionSnapshot, diagnostics: list[ProjectDiagnostic]
-) -> tuple[LakeProject | None, dict | None]:
+) -> tuple[LakeProject | None, _Requirements | None]:
     if snapshot.file("lakefile.lean").state != "missing":
         if _read_text(snapshot, "lakefile.lean", diagnostics) is None:
             return None, None
@@ -414,12 +420,34 @@ def _inspect_lake(
         None,
     )
     lake = LakeProject("lakefile.toml", config["name"], config.get("version"), targets)
-    root_name = _canonical_toml_name(config["name"])
-    # Resolver reuse of the root package satisfies a same-name requirement;
-    # the external manifest entry is therefore not materialized.
-    if requirement is not None and _canonical_toml_name(requirement["name"]) == root_name:
-        requirement = None
-    return lake, requirement
+    # Lake's resolver reuses an already loaded package of the required name
+    # before it consults the manifest, and the root is loaded first, so a root
+    # named mathlib satisfies every Mathlib requirement, direct or transitive;
+    # the manifest's Mathlib entry is then never materialized.
+    if _canonical_toml_name(config["name"]) == _MATHLIB_NAME:
+        return lake, _Requirements(None, transitive=False)
+    return lake, _Requirements(requirement, transitive=bool(config.get("require")))
+
+
+def _unused_mathlib(requirements: _Requirements, mathlib: MathlibLock) -> str | None:
+    """Why Lake never materializes the manifest's Mathlib entry, if it does not.
+
+    Lake resolves the root's requirements and, recursively, its dependencies'
+    against the root manifest alone (``Workspace.materializeDeps``), and
+    ``lake update`` records only reachable packages, so an inherited entry
+    under other requirements is taken as recorded.
+    """
+
+    if requirements.mathlib is not None:
+        return None
+    if not requirements.transitive:
+        return (
+            "Lake resolves no Mathlib from the manifest: lakefile.toml requires no packages, "
+            "or its own package is named mathlib."
+        )
+    if not mathlib.inherited:
+        return "The manifest locks Mathlib directly, but lakefile.toml does not require it, so Lake does not build it."
+    return None
 
 
 def _lakefile_problem(config: dict) -> str | None:
