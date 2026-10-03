@@ -160,6 +160,10 @@ which Lake reuses for every Mathlib requirement. Dependency lakefiles and
 manifests are not read: `lake update` records an inherited entry only while a
 dependency needs it, but an entry left behind after removing the require that
 pulled Mathlib in, without running `lake update`, is still taken as recorded.
+A require that neither the manifest nor the overrides record, or any require
+when they record no packages, is a `lake-manifest-incomplete` error, because
+Lake then refuses to build until `lake update`; a require of the root
+package's own name is satisfied by the root and is not looked up.
 `lakefile.lean` takes
 precedence, as in Lake, but is never evaluated, so its projects stay
 `indeterminate`. The decision files are size-bounded and read twice as one

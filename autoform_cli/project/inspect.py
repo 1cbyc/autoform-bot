@@ -113,15 +113,28 @@ class LakeProject:
 
 @dataclass(frozen=True, slots=True)
 class _Requirements:
-    """What lakefile.toml's require entries say about the manifest's Mathlib entry.
+    """lakefile.toml's require entries, as Lake resolves them against the root manifest.
 
     ``mathlib`` is the direct Mathlib requirement Lake keeps, if Lake resolves it from the manifest.
     ``transitive`` is whether another requirement may pull Mathlib in, which Lake then also resolves
     from the root manifest; the dependencies' own lakefiles are not read to confirm it.
+    ``declared`` is whether there is any require entry, and ``lookups`` holds the Lean name and
+    spelling of each requirement Lake looks up in the manifest and overrides rather than satisfying
+    with the root package itself.
     """
 
     mathlib: dict | None
     transitive: bool
+    declared: bool = False
+    lookups: tuple[tuple[tuple[tuple[str, str | int], ...], str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _LockedPackages:
+    """The package names a manifest or package-overrides file records, and its Mathlib entry."""
+
+    names: frozenset[tuple[tuple[str, str | int], ...]]
+    mathlib: MathlibLock | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,12 +290,18 @@ def _inspect_snapshot(
                 _MANIFEST,
             )
         )
-    manifest_valid, locked = _locked_mathlib(snapshot, _MANIFEST, diagnostics)
-    overrides_valid, override = (True, None)
+    manifest_valid, manifest_packages = _locked_mathlib(snapshot, _MANIFEST, diagnostics)
+    overrides_valid, override_packages = (True, None)
     # Lake reads workspace overrides only on the manifest-loading path. With no
     # usable root manifest it updates instead and never parses this file.
     if has_manifest and manifest_valid:
-        overrides_valid, override = _locked_mathlib(snapshot, _OVERRIDES, diagnostics)
+        overrides_valid, override_packages = _locked_mathlib(snapshot, _OVERRIDES, diagnostics)
+    locked = manifest_packages.mathlib if manifest_packages is not None else None
+    override = override_packages.mathlib if override_packages is not None else None
+    if manifest_packages is not None and overrides_valid and requirements is not None:
+        recorded = manifest_packages.names | (override_packages.names if override_packages is not None else frozenset())
+        if (incomplete := _unrecorded_requirements(requirements, recorded)) is not None:
+            diagnostics.append(ProjectDiagnostic("error", "lake-manifest-incomplete", incomplete, _MANIFEST))
     mathlib = locked if manifest_valid and overrides_valid else None
     if override is not None:  # Lake applies overrides to a manifest's packages
         diagnostics.append(
@@ -425,12 +444,42 @@ def _inspect_lake(
     )
     lake = LakeProject("lakefile.toml", config["name"], config.get("version"), targets)
     # Lake's resolver reuses an already loaded package of the required name
-    # before it consults the manifest, and the root is loaded first, so a root
-    # named mathlib satisfies every Mathlib requirement, direct or transitive;
-    # the manifest's Mathlib entry is then never materialized.
-    if _canonical_toml_name(config["name"]) == _MATHLIB_NAME:
-        return lake, _Requirements(None, transitive=False)
-    return lake, _Requirements(requirement, transitive=bool(config.get("require")))
+    # before it consults the manifest, and the root is loaded first, so a
+    # requirement of the root's own name never reaches the manifest. A root
+    # named mathlib thus satisfies every Mathlib requirement, direct or
+    # transitive, and the manifest's Mathlib entry is never materialized.
+    root_name = _canonical_toml_name(config["name"])
+    declared = bool(config.get("require"))
+    lookups = tuple(
+        (name, entry["name"])
+        for entry in config.get("require", [])
+        if (name := _canonical_toml_name(entry["name"])) != root_name
+    )
+    if root_name == _MATHLIB_NAME:
+        return lake, _Requirements(None, transitive=False, declared=declared, lookups=lookups)
+    return lake, _Requirements(requirement, transitive=declared, declared=declared, lookups=lookups)
+
+
+def _unrecorded_requirements(requirements: _Requirements, recorded: frozenset) -> str | None:
+    """Why Lake refuses to resolve lakefile.toml's requirements from the manifest, if it does.
+
+    ``Workspace.materializeDeps`` stops with "missing manifest" when the
+    manifest and overrides record no packages but lakefile.toml requires
+    some, and with "dependency ... not in manifest" when a requirement Lake
+    looks up there is absent; both ask for `lake update`.
+    """
+
+    if requirements.declared and not recorded:
+        return (
+            "lake-manifest.json records no packages, but lakefile.toml has requirements; Lake asks for `lake update`."
+        )
+    missing = list(dict.fromkeys(spelling for name, spelling in requirements.lookups if name not in recorded))
+    if missing:
+        return (
+            f"lakefile.toml requires {', '.join(map(repr, missing))}, which neither lake-manifest.json nor "
+            "package-overrides.json records; Lake asks for `lake update`."
+        )
+    return None
 
 
 def _unused_mathlib(requirements: _Requirements, mathlib: MathlibLock) -> str | None:
@@ -665,8 +714,8 @@ def _inspect_toolchain(snapshot: _DecisionSnapshot, diagnostics: list[ProjectDia
 
 def _locked_mathlib(
     snapshot: _DecisionSnapshot, relative: str, diagnostics: list[ProjectDiagnostic]
-) -> tuple[bool, MathlibLock | None]:
-    """Read the Mathlib entry of a Lake manifest or package-overrides file, if any."""
+) -> tuple[bool, _LockedPackages | None]:
+    """Read the package names and Mathlib entry of a Lake manifest or package-overrides file, if any."""
 
     if snapshot.file(relative).state == "missing":
         return True, None
@@ -713,7 +762,7 @@ def _locked_mathlib(
         return False, None
     # Lake inserts entries into a NameMap in order, so the last duplicate wins.
     match = next((lock for name, lock in reversed(decoded) if name == _MATHLIB_NAME), None)
-    return True, match
+    return True, _LockedPackages(frozenset(name for name, _lock in decoded), match)
 
 
 def _validate_manifest_root(payload: dict[str, object]) -> None:

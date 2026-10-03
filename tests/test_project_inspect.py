@@ -169,18 +169,19 @@ def test_last_duplicate_manifest_entry_wins(tmp_path: Path) -> None:
 
 
 LOOM_LAKEFILE = 'name = "Example"\n\n[[require]]\nname = "loom"\ngit = "https://example.com/loom"\n'
+LOOM = _mathlib(name="loom", url="https://example.com/loom", rev=OTHER_COMMIT, input_rev=None)
 
 
 def test_transitive_mathlib_still_decides_compatibility(tmp_path: Path) -> None:
     inherited = {**_mathlib(), "inherited": True}
-    result = inspect_project(_project(tmp_path, lakefile=LOOM_LAKEFILE, manifest=(inherited,)))
+    result = inspect_project(_project(tmp_path, lakefile=LOOM_LAKEFILE, manifest=(LOOM, inherited)))
 
     assert result.compatibility.status == "supported"
     assert "mathlib-manifest-unused" not in _codes(result)
 
 
 def test_direct_lock_without_a_requirement_is_unused(tmp_path: Path) -> None:
-    result = inspect_project(_project(tmp_path, lakefile=LOOM_LAKEFILE))
+    result = inspect_project(_project(tmp_path, lakefile=LOOM_LAKEFILE, manifest=(LOOM, _mathlib())))
 
     assert result.mathlib is None
     assert result.compatibility.status == "indeterminate"
@@ -200,11 +201,58 @@ def test_lock_without_any_requirement_is_unused(tmp_path: Path, inherited: bool)
 def test_root_named_mathlib_also_satisfies_transitive_requirements(tmp_path: Path) -> None:
     inherited = {**_mathlib(), "inherited": True}
     lakefile = LOOM_LAKEFILE.replace('"Example"', '"mathlib"')
-    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(inherited,)))
+    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(LOOM, inherited)))
 
     assert result.mathlib is None
     assert result.compatibility.status == "indeterminate"
     assert "mathlib-manifest-unused" in _codes(result)
+
+
+def _write_overrides(root: Path, *packages: dict) -> None:
+    (root / ".lake").mkdir()
+    (root / ".lake/package-overrides.json").write_text(
+        json.dumps({"schemaVersion": "1.1.0", "packages": list(packages)}), encoding="utf-8"
+    )
+
+
+def test_requirement_the_manifest_does_not_record_is_an_error(tmp_path: Path) -> None:
+    lakefile = LAKEFILE + '\n[[require]]\nname = "batteries"\nscope = "leanprover-community"\n'
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "lake-manifest-incomplete" in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "lakefile", [LAKEFILE, 'name = "mathlib"\n\n[[require]]\nname = "mathlib"\n'], ids=["mathlib", "root-named"]
+)
+def test_requirements_against_a_manifest_without_packages_are_an_error(tmp_path: Path, lakefile: str) -> None:
+    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=()))
+
+    assert not result.ok
+    assert "lake-manifest-incomplete" in _codes(result)
+
+
+def test_requirement_recorded_only_by_an_override_resolves(tmp_path: Path) -> None:
+    root = _project(tmp_path, manifest=())
+    _write_overrides(root, _mathlib())
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "supported"
+    assert "mathlib-overridden" in _codes(result)
+
+
+def test_requirement_of_the_roots_own_name_is_not_looked_up(tmp_path: Path) -> None:
+    root = _project(tmp_path, lakefile='name = "mathlib"\n\n[[require]]\nname = "mathlib"\n', manifest=())
+    _write_overrides(root, _mathlib(name="loom"))
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert "lake-manifest-incomplete" not in _codes(result)
 
 
 @pytest.mark.parametrize(
@@ -264,7 +312,8 @@ def test_path_requirement_with_a_git_lock_is_stale(tmp_path: Path) -> None:
 
 def test_project_without_mathlib_is_indeterminate(tmp_path: Path) -> None:
     plausible = {**_mathlib(), "name": "plausible"}
-    result = inspect_project(_project(tmp_path, manifest=(plausible,)))
+    lakefile = 'name = "Example"\n\n[[require]]\nname = "plausible"\nscope = "leanprover-community"\n'
+    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(plausible,)))
 
     assert result.ok
     assert result.mathlib is None
@@ -398,7 +447,7 @@ def test_legacy_manifests_are_advisory(tmp_path: Path, version: object) -> None:
 
 @pytest.mark.parametrize("packages", ['"packages": null', '"packages": []', '"name": "Example"'])
 def test_null_or_absent_packages_mean_no_packages(tmp_path: Path, packages: str) -> None:
-    root = _project(tmp_path)
+    root = _project(tmp_path, lakefile='name = "Example"\n')
     (root / "lake-manifest.json").write_text(f'{{"version": "1.1.0", {packages}}}', encoding="utf-8")
 
     result = inspect_project(root)
@@ -768,7 +817,7 @@ def test_malformed_shadowed_requirement_source_is_ignored_as_lake_ignores_it(tmp
 def test_lake_version_constraint_spellings_are_accepted(tmp_path: Path, version: str) -> None:
     lakefile = f'name = "Example"\n\n[[require]]\nname = "other"\nversion = "{version}"\n'
 
-    assert inspect_project(_project(tmp_path, lakefile=lakefile)).ok
+    assert inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(_mathlib(name="other"),))).ok
 
 
 def test_huge_toml_numbers_return_stable_diagnostics(tmp_path: Path) -> None:
@@ -823,7 +872,7 @@ def test_git_table_ignores_its_inner_rev_field_like_lake(tmp_path: Path) -> None
         'git = {url = "https://example.com/other", rev = 7}\n'
     )
 
-    assert inspect_project(_project(tmp_path, lakefile=lakefile)).ok
+    assert inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(_mathlib(name="other"),))).ok
 
 
 @pytest.mark.parametrize("lakefile", ['name = "my-project"\n', 'name = "E"\nsrcDir = "../outside"\n'])
