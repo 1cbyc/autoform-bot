@@ -1388,6 +1388,7 @@ def test_unsearchable_autoform_directory_reads_as_absent(tmp_path: Path) -> None
     workflows = root / ".github" / "workflows"
     workflows.mkdir(parents=True)
     (workflows / "autoform-verify.yml").write_text("", encoding="utf-8")
+    (workflows / "blueprint-pages.yml").write_text("", encoding="utf-8")
     workflows.chmod(0o644)  # listable, but its entries cannot be stat'ed
     try:
         result = inspect_project(root)
