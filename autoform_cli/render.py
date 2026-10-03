@@ -20,7 +20,6 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
 from . import graph_pages, graph_views, mermaid, status
-from ._directory_binding import resolved_path
 from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, Node, load_graph
 from .lean import SourceLinker, build_linker, declaration_names
@@ -270,8 +269,8 @@ def render_site(
     # The repository root, not the vault's parent. A blueprint nested at
     # <repo>/docs/blueprint would otherwise be described as <repo>/blueprint,
     # and every generated permalink would 404.
+    repo_root = Path(lean_root).expanduser().resolve() if lean_root is not None else blueprint.parent
     try:
-        repo_root = resolved_path(lean_root) if lean_root is not None else blueprint.parent
         linker = build_linker(repo_root, repository_url=repository_url, ref=ref)
     except OSError as error:
         raise PublicationError(["Lean sources could not be indexed"]) from error

@@ -34,7 +34,6 @@ from urllib.parse import quote, urlsplit
 
 import psutil
 
-from ._directory_binding import resolved_path
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import (
     MANAGED_OUTPUT_SCHEMAS,
@@ -1198,10 +1197,7 @@ def lean_libraries(lean_root: str | Path) -> tuple[LeanLibrary, ...]:
     handled without a second parser for Lean syntax.
     """
 
-    try:
-        root = resolved_path(lean_root)
-    except OSError as error:
-        raise SkeletonError(["Lean project path could not be inspected"]) from error
+    root = Path(lean_root).expanduser().resolve()
     toml_snapshot = _read_snapshot_file(root / "lakefile.toml")
     lakefile_snapshot = _read_snapshot_file(root / "lakefile.lean")
     if toml_snapshot is not None:
@@ -1998,10 +1994,7 @@ def extract_skeletons(
         graph = load_graph(blueprint_dir)
     except GraphValidationError as exc:
         raise SkeletonError(exc.issues) from exc
-    try:
-        root = resolved_path(lean_root)
-    except OSError as error:
-        raise SkeletonError(["Lean sources could not be indexed"]) from error
+    root = Path(lean_root).expanduser().resolve()
     graph_snapshot = _graph_snapshot(graph)
     control_snapshot = _project_control_snapshot(root)
     libraries = lean_libraries(root)

@@ -91,44 +91,11 @@ class RetainedDirectory:
         self.close()
 
 
-def expand_current_user_path(path: str | Path) -> Path:
-    """Expand only the current user's home without named-account lookups."""
-
-    try:
-        raw = os.fspath(path)
-        if not isinstance(raw, str):
-            raise ValueError("path must be text")
-        separators = tuple(
-            separator for separator in (os.sep, os.altsep) if separator is not None
-        )
-        if raw == "~":
-            return Path.home()
-        if any(raw.startswith(f"~{separator}") for separator in separators):
-            tail = raw[1:]
-            while any(tail.startswith(separator) for separator in separators):
-                tail = tail[1:]
-            return Path.home() / tail
-        if raw.startswith("~"):
-            raise OSError("named-user home paths are not supported")
-        return Path(raw)
-    except (OSError, RuntimeError, TypeError, ValueError, UnicodeError) as error:
-        raise OSError("path cannot be normalized safely") from error
-
-
 def lexical_absolute_path(path: str | Path) -> Path:
     """Make *path* absolute without erasing ``..`` before validation."""
 
-    expanded = expand_current_user_path(path)
+    expanded = Path(path).expanduser()
     return expanded if expanded.is_absolute() else Path.cwd() / expanded
-
-
-def resolved_path(path: str | Path) -> Path:
-    """Return a resolved path with a stable, sanitized failure contract."""
-
-    try:
-        return lexical_absolute_path(path).resolve()
-    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
-        raise OSError("path cannot be normalized safely") from error
 
 
 def open_directory(path: str | Path) -> RetainedDirectory:
@@ -190,8 +157,6 @@ def open_directory(path: str | Path) -> RetainedDirectory:
 __all__ = [
     "DIRECTORY_BINDING_SUPPORTED",
     "RetainedDirectory",
-    "expand_current_user_path",
     "lexical_absolute_path",
     "open_directory",
-    "resolved_path",
 ]

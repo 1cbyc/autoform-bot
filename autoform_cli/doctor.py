@@ -13,7 +13,6 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path, PureWindowsPath
 
-from ._directory_binding import resolved_path
 from .audit import AuditFinding, audit_graph
 from .graph import GraphValidationError, load_graph
 from .runtime import (
@@ -197,7 +196,7 @@ def _resolve_lean_root(lean_root: str | Path | None) -> tuple[Path | None, bool]
     if lean_root is None:
         return None, True
     try:
-        root = resolved_path(lean_root)
+        root = Path(lean_root).expanduser().resolve()
         valid = root.is_dir()
     except (OSError, RuntimeError, ValueError):
         return None, False
