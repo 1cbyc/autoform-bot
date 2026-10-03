@@ -1144,3 +1144,103 @@ def test_a_directory_link_uses_tree_even_when_the_repo_url_says_blob() -> None:
         "https://git.example/blob/x/repo/blob/abc/blueprint/sources/paper.md"
     )
     assert base.href(()) == "https://git.example/blob/x/repo/tree/abc/blueprint/sources"
+
+
+def test_node_links_resolve_each_target_page_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Building a link per node resolved paths on disk once per node on every
+    page, which made render time grow with the square of the node count."""
+    from autoform_cli import mermaid
+    from autoform_cli.render import _anchored_links
+
+    chapter, other, page = tmp_path / "a.md", tmp_path / "b" / "README.md", tmp_path / "page.md"
+    targets = {f"a/{index}": (chapter, f"n{index}") for index in range(20)}
+    targets["b"] = (other, "")
+    targets["here"] = (page, "self")
+    calls: list[Path] = []
+    relative_link = mermaid.relative_link
+
+    def counting(target: Path, output: Path, link_extension: str) -> str:
+        calls.append(target)
+        return relative_link(target, output, link_extension)
+
+    monkeypatch.setattr(mermaid, "relative_link", counting)
+
+    links = _anchored_links(targets, page)
+
+    assert sorted(calls) == [chapter, other]
+    assert links["a/7"] == "a.html#n7"
+    assert links["b"] == "b/index.html"
+    assert links["here"] == "#self"
+
+
+def test_rewriting_a_page_links_only_the_nodes_it_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A page uses the few node links it contains, so rewriting it should not
+    build a link for every node in the graph."""
+    from autoform_cli import mermaid
+    from autoform_cli.render import _rewrite_links
+
+    blueprint, destination = tmp_path / "blueprint", tmp_path / "out"
+    source_dir = blueprint / "roadmap"
+    source_dir.mkdir(parents=True)
+    chapter, other, page = destination / "a.md", destination / "b.md", destination / "page.md"
+    targets = {"a/x": (chapter, "x"), "b/y": (other, "y")}
+    node_sources = {(source_dir / "x.md").resolve(): "a/x", (source_dir / "y.md").resolve(): "b/y"}
+    calls: list[Path] = []
+    relative_link = mermaid.relative_link
+
+    def counting(target: Path, output: Path, link_extension: str) -> str:
+        calls.append(target)
+        return relative_link(target, output, link_extension)
+
+    monkeypatch.setattr(mermaid, "relative_link", counting)
+
+    def rewrite(text: str) -> str:
+        return _rewrite_links(
+            text,
+            source_dir=source_dir,
+            page=page,
+            blueprint=blueprint,
+            destination=destination,
+            node_sources=node_sources,
+            targets=targets,
+        )
+
+    assert rewrite("Plain prose.\n") == "Plain prose.\n"
+    assert calls == []
+    assert rewrite("See [X](x.md).\n") == "See [X](a.md#x).\n"
+    assert calls == [chapter]
+
+
+def test_a_focus_page_asks_for_its_node_links_once(tmp_path: Path) -> None:
+    """Each request builds a link for every node, so asking twice per focus
+    page doubled the cost of the largest group of generated pages."""
+    from autoform_cli.graph_pages import focus_page_path, write_graph_pages
+
+    project = _project(tmp_path)
+    graph = load_graph(project / "blueprint")
+    destination = tmp_path / "out"
+    requested: list[Path] = []
+
+    def node_links(page: Path) -> dict[str, str]:
+        requested.append(page)
+        return {node_id: f"roadmap.html#{node_id}" for node_id in graph.nodes}
+
+    write_graph_pages(graph, derive(graph), destination, node_links=node_links)
+
+    for node_id in ("base", "top"):
+        page = focus_page_path(destination, node_id)
+        assert requested.count(page) == 1
+        assert f"roadmap.html#{node_id}" in page.read_text(encoding="utf-8")
+
+
+def test_a_node_that_is_the_current_page_links_as_a_bare_fragment(tmp_path: Path) -> None:
+    """A container article has no anchor of its own, and an empty href would
+    drop the link, so its own page links to the top of itself."""
+    from autoform_cli.render import _anchored_links
+
+    page = tmp_path / "chapter" / "README.md"
+
+    assert _anchored_links({"chapter": (page, ""), "chapter/x": (page, "x")}, page) == {
+        "chapter": "#",
+        "chapter/x": "#x",
+    }
