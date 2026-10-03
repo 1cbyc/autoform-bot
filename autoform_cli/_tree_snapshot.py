@@ -105,6 +105,7 @@ if os.name == "nt":
 
 _WINDOWS_FILE_READ_ATTRIBUTES = 0x0080
 _WINDOWS_FILE_SHARE_READ = 0x00000001
+_WINDOWS_FILE_SHARE_WRITE = 0x00000002
 _WINDOWS_OPEN_EXISTING = 3
 _WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
@@ -537,7 +538,7 @@ class BoundDirectoryTree:
                 _close_portable_directory_handle(handle)
             self._portable_handles = ()
             raise
-        except (OSError, ValueError) as error:
+        except OSError as error:
             for handle in reversed(self._portable_handles):
                 _close_portable_directory_handle(handle)
             self._portable_handles = ()
@@ -888,7 +889,7 @@ def _open_locked_windows_directory(
         handle = _create_file(
             os.fspath(path),
             _WINDOWS_FILE_READ_ATTRIBUTES,
-            _WINDOWS_FILE_SHARE_READ,
+            _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE,
             None,
             _WINDOWS_OPEN_EXISTING,
             _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
@@ -943,10 +944,6 @@ def _retain_portable_directory_path(root: Path) -> tuple[int, ...]:
             if index:
                 current = current / part
             metadata = os.lstat(current)
-            if not stat.S_ISDIR(metadata.st_mode) or _is_reparse_point(metadata):
-                raise TreeSnapshotError(
-                    "directory tree path contains an unsafe component"
-                )
             handles.append(
                 _open_locked_windows_directory(current, _stat_signature(metadata))
             )
@@ -1427,9 +1424,7 @@ def _portable_directory_identities(root: Path) -> tuple[tuple[int, int], ...]:
         identities: list[tuple[int, int]] = []
         for index, part in enumerate(root.parts):
             if index:
-                if part == ".." and not (
-                    os.name == "nt" and _WINDOWS_DIRECTORY_LOCKING_SUPPORTED
-                ):
+                if part == "..":
                     raise TreeSnapshotError(
                         "parent path components require directory descriptor support"
                     )
