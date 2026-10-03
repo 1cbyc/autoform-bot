@@ -18,12 +18,9 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .catalog import ReleaseCatalog, canonical_git_url, load_release_catalog
+import tomli
 
-try:  # Python 3.11+
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
+from .catalog import ReleaseCatalog, canonical_git_url, load_release_catalog
 
 PROJECT_INSPECTION_SCHEMA = "autoform-project-inspection/v1"
 _MAX_FILE_BYTES = 1024 * 1024
@@ -117,8 +114,8 @@ class _Requirements:
     """lakefile.toml's require entries, as Lake resolves them against the root manifest.
 
     ``mathlib`` is the direct Mathlib requirement Lake keeps, if Lake resolves it from the manifest.
-    ``transitive`` is whether another requirement may pull Mathlib in, which Lake then also resolves
-    from the root manifest; the dependencies' own lakefiles are not read to confirm it.
+    ``transitive`` is whether another requirement could pull Mathlib in; it is not evidence that the
+    dependency's current configuration actually does so, because dependency lakefiles are not read.
     ``declared`` is whether there is any require entry, and ``lookups`` holds the Lean name and
     spelling of each requirement Lake looks up in the manifest and overrides rather than satisfying
     with the root package itself.
@@ -309,7 +306,7 @@ def _inspect_snapshot(
             ProjectDiagnostic(
                 "warning",
                 "mathlib-overridden",
-                "Lake uses the Mathlib from package-overrides.json instead of the manifest's.",
+                "package-overrides.json selects this Mathlib entry whenever Mathlib is an active dependency.",
                 _OVERRIDES,
             )
         )
@@ -325,7 +322,7 @@ def _inspect_snapshot(
         )
     if lake is not None and lake.config == "lakefile.lean":
         mathlib = None
-    elif mathlib is not None and requirements is not None and (unused := _unused_mathlib(requirements, locked)):
+    elif mathlib is not None and requirements is not None and (unused := _unused_mathlib(requirements)):
         diagnostics.append(ProjectDiagnostic("warning", "mathlib-manifest-unused", unused, mathlib.source))
         mathlib = None
     return _result(
@@ -412,8 +409,8 @@ def _inspect_lake(
     if text is None:
         return None, None
     try:
-        config = tomllib.loads(text)
-    except tomllib.TOMLDecodeError:
+        config = tomli.loads(text)
+    except tomli.TOMLDecodeError:
         config = None
     except (RecursionError, ValueError):
         diagnostics.append(
@@ -449,7 +446,9 @@ def _inspect_lake(
     # requirement of the root's own name never reaches the manifest. A root
     # named mathlib thus satisfies every Mathlib requirement, direct or
     # transitive, and the manifest's Mathlib entry is never materialized.
-    # Only the requirements Lake looks up can pull Mathlib in transitively.
+    # Only requirements Lake looks up could pull Mathlib in transitively. We
+    # do not inspect their current configurations, so that possibility alone
+    # never proves that the root manifest's Mathlib entry is active.
     root_name = _canonical_toml_name(config["name"])
     declared = bool(config.get("require"))
     lookups = tuple(
@@ -484,15 +483,14 @@ def _unrecorded_requirements(requirements: _Requirements, recorded: frozenset) -
     return None
 
 
-def _unused_mathlib(requirements: _Requirements, locked: MathlibLock | None) -> str | None:
+def _unused_mathlib(requirements: _Requirements) -> str | None:
     """Why Lake may not materialize the Mathlib the manifest or overrides select, if so.
 
-    Lake resolves the root's requirements and, recursively, its dependencies'
-    against the root manifest and the overrides (``Workspace.materializeDeps``),
-    and ``lake update`` records only reachable packages, so the manifest's own
-    entry decides: an inherited entry under other requirements is taken as
-    recorded. An override replaces a used entry but never makes Mathlib used,
-    since materializeDeps ignores the override's ``inherited`` flag.
+    A direct root requirement proves Mathlib is active. Other requirements may
+    pull it in, but an ``inherited`` manifest entry is only prior resolver
+    state and can be stale after a dependency drops Mathlib. Autoform does not
+    inspect dependency configurations, and an override selects the source of
+    an active package but does not itself make that package active.
     """
 
     if requirements.mathlib is not None:
@@ -502,17 +500,10 @@ def _unused_mathlib(requirements: _Requirements, locked: MathlibLock | None) -> 
             "Lake resolves no Mathlib from the manifest: lakefile.toml requires no package other than "
             "its own, or its own package is named mathlib."
         )
-    if locked is None:
-        return (
-            "Only package-overrides.json names Mathlib and lakefile.toml does not require it; "
-            "Lake builds it only if a dependency requires Mathlib, and Autoform does not read dependency lakefiles."
-        )
-    if not locked.inherited:
-        return (
-            "The manifest locks Mathlib directly, but lakefile.toml does not require it; "
-            "Lake builds it only if a dependency requires Mathlib, and Autoform does not read dependency lakefiles."
-        )
-    return None
+    return (
+        "lakefile.toml does not directly require Mathlib; a manifest or override entry, including an inherited "
+        "entry, does not prove that a dependency still requires it, and Autoform does not read dependency lakefiles."
+    )
 
 
 def _lakefile_problem(config: dict) -> str | None:
