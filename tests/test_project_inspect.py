@@ -28,8 +28,22 @@ LAKEFILE = (
 )
 
 
-def _mathlib(rev: str = COMMIT, input_rev: str = "v4.32.2", url: str = MATHLIB_URL) -> dict:
-    return {"name": "mathlib", "type": "git", "url": url, "rev": rev, "inputRev": input_rev, "inherited": False}
+def _mathlib(rev: str = COMMIT, input_rev: str = "v4.32.2", url: str = MATHLIB_URL, **fields: object) -> dict:
+    """A Mathlib entry spelled the way Lake 4.32 writes it."""
+
+    entry = {
+        "url": url,
+        "type": "git",
+        "subDir": None,
+        "scope": "",
+        "rev": rev,
+        "name": "mathlib",
+        "manifestFile": "lake-manifest.json",
+        "inputRev": input_rev,
+        "inherited": False,
+        "configFile": "lakefile.lean",
+    }
+    return {**entry, **fields}
 
 
 def _write_manifest(root: Path, *packages: dict, version: object = "1.1.0") -> None:
@@ -161,6 +175,58 @@ def test_transitive_mathlib_still_decides_compatibility(tmp_path: Path) -> None:
     assert result.compatibility.status == "supported"
 
 
+def test_direct_lock_without_a_requirement_is_unused(tmp_path: Path) -> None:
+    result = inspect_project(_project(tmp_path, lakefile='name = "Example"\n'))
+
+    assert result.mathlib is None
+    assert result.compatibility.status == "indeterminate"
+    assert "mathlib-manifest-unused" in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"subDir": "Archive"}, {"configFile": "alternate.lean"}, {"configFile": None}, {"manifestFile": "other.json"}],
+)
+def test_lock_must_load_mathlib_the_way_releases_do(tmp_path: Path, fields: dict) -> None:
+    result = inspect_project(_project(tmp_path, manifest=(_mathlib(**fields),)))
+
+    assert result.compatibility.status == "unlisted"
+
+
+def test_uppercase_commit_is_the_same_commit(tmp_path: Path) -> None:
+    result = inspect_project(_project(tmp_path, manifest=(_mathlib(rev=COMMIT.upper()),)))
+
+    assert result.compatibility.status == "supported"
+
+
+def test_url_credentials_are_redacted_and_never_match(tmp_path: Path, capsys) -> None:
+    secret = "https://user:hunter2@github.com/leanprover-community/mathlib4"
+    lakefile = LAKEFILE.replace('scope = "leanprover-community"', f'git = "{secret}"')
+    root = _project(tmp_path, lakefile=lakefile, manifest=(_mathlib(url=secret),))
+
+    result = inspect_project(root)
+    main(["project", "inspect", str(root)])
+
+    assert result.mathlib.url == "https://***@github.com/leanprover-community/mathlib4"
+    assert result.compatibility.status == "unlisted"
+    assert "lake-manifest-stale" not in _codes(result)
+    assert "hunter2" not in result.to_json() + capsys.readouterr().out
+
+
+def test_escaped_mathlib_spelling_is_the_same_package(tmp_path: Path) -> None:
+    lakefile = LAKEFILE.replace('name = "mathlib"', 'name = "«mathlib»"')
+    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(_mathlib(name="«mathlib»"),)))
+
+    assert result.compatibility.status == "supported"
+
+
+def test_path_requirement_with_a_git_lock_is_stale(tmp_path: Path) -> None:
+    lakefile = LAKEFILE.replace('scope = "leanprover-community"', 'path = "../mathlib4"')
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert "lake-manifest-stale" in _codes(result)
+
+
 def test_project_without_mathlib_is_indeterminate(tmp_path: Path) -> None:
     plausible = {**_mathlib(), "name": "plausible"}
     result = inspect_project(_project(tmp_path, manifest=(plausible,)))
@@ -181,7 +247,16 @@ def test_missing_manifest_is_indeterminate(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "content",
-    ["{", "[]", '{"version": "1.1.0"}', '{"version": "2.0.0", "packages": []}', '{"version": 6, "packages": []}'],
+    [
+        "{",
+        "[]",
+        '{"packages": []}',
+        '{"version": "1.1.0", "packages": {}}',
+        '{"version": "2.0.0", "packages": []}',
+        '{"version": 4, "packages": []}',
+        '{"version": "1.1.0", "packages": [], "lakeDir": NaN}',
+        '{"version": "1.1.0", "packages": [{"name": "mathlib", "type": "zip"}]}',
+    ],
 )
 def test_manifests_lake_would_refuse_fail_inspection(tmp_path: Path, content: str) -> None:
     root = _project(tmp_path)
@@ -192,6 +267,29 @@ def test_manifests_lake_would_refuse_fail_inspection(tmp_path: Path, content: st
     assert not result.ok
     assert result.compatibility.status == "indeterminate"
     assert "invalid-lake-manifest" in _codes(result)
+
+
+@pytest.mark.parametrize("version", [5, 6, "0.6.0"])
+def test_legacy_manifests_are_advisory(tmp_path: Path, version: object) -> None:
+    root = _project(tmp_path)
+    _write_manifest(root, _mathlib(), version=version)
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "unsupported-lake-manifest" in _codes(result)
+
+
+@pytest.mark.parametrize("packages", ['"packages": null', '"packages": []', '"name": "Example"'])
+def test_null_or_absent_packages_mean_no_packages(tmp_path: Path, packages: str) -> None:
+    root = _project(tmp_path)
+    (root / "lake-manifest.json").write_text(f'{{"version": "1.1.0", {packages}}}', encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "indeterminate"
 
 
 def test_integer_manifest_versions_are_read(tmp_path: Path) -> None:
@@ -218,8 +316,18 @@ def test_package_override_replaces_the_locked_mathlib(tmp_path: Path) -> None:
 
     assert result.mathlib.type == "path"
     assert result.mathlib.source == ".lake/package-overrides.json"
-    assert result.compatibility.status == "unlisted"
+    assert result.compatibility.status == "indeterminate"
     assert "mathlib-overridden" in _codes(result)
+
+
+def test_override_needs_a_manifest_to_replace(tmp_path: Path) -> None:
+    root = _project(tmp_path, manifest=None)
+    (root / ".lake").mkdir()
+    (root / ".lake/package-overrides.json").write_text(
+        json.dumps({"schemaVersion": "1.1.0", "packages": [_mathlib()]}), encoding="utf-8"
+    )
+
+    assert inspect_project(root).compatibility.status == "indeterminate"
 
 
 def test_override_without_mathlib_leaves_the_manifest_in_charge(tmp_path: Path) -> None:
@@ -230,6 +338,16 @@ def test_override_without_mathlib_leaves_the_manifest_in_charge(tmp_path: Path) 
     )
 
     assert inspect_project(root).compatibility.status == "supported"
+
+
+def test_lakefile_lean_cannot_confirm_an_inherited_mathlib(tmp_path: Path) -> None:
+    root = _project(tmp_path, lakefile=None, manifest=(_mathlib(inherited=True),))
+    (root / "lakefile.lean").write_text("import Lake\n", encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.mathlib is None
+    assert result.compatibility.status == "indeterminate"
 
 
 def test_invalid_override_file_blocks_a_supported_answer(tmp_path: Path) -> None:
@@ -251,8 +369,9 @@ def test_lakefile_lean_takes_precedence_and_is_not_evaluated(tmp_path: Path) -> 
 
     assert result.lake.config == "lakefile.lean"
     assert result.lake.name is None
+    assert result.mathlib is None
     assert "lakefile-lean-not-evaluated" in _codes(result)
-    assert result.compatibility.status == "supported"
+    assert result.compatibility.status == "indeterminate"
 
 
 @pytest.mark.parametrize(
@@ -261,11 +380,18 @@ def test_lakefile_lean_takes_precedence_and_is_not_evaluated(tmp_path: Path) -> 
         ("leanprover/lean4:v4.32.2", True),
         ("leanprover/lean4:v4.32.2\n\n", True),
         ("leanprover/lean4:v4.32.2\r\n", True),
+        (" leanprover/lean4:v4.32.2\t\n", True),
+        ("leanprover/lean4:v4.32.2\nleanprover/lean4:v4.31.0\n", True),
         ("", False),
-        ("leanprover/lean4:v4.32.2\nleanprover/lean4:v4.31.0\n", False),
+        ("\nleanprover/lean4:v4.32.2\n", False),
+        ("leanprover/lean4:v4.32.2 extra\n", False),
+        ("leanprover/lean4:v4.32.2\x1b\n", False),
+        ("leanprover/lean4:v4.32.2\x00\n", False),
+        ("leanprover/lean4:v4.32.2\u009b\n", False),
     ],
 )
-def test_toolchain_file_must_name_one_toolchain(tmp_path: Path, toolchain: str, ok: bool) -> None:
+def test_toolchain_follows_elans_first_line_rule(tmp_path: Path, toolchain: str, ok: bool) -> None:
+    # Checked against elan 4.2.0: it trims the first line and ignores the file when that line is malformed.
     result = inspect_project(_project(tmp_path, toolchain=toolchain))
 
     assert result.ok is ok
@@ -283,11 +409,29 @@ def test_missing_toolchain_and_lakefile_are_errors(tmp_path: Path) -> None:
     assert result.compatibility.status == "indeterminate"
 
 
-def test_invalid_toml_is_an_error(tmp_path: Path) -> None:
-    result = inspect_project(_project(tmp_path, lakefile="name = \n"))
+@pytest.mark.parametrize(
+    "lakefile",
+    [
+        "name = \n",
+        'version = "0.1.0"\n',
+        'name = ""\n',
+        'name = "E"\nversion = "wat"\n',
+        'name = "E"\nrequire = 5\n',
+        'name = "E"\n[[lean_lib]]\n',
+        'name = "E"\n[[lean_lib]]\nname = "A"\n[[lean_exe]]\nname = "A"\n',
+    ],
+)
+def test_lakefiles_lake_refuses_are_errors(tmp_path: Path, lakefile: str) -> None:
+    # Each case checked against Lake 4.32.0, which refuses to load it.
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
 
     assert not result.ok
     assert "invalid-lakefile-toml" in _codes(result)
+
+
+@pytest.mark.parametrize("lakefile", ['name = "my-project"\n', 'name = "E"\nsrcDir = "../outside"\n'])
+def test_lakefiles_lake_accepts_are_fine(tmp_path: Path, lakefile: str) -> None:
+    assert inspect_project(_project(tmp_path, lakefile=lakefile + LAKEFILE.split("\n\n", 1)[1])).ok
 
 
 def test_oversized_and_non_utf8_files_are_errors(tmp_path: Path) -> None:
@@ -368,6 +512,10 @@ def test_autoform_paths_need_their_exact_spelling(tmp_path: Path) -> None:
     (root / "Blueprint").rename(root / "blueprint")
     assert inspect_project(root).autoform_paths == ("blueprint", "mkdocs.yml")
 
+    (root / "blueprint").rmdir()
+    (root / "blueprint").write_text("", encoding="utf-8")
+    assert inspect_project(root).autoform_paths == ("mkdocs.yml",)
+
 
 def test_bundled_catalog_lists_the_recommended_release() -> None:
     catalog = load_release_catalog()
@@ -432,5 +580,5 @@ def test_human_report_escapes_characters_that_could_forge_lines(tmp_path: Path, 
 
     assert main(["project", "inspect", str(root)]) == 0
 
-    assert "Lake: Ex\\u202eample\\x9b\\n (lakefile.toml)" in capsys.readouterr().out
+    assert "Lake: Ex\\u202eample\\x9b\\n 0.1.0 (lakefile.toml)" in capsys.readouterr().out
     assert _human_text("\U000e0001") == "\\U000e0001"

@@ -343,7 +343,8 @@ def _print_project_inspection(result) -> None:
     if result.project_root is not None:
         print(f"Project root: {_human_text(result.project_root)}")
     if result.lake is not None:
-        print(f"Lake: {_human_text(result.lake.name or 'unknown package')} ({result.lake.config})")
+        version = f" {result.lake.version}" if result.lake.version else ""
+        print(f"Lake: {_human_text((result.lake.name or 'unknown package') + version)} ({result.lake.config})")
         for target in result.lake.targets:
             print(f"  {target.kind} {_human_text(target.name)}")
     if result.lean_toolchain is not None:

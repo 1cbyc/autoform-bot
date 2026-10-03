@@ -34,12 +34,13 @@ class ReleaseCatalog:
         return next(release for release in self.releases if release.recommended)
 
     def match(self, lean_toolchain: str, mathlib_git: str | None, mathlib_commit: str | None) -> SupportedRelease | None:
+        commit = None if mathlib_commit is None else mathlib_commit.lower()  # Git reads either case
         return next(
             (
                 release
                 for release in self.releases
                 if release.lean_toolchain == lean_toolchain
-                and release.mathlib_commit == mathlib_commit
+                and release.mathlib_commit == commit
                 and canonical_git_url(release.mathlib_git) == canonical_git_url(mathlib_git)
             ),
             None,
