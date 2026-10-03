@@ -40,7 +40,7 @@ _DECLARATION = re.compile(
     r"(?:(?:private|protected|noncomputable|partial|unsafe|scoped|local)\s+)*"
     r"(theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+(.+)$"
 )
-_IGNORED_DIRECTORIES = frozenset(
+_PORTABLE_IGNORED_DIRECTORIES = frozenset(
     {
         ".direnv",
         ".git",
@@ -48,10 +48,10 @@ _IGNORED_DIRECTORIES = frozenset(
         ".obsidian",
         ".trash",
         ".venv",
-        "build",
         "lake-packages",
     }
 )
+_EXACT_IGNORED_DIRECTORIES = frozenset({"build"})
 _IGNORED_DIRECTORY_PREFIXES = (".autoform-publication-",)
 _PUBLICATION_MANIFEST = "publication.json"
 _PUBLICATION_SCHEMAS = frozenset({"autoform-publication/v1", "autoform-publication/v2"})
@@ -97,6 +97,7 @@ class SourceIndex:
     declarations: dict[str, Declaration]
     source_digest: str
     line_counts: dict[Path, int] = field(default_factory=dict)
+    root_identity: tuple[int, int] | None = None
 
     def find(self, name: str) -> Declaration | None:
         return self.declarations.get(name)
@@ -116,6 +117,7 @@ class BoundProjectSources:
     """A retained Lean source root whose captures cannot change path generation."""
 
     root: Path
+    index_root: Path
     tree: BoundDirectoryTree
     exclusion_roots: tuple[Path, ...]
 
@@ -133,13 +135,37 @@ class BoundProjectSources:
                 root_identity=self.tree.identity,
             )
 
+        marker_selection = _manifest_tree_selection(
+            excluded,
+            refresh_exclusions=refresh_exclusions,
+        )
+        markers_before = self.tree.capture(selection=marker_selection)
+        ignored_roots = _managed_output_roots(markers_before)
+        effective_exclusions = tuple(
+            sorted(
+                {*excluded, *ignored_roots},
+                key=lambda path: (len(path.parts), path.as_posix()),
+            )
+        )
         snapshot = self.tree.capture(
             selection=_lean_tree_selection(
-                excluded,
+                effective_exclusions,
                 refresh_exclusions=refresh_exclusions,
             )
         )
-        return _indexed_source_snapshot(self.root, snapshot, excluded)
+        markers_after = self.tree.capture(selection=marker_selection)
+        if markers_after != markers_before or _managed_output_roots(
+            markers_after
+        ) != ignored_roots:
+            raise TreeSnapshotError(
+                "generated output markers changed while sources were captured"
+            )
+        return _indexed_source_snapshot(
+            self.index_root,
+            snapshot,
+            effective_exclusions,
+            ignored_roots=ignored_roots,
+        )
 
     def verify(self) -> None:
         self.tree.verify()
@@ -153,7 +179,7 @@ def index_project(
 ) -> SourceIndex:
     """Scan ``*.lean`` beneath *root* and index declarations by full name."""
     requested_root = directory_binding.lexical_absolute_path(root)
-    root_path = requested_root.resolve()
+    root_path = directory_binding.resolved_path(requested_root)
     if not root_path.is_dir():
         digest = hashlib.sha256(b"autoform-lean-source-index/v1\0").hexdigest()
         return SourceIndex(root=root_path, declarations={}, source_digest=digest)
@@ -174,7 +200,7 @@ def _remap_resolved_root_exclusion(
 ) -> Path:
     """Keep absolute descendant exclusions attached when a root alias resolves."""
 
-    candidate = Path(value).expanduser()
+    candidate = directory_binding.expand_current_user_path(value)
     if not candidate.is_absolute():
         return candidate
     try:
@@ -226,12 +252,18 @@ def open_project_sources(
     """Open a retained Lean source root; the caller must close it."""
 
     root_path = directory_binding.lexical_absolute_path(root)
-    exclusion_paths = tuple(Path(value).expanduser() for value in exclude_roots)
+    exclusion_paths = tuple(
+        directory_binding.expand_current_user_path(value) for value in exclude_roots
+    )
     try:
         tree = BoundDirectoryTree(root_path)
     except TreeSnapshotError as error:
         raise OSError(str(error)) from error
     try:
+        index_root = directory_binding.resolved_path(root_path)
+        index_metadata = os.stat(index_root, follow_symlinks=False)
+        if (index_metadata.st_dev, index_metadata.st_ino) != tree.identity:
+            raise OSError("Lean source root changed while it was opened")
         excluded = _project_exclusions(
             root_path,
             exclusion_paths,
@@ -241,7 +273,7 @@ def open_project_sources(
     except BaseException:
         tree.close()
         raise
-    return BoundProjectSources(root_path, tree, exclusion_paths)
+    return BoundProjectSources(root_path, index_root, tree, exclusion_paths)
 
 
 def _project_exclusions(
@@ -302,6 +334,47 @@ def _lean_tree_selection(
     )
 
 
+def _manifest_tree_selection(
+    excluded: tuple[PurePosixPath, ...],
+    *,
+    refresh_exclusions: Callable[[], tuple[PurePosixPath, ...]] | None = None,
+) -> TreeSelection:
+    """Capture bounded output markers without retaining generated Lean bytes."""
+
+    def is_excluded(path: PurePosixPath) -> bool:
+        if _lean_path_is_excluded(path, excluded):
+            return True
+        if refresh_exclusions is None or not any(
+            path != prefix
+            and len(path.parts) == len(prefix.parts)
+            and _folded_path(path) == _folded_path(prefix)
+            for prefix in excluded
+        ):
+            return False
+        return _lean_path_is_excluded(path, refresh_exclusions())
+
+    def is_marker(path: PurePosixPath) -> bool:
+        return _is_publication_manifest_name(
+            path.name
+        ) or _is_managed_output_manifest_name(path.name)
+
+    return TreeSelection(
+        include=lambda path, _mode: not is_excluded(path) and is_marker(path),
+        descend=lambda path: not is_excluded(path),
+        byte_limit=lambda path: (
+            _PUBLICATION_MANIFEST_BYTE_LIMIT
+            if _is_publication_manifest_name(path.name)
+            else (
+                _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT
+                if _is_managed_output_manifest_name(path.name)
+                else None
+            )
+        ),
+        record_omitted=False,
+        verification_checkpoint="before-marker-verification",
+    )
+
+
 def _lean_snapshot_includes(
     relative: PurePosixPath,
     mode: int,
@@ -318,7 +391,7 @@ def _lean_snapshot_includes(
     return (
         stat.S_ISDIR(mode)
         or stat.S_ISLNK(mode)
-        or relative.suffix.casefold() == ".lean"
+        or relative.suffix == ".lean"
         or _is_publication_manifest_name(relative.name)
         or _is_managed_output_manifest_name(relative.name)
     )
@@ -330,7 +403,8 @@ def _lean_path_is_excluded(
 ) -> bool:
     folded_parts = _folded_path(relative)
     return (
-        bool(_IGNORED_DIRECTORIES.intersection(folded_parts))
+        bool(_EXACT_IGNORED_DIRECTORIES.intersection(relative.parts))
+        or bool(_PORTABLE_IGNORED_DIRECTORIES.intersection(folded_parts))
         or any(
             part.startswith(_IGNORED_DIRECTORY_PREFIXES) for part in folded_parts
         )
@@ -346,7 +420,64 @@ def _indexed_source_snapshot(
     root: Path,
     snapshot: TreeSnapshot,
     excluded: tuple[PurePosixPath, ...],
+    *,
+    ignored_roots: set[PurePosixPath] | None = None,
 ) -> IndexedSourceSnapshot:
+    ignored_roots = set(
+        _managed_output_roots(snapshot) if ignored_roots is None else ignored_roots
+    )
+
+    def in_ignored_root(relative_text: str) -> bool:
+        return _path_is_within_roots(PurePosixPath(relative_text), ignored_roots)
+
+    unsupported = [
+        (relative, reason)
+        for relative, reason in snapshot.unsupported_entries()
+        if not in_ignored_root(relative)
+        and PurePosixPath(relative).suffix == ".lean"
+    ]
+    if unsupported:
+        relative, reason = unsupported[0]
+        raise OSError(f"unsafe Lean source {relative}: {reason}")
+
+    declarations: dict[str, Declaration] = {}
+    line_counts: dict[Path, int] = {}
+    digest = hashlib.sha256(b"autoform-lean-source-index/v1\0")
+    for relative_text, data in snapshot.files:
+        relative = PurePosixPath(relative_text)
+        if relative.suffix != ".lean" or _lean_path_is_excluded(
+            relative,
+            excluded,
+        ):
+            continue
+        if _path_is_within_roots(relative, ignored_roots):
+            continue
+        relative_path = Path(relative.as_posix())
+        _update_source_digest(digest, relative_path, data)
+        try:
+            text = data.decode("utf-8")
+        except UnicodeError:
+            continue
+        line_counts[relative_path] = len(text.splitlines())
+        for declaration in _scan(text, relative_path):
+            declarations.setdefault(declaration.name, declaration)
+    source_digest = digest.hexdigest()
+    return IndexedSourceSnapshot(
+        SourceIndex(
+            root=root,
+            declarations=declarations,
+            source_digest=source_digest,
+            line_counts=line_counts,
+            root_identity=snapshot.root_identity,
+        ),
+        source_digest,
+        _lean_generation_revision(snapshot, ignored_roots),
+    )
+
+
+def _managed_output_roots(snapshot: TreeSnapshot) -> set[PurePosixPath]:
+    """Classify bounded marker bytes before generated trees are descended into."""
+
     publication_manifests: dict[
         PurePosixPath,
         list[tuple[str, bytes | None]],
@@ -411,52 +542,7 @@ def _indexed_source_snapshot(
                 raise OSError(
                     f"{label} manifest is not a regular file in {parent.as_posix()}"
                 )
-
-    def in_ignored_root(relative_text: str) -> bool:
-        return _path_is_within_roots(PurePosixPath(relative_text), ignored_roots)
-
-    unsupported = [
-        (relative, reason)
-        for relative, reason in snapshot.unsupported_entries()
-        if not in_ignored_root(relative)
-        and PurePosixPath(relative).suffix.casefold() == ".lean"
-    ]
-    if unsupported:
-        relative, reason = unsupported[0]
-        raise OSError(f"unsafe Lean source {relative}: {reason}")
-
-    declarations: dict[str, Declaration] = {}
-    line_counts: dict[Path, int] = {}
-    digest = hashlib.sha256(b"autoform-lean-source-index/v1\0")
-    for relative_text, data in snapshot.files:
-        relative = PurePosixPath(relative_text)
-        if relative.suffix.casefold() != ".lean" or _lean_path_is_excluded(
-            relative,
-            excluded,
-        ):
-            continue
-        if _path_is_within_roots(relative, ignored_roots):
-            continue
-        relative_path = Path(relative.as_posix())
-        _update_source_digest(digest, relative_path, data)
-        try:
-            text = data.decode("utf-8")
-        except UnicodeError:
-            continue
-        line_counts[relative_path] = len(text.splitlines())
-        for declaration in _scan(text, relative_path):
-            declarations.setdefault(declaration.name, declaration)
-    source_digest = digest.hexdigest()
-    return IndexedSourceSnapshot(
-        SourceIndex(
-            root=root,
-            declarations=declarations,
-            source_digest=source_digest,
-            line_counts=line_counts,
-        ),
-        source_digest,
-        _lean_generation_revision(snapshot, ignored_roots),
-    )
+    return ignored_roots
 
 
 def _lean_generation_revision(
@@ -467,7 +553,7 @@ def _lean_generation_revision(
 
     def retained_entry(relative_text: str) -> bool:
         relative = PurePosixPath(relative_text)
-        return relative.suffix.casefold() == ".lean" and not _path_is_within_roots(
+        return relative.suffix == ".lean" and not _path_is_within_roots(
             relative,
             ignored_roots,
         )
@@ -568,7 +654,7 @@ def _relative_exclusion(
     *,
     root_identity: tuple[int, int],
 ) -> PurePosixPath | None:
-    candidate = Path(value).expanduser()
+    candidate = directory_binding.expand_current_user_path(value)
     if not candidate.is_absolute():
         candidate = root / candidate
     cursor = directory_binding.lexical_absolute_path(candidate)
@@ -922,21 +1008,44 @@ def build_linker(
     A supplied source snapshot never inherits a live Git ref; callers must bind
     that ref explicitly if they want permalinks.
     """
-    root = Path(lean_root).expanduser().resolve()
-    if source_index is not None and source_index.root != root:
-        raise ValueError("captured source index belongs to a different Lean root")
+    root = directory_binding.resolved_path(lean_root)
+    if source_index is not None:
+        try:
+            root_metadata = os.stat(root, follow_symlinks=False)
+            same_root = (
+                (root_metadata.st_dev, root_metadata.st_ino)
+                == source_index.root_identity
+                if source_index.root_identity is not None
+                else directory_binding.resolved_path(source_index.root) == root
+            )
+        except OSError as error:
+            raise ValueError(
+                "captured source index belongs to a different Lean root"
+            ) from error
+        if not same_root:
+            raise ValueError("captured source index belongs to a different Lean root")
     resolved_repository_url = repository_url
     resolved_ref = ref
     if detect_missing:
         resolved_repository_url = repository_url or detect_repository_url(root)
-        if source_index is None:
-            resolved_ref = ref or detect_ref(root)
+    if source_index is not None:
+        index = source_index
+    elif detect_missing and ref is None:
+        index = None
+        for _attempt in range(2):
+            before_ref = detect_ref(root)
+            candidate = index_project(root, exclude_roots=exclude_roots)
+            after_ref = detect_ref(root)
+            if before_ref == after_ref:
+                index = candidate
+                resolved_ref = after_ref
+                break
+        if index is None:
+            raise OSError("Git ref changed while Lean sources were indexed")
+    else:
+        index = index_project(root, exclude_roots=exclude_roots)
     return SourceLinker(
-        index=(
-            source_index
-            if source_index is not None
-            else index_project(root, exclude_roots=exclude_roots)
-        ),
+        index=index,
         repository_url=resolved_repository_url,
         ref=resolved_ref,
     )

@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import status
+from ._directory_binding import resolved_path
 from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, GraphValidationError, Node, load_graph
 from .lean import SourceIndex, declaration_names, index_project
@@ -352,8 +353,11 @@ def _coverage_findings(
 
 
 def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
-    root = Path(lean_root).expanduser().resolve()
-    if not root.is_dir():
+    try:
+        root = resolved_path(lean_root)
+    except OSError:
+        root = None
+    if root is None or not root.is_dir():
         return [
             AuditFinding(
                 ".",

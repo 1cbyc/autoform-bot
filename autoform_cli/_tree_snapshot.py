@@ -34,6 +34,9 @@ _DESCRIPTOR_CAPTURE_SUPPORTED = (
     and os.readlink in getattr(os, "supports_dir_fd", ())
 )
 _DESCRIPTOR_SCANDIR_SUPPORTED = os.scandir in getattr(os, "supports_fd", ())
+_NATIVE_DESCRIPTOR_CAPTURE_SUPPORTED = (
+    directory_binding.DIRECTORY_BINDING_SUPPORTED and _DESCRIPTOR_CAPTURE_SUPPORTED
+)
 _WINDOWS_STAT_VIEWS = os.name == "nt"
 _WINDOWS_DEVICE_NAMES = frozenset(
     {
@@ -53,6 +56,61 @@ _WINDOWS_DEVICE_NAMES = frozenset(
         "LPT³",
     }
 )
+
+_WINDOWS_DIRECTORY_LOCKING_SUPPORTED = False
+if os.name == "nt":
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _ByHandleFileInformation(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME),
+                ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            ]
+
+        _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _create_file = _kernel32.CreateFileW
+        _create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        _create_file.restype = wintypes.HANDLE
+        _get_file_information = _kernel32.GetFileInformationByHandle
+        _get_file_information.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_ByHandleFileInformation),
+        ]
+        _get_file_information.restype = wintypes.BOOL
+        _close_handle = _kernel32.CloseHandle
+        _close_handle.argtypes = [wintypes.HANDLE]
+        _close_handle.restype = wintypes.BOOL
+        _INVALID_WINDOWS_HANDLE = ctypes.c_void_p(-1).value
+        _WINDOWS_DIRECTORY_LOCKING_SUPPORTED = True
+    except (AttributeError, OSError):
+        _WINDOWS_DIRECTORY_LOCKING_SUPPORTED = False
+
+_WINDOWS_FILE_READ_ATTRIBUTES = 0x0080
+_WINDOWS_FILE_SHARE_READ = 0x00000001
+_WINDOWS_FILE_SHARE_WRITE = 0x00000002
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
 
 class TreeSnapshotError(ValueError):
@@ -164,6 +222,7 @@ class TreeSelection:
     byte_limit: Callable[[PurePosixPath], int | None] = lambda _path: None
     record_omitted: bool = True
     limits: TreeCaptureLimits = TreeCaptureLimits()
+    verification_checkpoint: str = "before-final-verification"
 
 
 ALL_ENTRIES = TreeSelection(
@@ -443,6 +502,7 @@ class BoundDirectoryTree:
         self.expected_children = dict(expected_children or {})
         self.selection = selection
         self._binding: RetainedDirectory | None = None
+        self._portable_handles: tuple[int, ...] = ()
         self._portable_identity: tuple[int, int] | None = None
         self._portable_path_identities: tuple[tuple[int, int], ...] | None = None
         self._verification_limits: TreeCaptureLimits | None = None
@@ -470,18 +530,33 @@ class BoundDirectoryTree:
                 raise
             return
         try:
+            self._portable_handles = _retain_portable_directory_path(self.root)
             path_identities = _portable_directory_identities(self.root)
             metadata = os.lstat(self.root)
+        except TreeSnapshotError:
+            for handle in reversed(self._portable_handles):
+                _close_portable_directory_handle(handle)
+            self._portable_handles = ()
+            raise
         except OSError as error:
+            for handle in reversed(self._portable_handles):
+                _close_portable_directory_handle(handle)
+            self._portable_handles = ()
             raise TreeSnapshotError("directory tree cannot be inspected safely") from error
-        identity = (metadata.st_dev, metadata.st_ino)
-        if not stat.S_ISDIR(metadata.st_mode) or (
-            expected_identity is not None and identity != expected_identity
-        ):
-            raise TreeSnapshotError("directory tree changed before it was captured")
-        self._portable_identity = identity
-        self._portable_path_identities = path_identities
-        self._verify_expected_children(None, limits=self.selection.limits)
+        try:
+            identity = (metadata.st_dev, metadata.st_ino)
+            if not stat.S_ISDIR(metadata.st_mode) or (
+                expected_identity is not None and identity != expected_identity
+            ):
+                raise TreeSnapshotError("directory tree changed before it was captured")
+            self._portable_identity = identity
+            self._portable_path_identities = path_identities
+            self._verify_expected_children(None, limits=self.selection.limits)
+        except BaseException:
+            for handle in reversed(self._portable_handles):
+                _close_portable_directory_handle(handle)
+            self._portable_handles = ()
+            raise
 
     @property
     def identity(self) -> tuple[int, int]:
@@ -618,7 +693,10 @@ class BoundDirectoryTree:
                         selection=active_selection,
                     )
                     _tree_snapshot_checkpoint("between-portable-captures", "")
-                    _tree_snapshot_checkpoint("before-final-verification", "")
+                    _tree_snapshot_checkpoint(
+                        active_selection.verification_checkpoint,
+                        "",
+                    )
                     snapshot = _capture_portable(
                         self.root,
                         expected_identity=self.identity,
@@ -645,6 +723,9 @@ class BoundDirectoryTree:
             if self._binding is not None:
                 self._binding.close()
                 self._binding = None
+            for handle in reversed(self._portable_handles):
+                _close_portable_directory_handle(handle)
+            self._portable_handles = ()
             self._closed = True
 
 
@@ -713,7 +794,7 @@ def capture_directory_descriptor(
             budget=budget,
         )
         _verify_captured_children(directories, entries, expected_children or {})
-        _tree_snapshot_checkpoint("before-final-verification", "")
+        _tree_snapshot_checkpoint(selection.verification_checkpoint, "")
         _verify_snapshot(
             descriptor,
             directories,
@@ -775,6 +856,121 @@ def _cross_interface_signature(signature: tuple[int, ...]) -> tuple[int, ...]:
         signature[4],
         signature[5],
     )
+
+
+def _close_portable_directory_handle(handle: int) -> None:
+    if os.name != "nt" or not _WINDOWS_DIRECTORY_LOCKING_SUPPORTED:
+        return
+    try:
+        _close_handle(handle)
+    except (OSError, ValueError):
+        pass
+
+
+def _open_locked_windows_directory(
+    path: Path,
+    expected: tuple[int, ...],
+) -> int:
+    """Open one directory without permitting replacement while the handle lives."""
+
+    if not _WINDOWS_DIRECTORY_LOCKING_SUPPORTED:
+        raise TreeSnapshotError(
+            "safe portable directory traversal is unavailable on this platform"
+        )
+    handle: int | None = None
+    try:
+        before = os.lstat(path)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or _is_reparse_point(before)
+            or _stat_signature(before) != expected
+        ):
+            raise TreeSnapshotError("directory tree changed while it was captured")
+        handle = _create_file(
+            os.fspath(path),
+            _WINDOWS_FILE_READ_ATTRIBUTES,
+            _WINDOWS_FILE_SHARE_READ | _WINDOWS_FILE_SHARE_WRITE,
+            None,
+            _WINDOWS_OPEN_EXISTING,
+            _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+            | _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle == _INVALID_WINDOWS_HANDLE:
+            handle = None
+            raise ctypes.WinError(ctypes.get_last_error())
+        information = _ByHandleFileInformation()
+        if not _get_file_information(handle, ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if (
+            not information.dwFileAttributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+            or information.dwFileAttributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise TreeSnapshotError("directory tree changed while it was captured")
+        after = os.lstat(path)
+        if _stat_signature(after) != expected:
+            raise TreeSnapshotError("directory tree changed while it was captured")
+        return handle
+    except TreeSnapshotError:
+        if handle is not None:
+            _close_portable_directory_handle(handle)
+        raise
+    except (OSError, ValueError) as error:
+        if handle is not None:
+            _close_portable_directory_handle(handle)
+        raise TreeSnapshotError("directory tree changed while it was captured") from error
+
+
+def _retain_portable_directory_path(root: Path) -> tuple[int, ...]:
+    """Lock every lexical Windows ancestor so path traversal cannot be redirected."""
+
+    if os.name != "nt":
+        # The portable algorithm is exercised on descriptor-capable POSIX hosts
+        # by unit tests.  A real non-Windows platform without descriptor support
+        # fails closed instead of treating double capture as a security boundary.
+        if _NATIVE_DESCRIPTOR_CAPTURE_SUPPORTED:
+            return ()
+        raise TreeSnapshotError(
+            "safe portable directory traversal is unavailable on this platform"
+        )
+    if not _WINDOWS_DIRECTORY_LOCKING_SUPPORTED:
+        raise TreeSnapshotError(
+            "safe portable directory traversal is unavailable on this platform"
+        )
+    handles: list[int] = []
+    try:
+        current = Path(root.anchor)
+        for index, part in enumerate(root.parts):
+            if index:
+                current = current / part
+            metadata = os.lstat(current)
+            handles.append(
+                _open_locked_windows_directory(current, _stat_signature(metadata))
+            )
+        return tuple(handles)
+    except BaseException:
+        for handle in reversed(handles):
+            _close_portable_directory_handle(handle)
+        raise
+
+
+@contextmanager
+def _lock_portable_child_directory(
+    path: Path,
+    expected: tuple[int, ...],
+) -> Iterator[None]:
+    if os.name != "nt":
+        if not _NATIVE_DESCRIPTOR_CAPTURE_SUPPORTED:
+            raise TreeSnapshotError(
+                "safe portable directory traversal is unavailable on this platform"
+            )
+        yield
+        return
+    handle = _open_locked_windows_directory(path, expected)
+    try:
+        yield
+    finally:
+        _close_portable_directory_handle(handle)
 
 
 def _valid_name(name: object) -> bool:
@@ -1108,22 +1304,24 @@ def _capture_portable(
                     observed_children.add(required_name)
             relative_path = PurePosixPath(child_relative)
             if stat.S_ISDIR(metadata.st_mode) and not _is_reparse_point(metadata):
-                if not selection.descend(relative_path):
-                    if selection.record_omitted:
-                        omitted.append((child_relative, "directory"))
-                    continue
-                directories.append(child_relative)
-                identities.append((child_relative, _stat_signature(metadata)))
-                visit(path, child_relative, depth + 1)
-                final = os.lstat(path)
-                if (
-                    not stat.S_ISDIR(final.st_mode)
-                    or _is_reparse_point(final)
-                    or _stat_signature(final) != _stat_signature(metadata)
-                ):
-                    raise TreeSnapshotError(
-                        "directory tree changed while it was captured"
-                    )
+                directory_signature = _stat_signature(metadata)
+                with _lock_portable_child_directory(path, directory_signature):
+                    if not selection.descend(relative_path):
+                        if selection.record_omitted:
+                            omitted.append((child_relative, "directory"))
+                        continue
+                    directories.append(child_relative)
+                    identities.append((child_relative, directory_signature))
+                    visit(path, child_relative, depth + 1)
+                    final = os.lstat(path)
+                    if (
+                        not stat.S_ISDIR(final.st_mode)
+                        or _is_reparse_point(final)
+                        or _stat_signature(final) != directory_signature
+                    ):
+                        raise TreeSnapshotError(
+                            "directory tree changed while it was captured"
+                        )
             elif stat.S_ISREG(metadata.st_mode) and not _is_reparse_point(metadata):
                 if not selection.include(relative_path, metadata.st_mode):
                     if selection.placeholder(relative_path, metadata.st_mode):

@@ -360,6 +360,26 @@ def test_check_cli_reports_source_index_io_failure_before_success(
     assert str(tmp_path) not in captured.out
 
 
+def test_check_cli_rejects_named_user_home_without_a_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "base.md", "# Base\n", lean="Project.base")
+
+    assert main(
+        [
+            "check",
+            str(blueprint),
+            "--lean-root",
+            "~autoform-user-that-cannot-exist",
+        ]
+    ) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "error: Lean sources could not be indexed\n"
+    assert captured.err == ""
+
+
 def test_a_chapter_directory_with_no_chapter_page_is_refused(tmp_path: Path) -> None:
     """The layout decides what the book is, so check has to assert it.
 

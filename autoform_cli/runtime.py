@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote, urlsplit
 
+from ._directory_binding import resolved_path
 from .graph import Graph, load_graph
 from .lean import declaration_names, index_project
 from .status import derive, is_definition
@@ -303,7 +304,12 @@ def build_runtime_graph(
     statuses = derive(graph)
     lean_index = None
     if lean_root is not None:
-        root = Path(lean_root).expanduser().resolve()
+        try:
+            root = resolved_path(lean_root)
+        except OSError as error:
+            raise RuntimeProjectionError(
+                ["Lean root does not exist or is not a directory"]
+            ) from error
         if not root.is_dir():
             raise RuntimeProjectionError(["Lean root does not exist or is not a directory"])
         try:

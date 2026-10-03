@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -177,6 +177,26 @@ def test_case_alias_of_publication_staging_prefix_is_not_scanned(
 
     assert index.find("canonical") is not None
     assert index.find("leaked") is None
+
+
+def test_case_distinct_build_namespace_is_not_silently_ignored(tmp_path: Path) -> None:
+    source = tmp_path / "Build" / "Actual.lean"
+    source.parent.mkdir()
+    source.write_text("theorem buildResult : True := trivial\n", encoding="utf-8")
+
+    index = index_project(tmp_path)
+
+    assert index.find("buildResult") is not None
+
+
+def test_noncanonical_lean_extension_is_not_indexed(tmp_path: Path) -> None:
+    source = tmp_path / "NotCompiled.LEAN"
+    source.write_text(
+        "theorem falsePositive : True := trivial\n",
+        encoding="utf-8",
+    )
+
+    assert index_project(tmp_path).find("falsePositive") is None
 
 
 @pytest.mark.parametrize("portable", [False, True])
@@ -574,6 +594,54 @@ def test_portable_capture_rejects_repeatable_nested_directory_redirection(
     finally:
         restore()
         bound.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-handle lock")
+def test_windows_portable_capture_locks_a_child_before_selection(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "Local.lean").write_text("def local : Nat := 0\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Escaped.lean").write_text(
+        "def escaped : Nat := 0\n",
+        encoding="utf-8",
+    )
+    displaced = tmp_path / "displaced"
+    attempted = False
+    blocked = False
+
+    def descend(path: PurePosixPath) -> bool:
+        nonlocal attempted, blocked
+        if path.as_posix() == "nested":
+            attempted = True
+            try:
+                nested.rename(displaced)
+            except OSError:
+                blocked = True
+                raise
+            nested.symlink_to(outside, target_is_directory=True)
+        return True
+
+    bound = BoundDirectoryTree(
+        root,
+        selection=TreeSelection(include=lambda _path, _mode: True, descend=descend),
+    )
+    try:
+        with pytest.raises(TreeSnapshotError, match="changed while it was captured"):
+            bound.capture()
+    finally:
+        if nested.is_symlink():
+            nested.unlink()
+            displaced.rename(nested)
+        bound.close()
+
+    assert attempted
+    assert blocked
+    assert (nested / "Local.lean").is_file()
 
 
 def test_portable_capture_rejects_a_file_swapped_to_fifo_without_blocking(
@@ -1377,6 +1445,88 @@ def test_managed_skeleton_output_is_not_indexed_as_project_source(
     assert index.find("target").path == Path("Actual.lean")
 
 
+def test_managed_output_is_pruned_before_generated_lean_bytes_are_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _index(tmp_path, "def target : Nat := 1\n", name="Actual.lean")
+    packets = tmp_path / "review-packets"
+    generated = packets / "node" / "target.lean"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("def target : Nat := 2\n", encoding="utf-8")
+    (packets / "manifest.json").write_text(
+        json.dumps(
+            {
+                "kind": "packets",
+                "packets": [],
+                "schema": "autoform-skeleton-packets/v2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    portable = not (
+        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
+        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
+    )
+    reader_name = "_read_portable_file" if portable else "_read_file"
+    original_read = getattr(tree_snapshot_module, reader_name)
+    opened: list[str] = []
+
+    def record_read(*args, **kwargs):
+        name = Path(args[0]).name if portable else args[1]
+        opened.append(name)
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(tree_snapshot_module, reader_name, record_read)
+
+    index = index_project(tmp_path)
+
+    assert index.find("target").path == Path("Actual.lean")
+    assert "target.lean" not in opened
+
+
+def test_managed_output_churn_does_not_invalidate_project_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _index(tmp_path, "def actual : Nat := 1\n", name="Actual.lean")
+    packets = tmp_path / "review-packets"
+    generated = packets / "node" / "target.lean"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("def generated : Nat := 2\n", encoding="utf-8")
+    (packets / "manifest.json").write_text(
+        json.dumps(
+            {
+                "kind": "packets",
+                "packets": [],
+                "schema": "autoform-skeleton-packets/v2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    changed = False
+
+    def change_generated_output(event: str, relative: str) -> None:
+        nonlocal changed
+        original_checkpoint(event, relative)
+        if event == "before-marker-verification" and not changed:
+            generated.write_text("def generated : Nat := 3\n", encoding="utf-8")
+            changed = True
+
+    monkeypatch.setattr(
+        tree_snapshot_module,
+        "_tree_snapshot_checkpoint",
+        change_generated_output,
+    )
+
+    index = index_project(tmp_path)
+
+    assert changed
+    assert index.find("actual") is not None
+    assert index.find("generated") is None
+
+
 def test_managed_skeleton_output_does_not_change_source_revisions(
     tmp_path: Path,
 ) -> None:
@@ -1569,3 +1719,61 @@ def test_build_linker_rejects_a_captured_index_from_another_root(tmp_path: Path)
 
     with pytest.raises(ValueError, match="different Lean root"):
         build_linker(second, source_index=index, detect_missing=False)
+
+
+def test_build_linker_accepts_a_captured_index_from_a_safe_lexical_alias(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    detour = project / "detour"
+    detour.mkdir(parents=True)
+    (project / "A.lean").write_text(
+        "theorem stableRoot : True := trivial\n",
+        encoding="utf-8",
+    )
+    snapshot = snapshot_project_sources(detour / "..")
+
+    linker = build_linker(
+        project,
+        source_index=snapshot.index,
+        detect_missing=False,
+    )
+
+    assert linker.index is snapshot.index
+    assert linker.location("stableRoot") is not None
+
+
+def test_build_linker_retries_when_git_ref_changes_during_source_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "A.lean"
+    source.write_text("theorem atCommitA : True := trivial\n", encoding="utf-8")
+    commit_a = "a" * 40
+    commit_b = "b" * 40
+    calls = 0
+
+    def detect_then_advance(_root: Path) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            source.write_text(
+                "theorem onlyAtCommitB : True := trivial\n",
+                encoding="utf-8",
+            )
+            return commit_a
+        return commit_b
+
+    monkeypatch.setattr(lean_module, "detect_ref", detect_then_advance)
+
+    linker = build_linker(
+        tmp_path,
+        repository_url="https://github.com/owner/repo",
+    )
+
+    assert calls == 4
+    assert linker.ref == commit_b
+    assert linker.location("onlyAtCommitB") is not None
+    assert linker.url("onlyAtCommitB").startswith(
+        f"https://github.com/owner/repo/blob/{commit_b}/"
+    )
