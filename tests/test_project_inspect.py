@@ -654,6 +654,24 @@ def test_legacy_override_of_mathlib_is_not_reported_as_the_lock(tmp_path: Path, 
     assert result.mathlib is None
 
 
+def test_requirement_recorded_only_by_a_legacy_override_is_not_an_error(tmp_path: Path) -> None:
+    # Lake applies a legacy override through Manifest.getPackages (PackageEntry.ofV6),
+    # so it records the requirement even though Autoform does not decode the file.
+    lakefile = LAKEFILE + '\n[[require]]\nname = "batteries"\nscope = "leanprover-community"\n'
+    root = _project(tmp_path, lakefile=lakefile)
+    (root / ".lake").mkdir()
+    legacy = {"name": "batteries", "opts": {}, "inherited": False, "url": "https://example.com/b", "rev": OTHER_COMMIT}
+    (root / ".lake/package-overrides.json").write_text(
+        json.dumps({"schemaVersion": 6, "packages": [{"git": legacy}]}), encoding="utf-8"
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "lake-manifest-incomplete" not in _codes(result)
+
+
 def test_legacy_override_file_cannot_fall_through_to_supported_manifest(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / ".lake").mkdir()
