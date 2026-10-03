@@ -433,6 +433,35 @@ def test_malformed_non_mathlib_package_also_invalidates_the_manifest(tmp_path: P
     assert "invalid-lake-manifest" in _codes(result)
 
 
+def test_fields_lake_accepts_are_still_read(tmp_path: Path) -> None:
+    siblings = [_mathlib(name=name) for name in ("«doc-gen4»", "x₁", "αβ.γ", "Qq.1", "[anonymous]")]
+    mathlib = {key: value for key, value in _mathlib(scope=None, manifestFile=None).items() if key != "subDir"}
+    root = _project(tmp_path, manifest=None)
+    (root / "lake-manifest.json").write_text(
+        json.dumps(
+            {
+                "version": "1.2.0",
+                "fixedToolchain": None,
+                "name": "«my-project»",
+                "lakeDir": None,
+                "packagesDir": None,
+                "packages": [*siblings, mathlib],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / ".lake").mkdir()
+    (root / ".lake/package-overrides.json").write_text(  # Lake reads only the packages of this file
+        json.dumps({"schemaVersion": "1.1.0", "name": 1, "lakeDir": 2, "fixedToolchain": "x", "packages": [mathlib]}),
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "supported"
+
+
 @pytest.mark.parametrize("version", [5, 6, "0.6.0"])
 def test_legacy_manifests_are_advisory(tmp_path: Path, version: object) -> None:
     root = _project(tmp_path)
@@ -570,6 +599,24 @@ def test_invalid_override_file_blocks_a_supported_answer(tmp_path: Path) -> None
 
     assert not result.ok
     assert result.compatibility.status == "indeterminate"
+
+
+@pytest.mark.parametrize("version", [5, 6, "0.6.0"])
+def test_legacy_override_of_mathlib_is_not_reported_as_the_lock(tmp_path: Path, version: object) -> None:
+    # Lake 4.32.2 applies a legacy override (Manifest.getPackages decodes it as
+    # PackageEntryV6), so its Mathlib replaces the manifest's; Autoform does not decode it.
+    root = _project(tmp_path)
+    (root / ".lake").mkdir()
+    legacy = {"name": "mathlib", "opts": {}, "inherited": False, "url": MATHLIB_URL, "rev": OTHER_COMMIT}
+    (root / ".lake/package-overrides.json").write_text(
+        json.dumps({"schemaVersion": version, "packages": [{"git": {**legacy, "inputRev?": "master"}}]}),
+        encoding="utf-8",
+    )
+
+    result = inspect_project(root)
+
+    assert result.compatibility.status == "indeterminate"
+    assert result.mathlib is None
 
 
 def test_legacy_override_file_cannot_fall_through_to_supported_manifest(tmp_path: Path) -> None:
