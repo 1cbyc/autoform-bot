@@ -17,7 +17,14 @@ import pytest
 import psutil
 
 from autoform_cli.__main__ import main
-from autoform_cli.lean import PACKET_SCHEMA, PASSAGE_SCHEMA, index_project
+from autoform_cli.graph import load_graph
+from autoform_cli.lean import (
+    PACKET_SCHEMA,
+    PASSAGE_SCHEMA,
+    Declaration,
+    SourceIndex,
+    index_project,
+)
 from autoform_cli.skeleton import (
     DeclarationSkeleton,
     NodeSkeleton,
@@ -46,6 +53,7 @@ from autoform_cli.skeleton import (
     _project_control_snapshot,
     _without_comments,
     _probe_record_issue,
+    extract_graph_skeletons,
     extract_skeletons,
     format_report,
     lean_libraries,
@@ -247,6 +255,26 @@ def _fake_report(tmp_path: Path, output: str | None = None) -> SkeletonReport:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
     output = _fake_probe_output() if output is None else output
+    if os.name == "nt":
+        declaration = Declaration(
+            "Skel.observation_determined",
+            Path("Skel/Main.lean"),
+            15,
+            "theorem",
+        )
+        index = SourceIndex(
+            root=project,
+            declarations={declaration.name: declaration},
+            source_digest="windows-publication-fixture",
+            line_counts={Path("Skel/Main.lean"): 21},
+        )
+        return extract_graph_skeletons(
+            load_graph(blueprint),
+            lean_root=project,
+            libraries=lean_libraries(project),
+            index=index,
+            runner=lambda _probe, _root: output,
+        )
     return extract_skeletons(blueprint, lean_root=project, runner=lambda probe, root: output)
 
 
