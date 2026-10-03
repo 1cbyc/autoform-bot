@@ -719,6 +719,36 @@ def test_duplicate_target_names_are_compared_as_lean_names(tmp_path: Path) -> No
     assert "invalid-lakefile-toml" in _codes(result)
 
 
+@pytest.mark.parametrize(
+    "targets",
+    [
+        '[[lean_lib]]\nname = "A"\n[[input_dir]]\nname = "A"\npath = "d"\n',
+        '[[lean_exe]]\nname = "a"\n[[input_file]]\nname = "a"\npath = "x"\n',
+        '[[input_file]]\nname = "x"\npath = "x"\n[[input_dir]]\nname = "x"\npath = "d"\n',
+        '[[lean_lib]]\nname = "A"\n[[input_file]]\npath = "x"\n',
+        'input_dir = 5\n[[lean_lib]]\nname = "A"\n',
+    ],
+    ids=["lib-dir", "exe-file", "file-dir", "unnamed-input", "input-not-tables"],
+)
+def test_input_targets_share_lakes_target_namespace(tmp_path: Path, targets: str) -> None:
+    # Lake 4.32.2 refuses each (implB corpus tgt-dup-lib-dir, tgt-dup-exe-dir,
+    # e-input-dup-file-dir, tgt-file-no-name, tgt-file-not-array).
+    result = inspect_project(_project(tmp_path, lakefile='name = "E"\n' + targets))
+
+    assert not result.ok
+    assert "invalid-lakefile-toml" in _codes(result)
+
+
+def test_distinct_input_targets_are_left_out_of_the_report(tmp_path: Path) -> None:
+    targets = (
+        '[[lean_lib]]\nname = "A"\n[[input_file]]\nname = "b"\npath = "x"\n[[input_dir]]\nname = "c"\npath = "d"\n'
+    )
+    result = inspect_project(_project(tmp_path, lakefile=LAKEFILE.split("\n\n[[lean_lib]]")[0] + "\n" + targets))
+
+    assert result.compatibility.status == "supported"
+    assert result.lake.targets == (project_inspect.LakeTarget("lean_lib", "A"),)
+
+
 def test_numeric_and_escaped_numeric_target_names_are_distinct(tmp_path: Path) -> None:
     lakefile = 'name = "E"\n[[lean_lib]]\nname = "1"\n[[lean_exe]]\nname = "«1»"\n'
 

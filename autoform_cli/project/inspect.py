@@ -32,6 +32,7 @@ _ROOT_MARKERS = ("lakefile.lean", "lakefile.toml", "lean-toolchain")
 _MANIFEST = "lake-manifest.json"
 _OVERRIDES = ".lake/package-overrides.json"
 _DECISION_FILES = (*_ROOT_MARKERS, _MANIFEST, _OVERRIDES)
+_TARGET_KINDS = ("lean_lib", "lean_exe", "input_file", "input_dir")  # the kinds lakefile.toml declares
 _MATHLIB_NAME = (("str", "mathlib"),)
 _LAKE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[^ \t\r\n]+)?")  # Lake's StdVer
 _MANIFEST_VERSION = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)(?:-[^ \t\r\n]+)?")
@@ -511,15 +512,17 @@ def _lakefile_problem(config: dict) -> str | None:
     version = config.get("version")
     if version is not None and not (isinstance(version, str) and _LAKE_VERSION.fullmatch(version)):
         return "its version is not major.minor.patch"
-    if not all(_are_named_tables(config.get(key, [])) for key in ("require", "lean_lib", "lean_exe")):
-        return "a require, lean_lib, or lean_exe entry has no name"
+    if not all(_are_named_tables(config.get(key, [])) for key in ("require", *_TARGET_KINDS)):
+        return "a require or target entry has no name"
     for requirement in config.get("require", []):
         problem = _requirement_problem(requirement)
         if problem is not None:
             return problem
+    # Lake's decodeTargetDecls keeps one name map for every target kind, so a
+    # reported lean_lib or lean_exe also clashes with an input target.
     targets = [
         _canonical_toml_name(entry["name"])
-        for key in ("lean_lib", "lean_exe")
+        for key in _TARGET_KINDS
         for entry in config.get(key, [])
     ]
     if len(set(targets)) != len(targets):
