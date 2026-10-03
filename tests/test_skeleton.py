@@ -407,13 +407,16 @@ def test_bounded_command_finds_a_descendant_that_escapes_its_process_group(
 ) -> None:
     child_pid = tmp_path / "detached-child.pid"
     child_program = (
-        "import os, pathlib, time; os.setsid(); "
-        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid())); time.sleep(30)"
+        "import os, pathlib, time; os.setsid(); time.sleep(0.1); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid())); "
+        "os.write({ready_fd}, b'1'); os.close({ready_fd}); time.sleep(30)"
     )
     parent_program = (
-        "import subprocess, sys; "
-        f"subprocess.Popen([sys.executable, '-c', {child_program!r}], "
-        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+        "import os, subprocess, sys; read_fd, write_fd = os.pipe(); "
+        f"child_program = {child_program!r}.format(ready_fd=write_fd); "
+        "subprocess.Popen([sys.executable, '-c', child_program], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(write_fd,)); "
+        "os.close(write_fd); assert os.read(read_fd, 1) == b'1'; os.close(read_fd)"
     )
 
     with pytest.raises(SkeletonError, match="descendant processes"):
