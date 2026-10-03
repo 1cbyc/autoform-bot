@@ -325,7 +325,7 @@ def _inspect_snapshot(
         )
     if lake is not None and lake.config == "lakefile.lean":
         mathlib = None
-    elif mathlib is not None and requirements is not None and (unused := _unused_mathlib(requirements, mathlib)):
+    elif mathlib is not None and requirements is not None and (unused := _unused_mathlib(requirements, locked)):
         diagnostics.append(ProjectDiagnostic("warning", "mathlib-manifest-unused", unused, mathlib.source))
         mathlib = None
     return _result(
@@ -449,6 +449,7 @@ def _inspect_lake(
     # requirement of the root's own name never reaches the manifest. A root
     # named mathlib thus satisfies every Mathlib requirement, direct or
     # transitive, and the manifest's Mathlib entry is never materialized.
+    # Only the requirements Lake looks up can pull Mathlib in transitively.
     root_name = _canonical_toml_name(config["name"])
     declared = bool(config.get("require"))
     lookups = tuple(
@@ -458,7 +459,7 @@ def _inspect_lake(
     )
     if root_name == _MATHLIB_NAME:
         return lake, _Requirements(None, transitive=False, declared=declared, lookups=lookups)
-    return lake, _Requirements(requirement, transitive=declared, declared=declared, lookups=lookups)
+    return lake, _Requirements(requirement, transitive=bool(lookups), declared=declared, lookups=lookups)
 
 
 def _unrecorded_requirements(requirements: _Requirements, recorded: frozenset) -> str | None:
@@ -483,24 +484,34 @@ def _unrecorded_requirements(requirements: _Requirements, recorded: frozenset) -
     return None
 
 
-def _unused_mathlib(requirements: _Requirements, mathlib: MathlibLock) -> str | None:
-    """Why Lake never materializes the manifest's Mathlib entry, if it does not.
+def _unused_mathlib(requirements: _Requirements, locked: MathlibLock | None) -> str | None:
+    """Why Lake may not materialize the Mathlib the manifest or overrides select, if so.
 
     Lake resolves the root's requirements and, recursively, its dependencies'
-    against the root manifest alone (``Workspace.materializeDeps``), and
-    ``lake update`` records only reachable packages, so an inherited entry
-    under other requirements is taken as recorded.
+    against the root manifest and the overrides (``Workspace.materializeDeps``),
+    and ``lake update`` records only reachable packages, so the manifest's own
+    entry decides: an inherited entry under other requirements is taken as
+    recorded. An override replaces a used entry but never makes Mathlib used,
+    since materializeDeps ignores the override's ``inherited`` flag.
     """
 
     if requirements.mathlib is not None:
         return None
     if not requirements.transitive:
         return (
-            "Lake resolves no Mathlib from the manifest: lakefile.toml requires no packages, "
-            "or its own package is named mathlib."
+            "Lake resolves no Mathlib from the manifest: lakefile.toml requires no package other than "
+            "its own, or its own package is named mathlib."
         )
-    if not mathlib.inherited:
-        return "The manifest locks Mathlib directly, but lakefile.toml does not require it, so Lake does not build it."
+    if locked is None:
+        return (
+            "Only package-overrides.json names Mathlib and lakefile.toml does not require it; "
+            "Lake builds it only if a dependency requires Mathlib, and Autoform does not read dependency lakefiles."
+        )
+    if not locked.inherited:
+        return (
+            "The manifest locks Mathlib directly, but lakefile.toml does not require it; "
+            "Lake builds it only if a dependency requires Mathlib, and Autoform does not read dependency lakefiles."
+        )
     return None
 
 

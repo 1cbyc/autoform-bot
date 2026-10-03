@@ -186,6 +186,8 @@ def test_direct_lock_without_a_requirement_is_unused(tmp_path: Path) -> None:
     assert result.mathlib is None
     assert result.compatibility.status == "indeterminate"
     assert "mathlib-manifest-unused" in _codes(result)
+    (unused,) = [d for d in result.diagnostics if d.code == "mathlib-manifest-unused"]
+    assert "does not build" not in unused.message and "dependency" in unused.message
 
 
 @pytest.mark.parametrize("inherited", [False, True])
@@ -206,6 +208,39 @@ def test_root_named_mathlib_also_satisfies_transitive_requirements(tmp_path: Pat
     assert result.mathlib is None
     assert result.compatibility.status == "indeterminate"
     assert "mathlib-manifest-unused" in _codes(result)
+
+
+def test_self_requirement_alone_pulls_in_no_mathlib(tmp_path: Path) -> None:
+    inherited = {**_mathlib(), "inherited": True}
+    lakefile = 'name = "selfy"\n\n[[require]]\nname = "selfy"\npath = "."\n'
+    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(LOOM, inherited)))
+
+    assert result.mathlib is None
+    assert result.compatibility.status == "indeterminate"
+    assert "mathlib-manifest-unused" in _codes(result)
+
+
+def test_inherited_override_does_not_make_an_unrecorded_mathlib_used(tmp_path: Path) -> None:
+    root = _project(tmp_path, lakefile=LOOM_LAKEFILE, manifest=(LOOM,))
+    _write_overrides(root, {**_mathlib(), "inherited": True})
+
+    result = inspect_project(root)
+
+    assert result.mathlib is None
+    assert result.compatibility.status == "indeterminate"
+    assert "mathlib-manifest-unused" in _codes(result)
+
+
+@pytest.mark.parametrize("override_inherited", [False, True])
+def test_override_of_an_inherited_lock_decides_compatibility(tmp_path: Path, override_inherited: bool) -> None:
+    root = _project(tmp_path, lakefile=LOOM_LAKEFILE, manifest=(LOOM, _mathlib(rev=OTHER_COMMIT, inherited=True)))
+    _write_overrides(root, {**_mathlib(), "inherited": override_inherited})
+
+    result = inspect_project(root)
+
+    assert result.mathlib is not None and result.mathlib.rev == COMMIT
+    assert result.compatibility.status == "supported"
+    assert "mathlib-manifest-unused" not in _codes(result)
 
 
 def _write_overrides(root: Path, *packages: dict) -> None:

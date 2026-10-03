@@ -152,12 +152,14 @@ a `lakefile.toml` that requests a different Mathlib than the lock gets a
 `lake-manifest-stale` warning. Lake resolves every requirement, direct or
 transitive, from the root manifest, so the Mathlib entry decides compatibility
 when `lakefile.toml` requires Mathlib, or requires other packages and the
-manifest records the entry as inherited from them. It is unused, with a
+manifest records the entry as inherited from them; an override replaces that
+entry but never makes Mathlib count on its own. It is unused, with a
 `mathlib-manifest-unused` warning and an `indeterminate` answer, when
-`lakefile.toml` requires no packages, when the entry is not inherited and no
-require names Mathlib, or when the root package is itself named `mathlib`,
-which Lake reuses for every Mathlib requirement. Dependency lakefiles and
-manifests are not read: `lake update` records an inherited entry only while a
+`lakefile.toml` requires no package other than its own, when no require names
+Mathlib and the manifest's entry is missing or not inherited (Lake then builds
+it only if a dependency requires Mathlib), or when the root package is itself
+named `mathlib`, which Lake reuses for every Mathlib requirement. Dependency
+lakefiles and manifests are not read: `lake update` records an inherited entry only while a
 dependency needs it, but an entry left behind after removing the require that
 pulled Mathlib in, without running `lake update`, is still taken as recorded.
 A require that neither the manifest nor the overrides record, or any require
@@ -688,7 +690,7 @@ would work but Autoform cannot decide, or wants to point something out.
 | `lakefile-lean-not-evaluated` | warning | `lakefile.lean` takes precedence and is never evaluated, so its package and Mathlib are unknown. |
 | `mathlib-overridden` | warning | `.lake/package-overrides.json` replaces the manifest's Mathlib; `mathlib` reports the override. |
 | `lake-manifest-stale` | warning | `lakefile.toml` asks for a different Mathlib than the manifest locks; Lake builds the locked one. |
-| `mathlib-manifest-unused` | warning | The manifest has a Mathlib entry Lake does not build: `lakefile.toml` requires no packages, the entry is not inherited and no require names Mathlib, or the root package is itself named `mathlib`. |
+| `mathlib-manifest-unused` | warning | Autoform cannot tell that Lake builds the Mathlib the manifest or overrides select: `lakefile.toml` requires no package other than its own (Lake builds none), no require names Mathlib and the manifest's entry is missing or not inherited (Lake builds it only if a dependency requires Mathlib), or the root package is itself named `mathlib` (Lake builds none). |
 | `release-indeterminate` | warning | With no error, the toolchain or the Mathlib Lake builds is unknown or path-based. |
 | `release-unlisted` | warning | The toolchain and Mathlib are known but are not a bundled catalog pair, or Mathlib is not loaded the way releases load it (another `subDir`, `configFile` or `manifestFile`). |
 
