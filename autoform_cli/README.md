@@ -177,6 +177,9 @@ This predicts an ordinary Lake invocation. CLI `--packages` / `--file`
 overrides, `LAKE_PKG_URL_MAP`, and edits inside an already-materialized checkout
 are outside the offline report.
 
+[Project inspection report](#project-inspection-report) lists the command's
+exit codes, JSON fields and diagnostic codes.
+
 `project versions` lists the bundled catalog of known-good Lean and Mathlib
 pairs. It is an allowlist, not a resolver.
 
@@ -656,18 +659,19 @@ prints `{"error": {"code": "project-catalog-invalid", "message": ...},
 | `project_root` | path from the target to the nearest enclosing project, such as `"."` or `"../.."`; `null` when no project was found |
 | `lean_toolchain` | the trimmed first line of `lean-toolchain`, or `null` when it is missing or invalid |
 | `lake` | `null` when the Lake configuration is missing, unreadable or invalid; otherwise `config` (`"lakefile.toml"` or `"lakefile.lean"`), the package `name` and `version` (both `null` for `lakefile.lean`, which is not evaluated), and `targets`, a list of `{kind, name}` for each `lean_lib` and `lean_exe` |
-| `mathlib` | the Mathlib entry Lake would build, or `null` when none decides compatibility; see below |
-| `compatibility` | `status` (`supported`, `unlisted` or `indeterminate`, defined above), `release` (the matching catalog id, or `null`), and `recommended_release` (the catalog's recommended id) |
+| `mathlib` | the Mathlib entry the manifest or overrides select; `null` when there is none, when either file cannot be decoded, or when Lake would not build it (`lakefile.lean`, or a `mathlib-manifest-unused` warning). It is still reported when another error makes the status `indeterminate`; see below |
+| `compatibility` | `status` (`supported`, `unlisted` or `indeterminate`, defined under [Commands](#commands)), `release` (the matching catalog id, or `null`), and `recommended_release` (the catalog's recommended id) |
 | `autoform_paths` | which of `blueprint`, `mkdocs.yml`, `.github/workflows/autoform-verify.yml` and `.github/workflows/blueprint-pages.yml` exist under the project root, with that exact spelling |
 | `diagnostics` | a list of `{severity, code, message, path}`, sorted by severity (`error` first), then code, then path; `path` is the file concerned, relative to the project root, or `null` |
 
 The `mathlib` object has `source` (`"lake-manifest.json"` or
 `".lake/package-overrides.json"`, whichever Lake takes the entry from),
 `type` (`"git"` or `"path"`), `inherited`, and the entry's `url` (with any
-embedded credentials replaced by `***`), `input_rev`, `rev`, `dir`,
-`sub_dir`, `config_file` and `manifest_file`, each `null` when the entry
-does not have it. A `null` `config_file` in the manifest is reported as
-`"lakefile"`, as Lake reads it.
+embedded credentials replaced by `***`), `input_rev`, `rev`, `dir` and
+`sub_dir`, each `null` when the entry does not have it, and `config_file`
+and `manifest_file`, which default to `"lakefile"` and
+`"lake-manifest.json"` when the entry has no value or `null`, as Lake reads
+them.
 
 Errors mean Lake would fail on the project or a file Autoform needs cannot
 be read; any error makes the status `indeterminate`. Warnings mean Lake
@@ -680,9 +684,9 @@ would work but Autoform cannot decide, or wants to point something out.
 | `project-changed-during-inspection` | error | The decision files kept changing across every retry, so no single snapshot was read. |
 | `unreadable-file` | error | A decision file is not a regular, readable UTF-8 file of at most 1 MiB. |
 | `missing-lake-config` | error | There is neither `lakefile.toml` nor `lakefile.lean`. |
-| `invalid-lakefile-toml` | error | Lake would refuse a field of `lakefile.toml` that the report reads (invalid TOML, a bad name or version, a malformed require, or a target entry or name Lake rejects). |
+| `invalid-lakefile-toml` | error | `lakefile.toml` is not TOML that Autoform can decode safely, or Lake would refuse a field of it that the report reads (a bad name or version, a malformed require, or a target entry or name Lake rejects). |
 | `missing-lean-toolchain` | error | There is no `lean-toolchain`. |
-| `invalid-lean-toolchain` | error | The first line of `lean-toolchain` is empty or malformed, so elan ignores it. |
+| `invalid-lean-toolchain` | error | The trimmed first line of `lean-toolchain` is empty or contains whitespace or a non-printable character. |
 | `invalid-lake-manifest` | error | `lake-manifest.json` or `.lake/package-overrides.json` is not JSON Lake decodes, or has an unknown version. |
 | `lake-manifest-incomplete` | error | A requirement of `lakefile.toml` is recorded by neither the manifest nor the overrides, or there are requirements and they record no packages; Lake asks for `lake update`. |
 | `missing-lake-manifest` | warning | There is no `lake-manifest.json`, so the locked Mathlib is unknown; Lake would run an update. |
