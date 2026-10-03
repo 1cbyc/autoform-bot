@@ -145,14 +145,29 @@ the network. Compatibility is decided by the toolchain and the Mathlib commit
 the manifest locks, which is what `lake build` uses: `supported` when that pair
 is in the bundled catalog, `unlisted` when it is not, and `indeterminate` when
 either is unknown (no manifest, no Mathlib, a path-based Mathlib, or any file
-error). A `.lake/package-overrides.json` entry for Mathlib replaces the
-manifest's, and a `lakefile.toml` that requests a different Mathlib than the
-lock gets a `lake-manifest-stale` warning. `lakefile.lean` takes precedence, as
-in Lake, but is never evaluated, so its projects stay `indeterminate`. As in
-elan, only the trimmed first line of `lean-toolchain` counts.
+error). When Lake can load the root manifest, a
+`.lake/package-overrides.json` entry for Mathlib replaces the manifest's, and
+a `lakefile.toml` that requests a different Mathlib than the lock gets a
+`lake-manifest-stale` warning. A lock entry without a direct Mathlib
+requirement stays `indeterminate`, because proving it is transitively active
+would require evaluating dependency configurations. `lakefile.lean` takes
+precedence, as in Lake, but is never evaluated, so its projects stay
+`indeterminate`. The decision files are size-bounded and read twice as one
+snapshot; inspection retries or fails if their bytes, identities, presence, or
+case aliases change. As in elan, only the trimmed first line of
+`lean-toolchain` counts.
+
+This predicts an ordinary Lake invocation. CLI `--packages` / `--file`
+overrides, `LAKE_PKG_URL_MAP`, and edits inside an already-materialized checkout
+are outside the offline report.
 
 `project versions` lists the bundled catalog of known-good Lean and Mathlib
 pairs. It is an allowlist, not a resolver.
+
+`supported` certifies only the inspected Lean/Mathlib release pair; it is not a
+full Lake configuration or build-validity check. `ok` likewise means the files
+and fields used by this report were readable and decodable. Target and package
+options outside the report are left to Lake.
 
 Publishing a project runs four steps in order: validate, write the Mermaid
 graph into the vault, render the site source, then strict-build the site.

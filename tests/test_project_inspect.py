@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import autoform_cli.project.inspect as project_inspect
 from autoform_cli.__main__ import _human_text, main
 from autoform_cli.project import (
     PROJECT_INSPECTION_SCHEMA,
@@ -167,12 +168,14 @@ def test_last_duplicate_manifest_entry_wins(tmp_path: Path) -> None:
     assert result.compatibility.status == "supported"
 
 
-def test_transitive_mathlib_still_decides_compatibility(tmp_path: Path) -> None:
+def test_unverified_transitive_mathlib_is_indeterminate(tmp_path: Path) -> None:
     inherited = {**_mathlib(), "inherited": True}
     lakefile = 'name = "Example"\n\n[[require]]\nname = "loom"\ngit = "https://example.com/loom"\n'
     result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(inherited,)))
 
-    assert result.compatibility.status == "supported"
+    assert result.mathlib is None
+    assert result.compatibility.status == "indeterminate"
+    assert "mathlib-manifest-unused" in _codes(result)
 
 
 def test_direct_lock_without_a_requirement_is_unused(tmp_path: Path) -> None:
@@ -185,12 +188,23 @@ def test_direct_lock_without_a_requirement_is_unused(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "fields",
-    [{"subDir": "Archive"}, {"configFile": "alternate.lean"}, {"configFile": None}, {"manifestFile": "other.json"}],
+    [{"subDir": "Archive"}, {"configFile": "alternate.lean"}, {"manifestFile": "other.json"}],
 )
 def test_lock_must_load_mathlib_the_way_releases_do(tmp_path: Path, fields: dict) -> None:
     result = inspect_project(_project(tmp_path, manifest=(_mathlib(**fields),)))
 
     assert result.compatibility.status == "unlisted"
+
+
+@pytest.mark.parametrize("config_file", [None, "lakefile"])
+def test_lakes_default_extensionless_config_resolves_to_mathlibs_lakefile_lean(
+    tmp_path: Path, config_file: object
+) -> None:
+    result = inspect_project(_project(tmp_path, manifest=(_mathlib(configFile=config_file),)))
+
+    assert result.ok
+    assert result.mathlib.config_file == "lakefile"
+    assert result.compatibility.status == "supported"
 
 
 def test_uppercase_commit_is_the_same_commit(tmp_path: Path) -> None:
@@ -269,6 +283,86 @@ def test_manifests_lake_would_refuse_fail_inspection(tmp_path: Path, content: st
     assert "invalid-lake-manifest" in _codes(result)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", 7),
+        ("name", ""),
+        ("lakeDir", 7),
+        ("fixedToolchain", "false"),
+        ("packagesDir", 7),
+    ],
+)
+def test_every_decoded_manifest_root_field_is_type_checked(tmp_path: Path, field: str, value: object) -> None:
+    root = _project(tmp_path)
+    payload = json.loads((root / "lake-manifest.json").read_text(encoding="utf-8"))
+    payload[field] = value
+    (root / "lake-manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "invalid-lake-manifest" in _codes(result)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", 7),
+        ("name", ""),
+        ("scope", 7),
+        ("inherited", "false"),
+        ("inherited", None),
+        ("configFile", 7),
+        ("manifestFile", 7),
+        ("type", 7),
+        ("type", "zip"),
+        ("url", 7),
+        ("rev", 7),
+        ("inputRev", 7),
+        ("subDir", 7),
+    ],
+)
+def test_every_decoded_git_package_field_is_type_checked(tmp_path: Path, field: str, value: object) -> None:
+    root = _project(tmp_path, manifest=(_mathlib(**{field: value}),))
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "invalid-lake-manifest" in _codes(result)
+
+
+@pytest.mark.parametrize("field", ["name", "inherited", "type", "url", "rev"])
+def test_required_git_package_fields_cannot_be_missing(tmp_path: Path, field: str) -> None:
+    entry = _mathlib()
+    entry.pop(field)
+
+    result = inspect_project(_project(tmp_path, manifest=(entry,)))
+
+    assert not result.ok
+    assert "invalid-lake-manifest" in _codes(result)
+
+
+@pytest.mark.parametrize("directory", [None, 7])
+def test_path_package_dir_is_a_required_string(tmp_path: Path, directory: object) -> None:
+    entry = {"name": "other", "type": "path", "inherited": True, "dir": directory}
+    result = inspect_project(_project(tmp_path, manifest=(_mathlib(), entry)))
+
+    assert not result.ok
+    assert "invalid-lake-manifest" in _codes(result)
+
+
+@pytest.mark.parametrize("entry", [{"name": "other", "type": "path", "inherited": False}, {"name": 7}])
+def test_malformed_non_mathlib_package_also_invalidates_the_manifest(tmp_path: Path, entry: dict) -> None:
+    result = inspect_project(_project(tmp_path, manifest=(_mathlib(), entry)))
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "invalid-lake-manifest" in _codes(result)
+
+
 @pytest.mark.parametrize("version", [5, 6, "0.6.0"])
 def test_legacy_manifests_are_advisory(tmp_path: Path, version: object) -> None:
     root = _project(tmp_path)
@@ -330,6 +424,18 @@ def test_override_needs_a_manifest_to_replace(tmp_path: Path) -> None:
     assert inspect_project(root).compatibility.status == "indeterminate"
 
 
+def test_override_is_not_parsed_on_lakes_no_manifest_update_path(tmp_path: Path) -> None:
+    root = _project(tmp_path, manifest=None)
+    (root / ".lake").mkdir()
+    (root / ".lake/package-overrides.json").write_text("{", encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "invalid-lake-manifest" not in _codes(result)
+
+
 def test_override_without_mathlib_leaves_the_manifest_in_charge(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / ".lake").mkdir()
@@ -361,6 +467,20 @@ def test_invalid_override_file_blocks_a_supported_answer(tmp_path: Path) -> None
     assert result.compatibility.status == "indeterminate"
 
 
+def test_legacy_override_file_cannot_fall_through_to_supported_manifest(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / ".lake").mkdir()
+    (root / ".lake/package-overrides.json").write_text(
+        json.dumps({"schemaVersion": 6, "packages": []}), encoding="utf-8"
+    )
+
+    result = inspect_project(root)
+
+    assert result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "unsupported-lake-manifest" in _codes(result)
+
+
 def test_lakefile_lean_takes_precedence_and_is_not_evaluated(tmp_path: Path) -> None:
     root = _project(tmp_path)
     (root / "lakefile.lean").write_text('#eval IO.println "never run"\n', encoding="utf-8")
@@ -372,6 +492,21 @@ def test_lakefile_lean_takes_precedence_and_is_not_evaluated(tmp_path: Path) -> 
     assert result.mathlib is None
     assert "lakefile-lean-not-evaluated" in _codes(result)
     assert result.compatibility.status == "indeterminate"
+
+
+def test_case_variant_lakefile_lean_still_takes_precedence_on_case_insensitive_filesystems(tmp_path: Path) -> None:
+    probe = tmp_path / "case-probe"
+    probe.write_text("", encoding="utf-8")
+    if not (tmp_path / "CASE-PROBE").exists():
+        pytest.skip("needs a case-insensitive filesystem")
+    root = _project(tmp_path)
+    (root / "Lakefile.lean").write_text('#eval IO.println "never run"\n', encoding="utf-8")
+
+    result = inspect_project(root)
+
+    assert result.lake.config == "lakefile.lean"
+    assert result.compatibility.status == "indeterminate"
+    assert "lakefile-lean-not-evaluated" in _codes(result)
 
 
 @pytest.mark.parametrize(
@@ -414,7 +549,6 @@ def test_missing_toolchain_and_lakefile_are_errors(tmp_path: Path) -> None:
     [
         "name = \n",
         'version = "0.1.0"\n',
-        'name = ""\n',
         'name = "E"\nversion = "wat"\n',
         'name = "E"\nrequire = 5\n',
         'name = "E"\n[[lean_lib]]\n',
@@ -429,9 +563,162 @@ def test_lakefiles_lake_refuses_are_errors(tmp_path: Path, lakefile: str) -> Non
     assert "invalid-lakefile-toml" in _codes(result)
 
 
+def test_empty_toml_names_use_lakes_simple_name_fallback(tmp_path: Path) -> None:
+    lakefile = 'name = ""\n[[require]]\nname = ""\n[[lean_lib]]\nname = ""\n'
+
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert result.ok
+    assert result.lake.name == ""
+    assert result.lake.targets[0].name == ""
+
+
+def test_duplicate_target_names_are_compared_as_lean_names(tmp_path: Path) -> None:
+    lakefile = 'name = "E"\n[[lean_lib]]\nname = "A"\n[[lean_exe]]\nname = "«A»"\n'
+
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert not result.ok
+    assert "invalid-lakefile-toml" in _codes(result)
+
+
+def test_numeric_and_escaped_numeric_target_names_are_distinct(tmp_path: Path) -> None:
+    lakefile = 'name = "E"\n[[lean_lib]]\nname = "1"\n[[lean_exe]]\nname = "«1»"\n'
+
+    assert inspect_project(_project(tmp_path, lakefile=lakefile)).ok
+
+
+@pytest.mark.parametrize(("plain", "escaped"), [("", "«»"), ("a b", "«a b»"), ("[anonymous]", "«[anonymous]»")])
+def test_toml_simple_name_fallback_matches_the_equivalent_escape(
+    tmp_path: Path, plain: str, escaped: str
+) -> None:
+    lakefile = f'name = "E"\n[[lean_lib]]\nname = "{plain}"\n[[lean_exe]]\nname = "{escaped}"\n'
+
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert not result.ok
+    assert "invalid-lakefile-toml" in _codes(result)
+
+
+def test_root_package_reuses_itself_instead_of_the_same_name_manifest_entry(tmp_path: Path) -> None:
+    lakefile = 'name = "mathlib"\n[[require]]\nname = "«mathlib»"\nscope = "leanprover-community"\n'
+
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "mathlib-manifest-unused" in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        'name = "mathlib"\nscope = 7',
+        'name = "mathlib"\nrev = 7',
+        'name = "mathlib"\npath = 7',
+        'name = "mathlib"\ngit = 7',
+        'name = "mathlib"\ngit = {subDir = "x"}',
+        'name = "mathlib"\ngit = {url = 7}',
+        'name = "mathlib"\ngit = {url = "https://example.com/x", subDir = 7}',
+        'name = "mathlib"\nsource = 7',
+        'name = "mathlib"\nsource = {type = "zip"}',
+        'name = "mathlib"\nsource = {type = "path"}',
+        'name = "mathlib"\nsource = {type = "git", url = 7}',
+        'name = "mathlib"\noptions = 7',
+        'name = "mathlib"\noptions = {foo = 7}',
+        'name = "mathlib"\nversion = "1.2.3"',
+    ],
+)
+def test_every_active_requirement_field_lake_decodes_is_validated(tmp_path: Path, requirement: str) -> None:
+    lakefile = f'name = "Example"\n\n[[require]]\n{requirement}\n'
+
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert "invalid-lakefile-toml" in _codes(result)
+
+
+def test_malformed_shadowed_requirement_source_is_ignored_as_lake_ignores_it(tmp_path: Path) -> None:
+    lakefile = (
+        'name = "Example"\n\n[[require]]\nname = "mathlib"\npath = "../mathlib"\n'
+        'git = 7\nsource = 7\nscope = ""\n'
+    )
+
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert result.ok
+    assert "lake-manifest-stale" in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "*",
+        "1.*",
+        "1.2.x",
+        "^1",
+        "^0.2.3",
+        "~1.2",
+        ">=1.0.0 <2.0.0",
+        ">=1.0.0, || <2.0.0",
+        "=1.2.3",
+        "git#main",
+    ],
+)
+def test_lake_version_constraint_spellings_are_accepted(tmp_path: Path, version: str) -> None:
+    lakefile = f'name = "Example"\n\n[[require]]\nname = "other"\nversion = "{version}"\n'
+
+    assert inspect_project(_project(tmp_path, lakefile=lakefile)).ok
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "1",
+        "1.2",
+        "1.2.3",
+        "^0.0.0",
+        "^00.00.00",
+        ">=1.2",
+        "1.*.3",
+        "|| 1.*",
+        "1.*, ",
+        ">=1.0.0\u00a0<2.0.0",
+    ],
+)
+def test_lake_rejected_version_constraint_spellings_are_errors(tmp_path: Path, version: str) -> None:
+    lakefile = f'name = "Example"\n\n[[require]]\nname = "other"\nversion = "{version}"\n'
+
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert not result.ok
+    assert "invalid-lakefile-toml" in _codes(result)
+
+
+def test_git_table_ignores_its_inner_rev_field_like_lake(tmp_path: Path) -> None:
+    lakefile = (
+        'name = "Example"\n\n[[require]]\nname = "other"\n'
+        'git = {url = "https://example.com/other", rev = 7}\n'
+    )
+
+    assert inspect_project(_project(tmp_path, lakefile=lakefile)).ok
+
+
 @pytest.mark.parametrize("lakefile", ['name = "my-project"\n', 'name = "E"\nsrcDir = "../outside"\n'])
 def test_lakefiles_lake_accepts_are_fine(tmp_path: Path, lakefile: str) -> None:
     assert inspect_project(_project(tmp_path, lakefile=lakefile + LAKEFILE.split("\n\n", 1)[1])).ok
+
+
+def test_target_options_outside_the_release_pair_contract_are_left_to_lake(tmp_path: Path) -> None:
+    target = '[[lean_lib]]\nname = "Example"\n'
+    lakefile = LAKEFILE.replace(target, target + "srcDir = 7\n")
+    assert lakefile != LAKEFILE
+
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert result.ok
+    assert result.compatibility.status == "supported"
 
 
 def test_oversized_and_non_utf8_files_are_errors(tmp_path: Path) -> None:
@@ -447,6 +734,46 @@ def test_oversized_and_non_utf8_files_are_errors(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("denied", ["lakefile.toml", "lean-toolchain", "lake-manifest.json"])
+def test_stably_unreadable_decision_file_is_not_misreported_as_changing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, denied: str
+) -> None:
+    root = _project(tmp_path)
+    original = project_inspect._open_beneath
+
+    def deny_one(captured_root: Path, relative: str, flags: int):
+        if relative == denied:
+            raise PermissionError(relative)
+        return original(captured_root, relative, flags)
+
+    monkeypatch.setattr(project_inspect, "_open_beneath", deny_one)
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert "unreadable-file" in _codes(result)
+    assert "project-changed-during-inspection" not in _codes(result)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="chmod 000 must make files unreadable",
+)
+@pytest.mark.parametrize("denied", ["lakefile.toml", "lean-toolchain", "lake-manifest.json"])
+def test_chmod_unreadable_decision_file_keeps_its_specific_diagnostic(tmp_path: Path, denied: str) -> None:
+    root = _project(tmp_path)
+    path = root / denied
+    path.chmod(0)
+    try:
+        result = inspect_project(root)
+    finally:
+        path.chmod(0o600)
+
+    assert not result.ok
+    assert any(diagnostic.code == "unreadable-file" and diagnostic.path == denied for diagnostic in result.diagnostics)
+    assert "project-changed-during-inspection" not in _codes(result)
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
 def test_fifo_configuration_is_never_opened(tmp_path: Path) -> None:
     root = _project(tmp_path, lakefile=None)
@@ -454,6 +781,201 @@ def test_fifo_configuration_is_never_opened(tmp_path: Path) -> None:
 
     result = inspect_project(root)  # would block forever if opened
 
+    assert "unreadable-file" in _codes(result)
+
+
+def test_decision_files_are_retried_as_one_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Neither real state is supported: A has the new Lean with the old lock,
+    # and B has the old Lean with the new lock. A sequential read could invent
+    # a supported new-Lean/new-lock pair that never existed.
+    root = _project(tmp_path, manifest=(_mathlib(rev=OTHER_COMMIT, input_rev="v4.31.0"),))
+    original = project_inspect._capture_file
+    switched = False
+
+    def capture_and_switch(captured_root: Path, relative: str):
+        nonlocal switched
+        entry = original(captured_root, relative)
+        if relative == "lean-toolchain" and not switched:
+            switched = True
+            (root / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n", encoding="utf-8")
+            _write_manifest(root, _mathlib())
+        return entry
+
+    monkeypatch.setattr(project_inspect, "_capture_file", capture_and_switch)
+
+    result = inspect_project(root)
+
+    assert switched
+    assert result.lean_toolchain == "leanprover/lean4:v4.31.0"
+    assert result.mathlib.rev == COMMIT
+    assert result.compatibility.status == "unlisted"
+
+
+def test_rename_aba_cannot_repeat_a_synthetic_pair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _project(tmp_path, manifest=(_mathlib(rev=OTHER_COMMIT, input_rev="v4.31.0"),))
+    lean = root / "lean-toolchain"
+    manifest = root / "lake-manifest.json"
+    lean_b = root / ".lean-b"
+    manifest_b = root / ".manifest-b"
+    lean_b.write_text("leanprover/lean4:v4.31.0\n", encoding="utf-8")
+    manifest_b.write_text(
+        json.dumps({"version": "1.1.0", "packagesDir": ".lake/packages", "packages": [_mathlib()]}),
+        encoding="utf-8",
+    )
+    original = project_inspect._capture_file
+    state = "a"
+
+    def swap(first: Path, second: Path, saved: Path) -> None:
+        first.replace(saved)
+        second.replace(first)
+
+    def capture_and_cycle(captured_root: Path, relative: str):
+        nonlocal state
+        entry = original(captured_root, relative)
+        if relative == "lean-toolchain" and state == "a":
+            swap(lean, lean_b, root / ".lean-a")
+            swap(manifest, manifest_b, root / ".manifest-a")
+            state = "b"
+        elif relative == "lake-manifest.json" and state == "b":
+            swap(lean, root / ".lean-a", lean_b)
+            swap(manifest, root / ".manifest-a", manifest_b)
+            state = "a"
+        return entry
+
+    monkeypatch.setattr(project_inspect, "_capture_file", capture_and_cycle)
+
+    result = inspect_project(root)
+
+    assert result.compatibility.status == "indeterminate"
+    assert "project-changed-during-inspection" in _codes(result)
+
+
+def test_override_parent_generation_is_part_of_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    lake_dir = root / ".lake"
+    lake_dir.mkdir()
+    override = lake_dir / "package-overrides.json"
+    override.write_text(json.dumps({"schemaVersion": "1.1.0", "packages": []}), encoding="utf-8")
+    original = project_inspect._capture_file
+
+    def capture_and_rename_aba(captured_root: Path, relative: str):
+        entry = original(captured_root, relative)
+        if relative == ".lake/package-overrides.json":
+            temporary = lake_dir / ".override-aba"
+            override.replace(temporary)
+            temporary.replace(override)
+        return entry
+
+    monkeypatch.setattr(project_inspect, "_capture_file", capture_and_rename_aba)
+
+    result = inspect_project(root)
+
+    assert result.compatibility.status == "indeterminate"
+    assert "project-changed-during-inspection" in _codes(result)
+
+
+def test_new_nearer_project_root_forces_a_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    outer = _project(tmp_path)
+    inner = outer / "nested"
+    inner.mkdir()
+    original = project_inspect._capture_decision_snapshot
+    inserted = False
+
+    def capture_after_inserting_root(root: Path):
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            (inner / "lakefile.toml").write_text(LAKEFILE, encoding="utf-8")
+            (inner / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n", encoding="utf-8")
+            _write_manifest(inner, _mathlib())
+        return original(root)
+
+    monkeypatch.setattr(project_inspect, "_capture_decision_snapshot", capture_after_inserting_root)
+
+    result = inspect_project(inner)
+
+    assert inserted
+    assert result.project_root == "."
+    assert result.lean_toolchain == "leanprover/lean4:v4.31.0"
+    assert result.compatibility.status == "unlisted"
+
+
+def test_suppressed_path_predicate_errors_cannot_hide_a_nearer_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outer = _project(tmp_path)
+    inner = outer / "nested"
+    inner.mkdir()
+    (inner / "lakefile.toml").write_text(LAKEFILE, encoding="utf-8")
+    (inner / "lean-toolchain").write_text("leanprover/lean4:v4.31.0\n", encoding="utf-8")
+    _write_manifest(inner, _mathlib())
+    original_exists = Path.exists
+    original_is_symlink = Path.is_symlink
+
+    def suppressed_exists(path: Path) -> bool:
+        return False if path.parent == inner and path.name in project_inspect._ROOT_MARKERS else original_exists(path)
+
+    def suppressed_is_symlink(path: Path) -> bool:
+        return False if path.parent == inner and path.name in project_inspect._ROOT_MARKERS else original_is_symlink(path)
+
+    monkeypatch.setattr(Path, "exists", suppressed_exists)
+    monkeypatch.setattr(Path, "is_symlink", suppressed_is_symlink)
+
+    result = inspect_project(inner)
+
+    assert result.project_root == "."
+    assert result.lean_toolchain == "leanprover/lean4:v4.31.0"
+    assert result.compatibility.status == "unlisted"
+
+
+def test_autoform_paths_are_revalidated_with_the_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _project(tmp_path)
+    (root / "blueprint").mkdir()
+    original = project_inspect._capture_decision_snapshot
+    removed = False
+
+    def capture_after_removing_blueprint(captured_root: Path):
+        nonlocal removed
+        if not removed:
+            removed = True
+            (root / "blueprint").rmdir()
+        return original(captured_root)
+
+    monkeypatch.setattr(project_inspect, "_capture_decision_snapshot", capture_after_removing_blueprint)
+
+    result = inspect_project(root)
+
+    assert removed
+    assert result.compatibility.status == "supported"
+    assert result.autoform_paths == ()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"), reason="needs POSIX FIFOs")
+def test_file_replaced_by_fifo_between_stat_and_open_never_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    lakefile = root / "lakefile.toml"
+    original_open = project_inspect.os.open
+    switched = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal switched
+        if (Path(path) == lakefile or str(path) == "lakefile.toml") and not switched:
+            switched = True
+            lakefile.unlink()
+            os.mkfifo(lakefile)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(project_inspect.os, "open", racing_open)
+
+    result = inspect_project(root)
+
+    assert switched
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
     assert "unreadable-file" in _codes(result)
 
 
