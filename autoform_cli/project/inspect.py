@@ -47,10 +47,10 @@ _ELAN_WHITESPACE = frozenset(
     "\u2028\u2029\u202f\u205f\u3000"
 )
 _AUTOFORM_PATHS: dict[str, Callable[[Path], bool]] = {
-    "blueprint": Path.is_dir,
-    "mkdocs.yml": Path.is_file,
-    ".github/workflows/autoform-verify.yml": Path.is_file,
-    ".github/workflows/blueprint-pages.yml": Path.is_file,
+    "blueprint": os.path.isdir,
+    "mkdocs.yml": os.path.isfile,
+    ".github/workflows/autoform-verify.yml": os.path.isfile,
+    ".github/workflows/blueprint-pages.yml": os.path.isfile,
 }
 
 
@@ -247,6 +247,10 @@ def _find_project_root(start: Path) -> Path | None:
 
 
 def _inspect_autoform_paths(root: Path) -> tuple[str, ...]:
+    # The os.path predicates read a path they cannot stat as absent, as
+    # _exists_exactly reads an unlistable directory. Before Python 3.14,
+    # Path.is_file and Path.is_dir raise PermissionError for an entry under
+    # a listable but unsearchable directory.
     return tuple(
         path for path, kind in _AUTOFORM_PATHS.items() if _exists_exactly(root, path) and kind(root / path)
     )

@@ -1203,6 +1203,22 @@ def test_autoform_paths_need_their_exact_spelling(tmp_path: Path) -> None:
     assert inspect_project(root).autoform_paths == ("mkdocs.yml",)
 
 
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="needs POSIX permissions that apply")
+def test_unsearchable_autoform_directory_reads_as_absent(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    workflows = root / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "autoform-verify.yml").write_text("", encoding="utf-8")
+    workflows.chmod(0o644)  # listable, but its entries cannot be stat'ed
+    try:
+        result = inspect_project(root)
+    finally:
+        workflows.chmod(0o755)
+
+    assert result.autoform_paths == ()
+    assert result.compatibility.status == "supported"
+
+
 def test_bundled_catalog_lists_the_recommended_release() -> None:
     catalog = load_release_catalog()
 
