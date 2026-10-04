@@ -831,7 +831,7 @@ def test_portable_capture_rejects_a_restored_nested_directory_redirection(
     (nested / "Local.lean").write_text("def local : Nat := 0\n", encoding="utf-8")
     outside = tmp_path / "outside"
     outside.mkdir()
-    (outside / "Escaped.lean").write_text("def escaped : Nat := 0\n", encoding="utf-8")
+    (outside / "Escaped.lean").write_bytes(b"def escaped : Nat := 0\n")
     displaced = root / "nested-displaced"
     redirected = 0
     restored = 0
