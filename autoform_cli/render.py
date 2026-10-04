@@ -1389,23 +1389,37 @@ def _anchored_links(
     page: Path,
     *,
     extension: str = ".html",
+    hrefs: dict[Path, str] | None = None,
 ) -> dict[str, str]:
     """Link every node to its statement on the published chapter page.
 
     Use ``.md`` for links MkDocs will parse -- it validates and rewrites those
     itself -- and ``.html`` for raw HTML and Mermaid, which it never sees. A
-    statement on the current page is just a fragment.
+    statement on the current page is just a fragment. Calls for the same page
+    and extension can share *hrefs*, so each target page is linked once across
+    all of them.
     """
     resolved_page = page.resolve()
+    # Many nodes share a chapter page, and resolving a path walks the disk, so
+    # each target page is linked once. The current page is cached as "" and
+    # links as a bare fragment.
+    if hrefs is None:
+        hrefs = {}
     links: dict[str, str] = {}
     for node_id, (target, anchor) in targets.items():
-        if target.resolve() == resolved_page:
-            links[node_id] = f"#{anchor}" if anchor else "#"
-        else:
-            href = mermaid.relative_link(target, page, extension)
-            if extension == ".html":
-                href = _as_published(href)
+        href = hrefs.get(target)
+        if href is None:
+            if target.resolve() == resolved_page:
+                href = ""
+            else:
+                href = mermaid.relative_link(target, page, extension)
+                if extension == ".html":
+                    href = _as_published(href)
+            hrefs[target] = href
+        if href:
             links[node_id] = f"{href}#{anchor}" if anchor else href
+        else:
+            links[node_id] = f"#{anchor}" if anchor else "#"
     return links
 
 
@@ -1440,7 +1454,10 @@ def _rewrite_links(
     have to be recomputed from there. And source notes are not published at
     all when *sources_base* says where to reach them in the repository.
     """
-    anchored = _anchored_links(targets, page, extension=".md")
+    # Most pages name a few nodes, so each node link is built where it is used.
+    # A coverage page can name most of the graph, so one cache serves the whole
+    # text and each target page it reaches is linked once.
+    page_hrefs: dict[Path, str] = {}
 
     def moved_target(raw: str) -> str | None:
         """Where *raw* should point once published, or None to leave it alone."""
@@ -1451,7 +1468,7 @@ def _rewrite_links(
         candidate = (source_dir / unquote(path)).resolve()
         node_id = node_sources.get(candidate)
         if node_id is not None:
-            href = anchored[node_id]
+            href = _anchored_links({node_id: targets[node_id]}, page, extension=".md", hrefs=page_hrefs)[node_id]
             if not targets[node_id][1] and separator:
                 href = f"{'' if href == '#' else href}#{fragment}"
             return href
