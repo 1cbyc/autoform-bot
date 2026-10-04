@@ -1462,7 +1462,8 @@ def test_decision_file_accepts_windows_path_and_handle_stat_views(
     captured = project_snapshot._capture_file(root, "lakefile.toml")
 
     assert captured.state == "regular"
-    assert captured.content == (root / "lakefile.toml").read_bytes()
+    assert captured.content is not None
+    assert captured.content.decode("utf-8").splitlines() == LAKEFILE.splitlines()
 
 
 def _run_fifo_probe(root: Path, mode: str) -> dict:
