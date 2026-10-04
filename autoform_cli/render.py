@@ -88,7 +88,16 @@ DECLARATION_LABELS = {
 
 STYLESHEET = "stylesheets/blueprint.css"
 MERMAID_SCRIPT = "javascripts/blueprint-mermaid.js"
+LIVE_SCRIPT = "javascripts/blueprint-live.js"
 LOGO = "assets/autoform.svg"
+_ASSET_DIR = Path(__file__).resolve().parent / "assets"
+
+
+def _static_asset(name: str) -> str:
+    try:
+        return (_ASSET_DIR / name).read_text(encoding="utf-8")
+    except OSError as error:
+        raise PublicationError([f"packaged render asset is unavailable: {name}"]) from error
 
 
 def _logo() -> str:
@@ -434,6 +443,7 @@ def render_site(
     for relative, contents in (
         (STYLESHEET, _stylesheet()),
         (MERMAID_SCRIPT, _mermaid_script()),
+        (LIVE_SCRIPT, _static_asset("blueprint-live.js")),
         (LOGO, _logo()),
     ):
         asset = destination / relative
@@ -581,6 +591,12 @@ def _source_revision(blueprint: Path) -> str:
     return digest.hexdigest()
 
 
+def publication_source_revision(blueprint_dir: str | Path) -> str:
+    """Return the deterministic source hash stored in ``publication.json``."""
+
+    return _source_revision(Path(blueprint_dir).expanduser().resolve())
+
+
 def _write_publication_manifest(
     destination: Path,
     blueprint: Path,
@@ -601,7 +617,7 @@ def _write_publication_manifest(
         },
         "schema": "autoform-publication/v1",
         "source": "blueprint/roadmap Markdown",
-        "source_revision": _source_revision(blueprint),
+        "source_revision": publication_source_revision(blueprint),
         "git_ref": linker.ref,
         "nodes": len(graph.nodes),
         "dependencies": graph.edge_count,
@@ -865,7 +881,7 @@ def _next_target(
             else ""
         )
         return (
-            '<div class="bp-next-target">'
+            f'<div class="bp-next-target" data-autoform-node-id="{html.escape(node.id, quote=True)}">'
             '<div class="bp-next-kicker">Next up</div>'
             f'<div class="bp-next-title">{heading}</div>'
             f'<div class="bp-next-why">{why}</div>'
@@ -919,9 +935,21 @@ def _render_structure_page(
             if parent != Path("."):
                 directories.add(parent)
 
-    def row(indent: int, label: str, kind: str, mark: str, extra: str = "") -> str:
+    def row(
+        indent: int,
+        label: str,
+        kind: str,
+        mark: str,
+        extra: str = "",
+        node_id: str | None = None,
+    ) -> str:
+        identity = (
+            f' data-autoform-node-id="{html.escape(node_id, quote=True)}"'
+            if node_id is not None
+            else ""
+        )
         return (
-            f'<span class="bp-tree-path{extra}" '
+            f'<span class="bp-tree-path{extra}"{identity} '
             f'style="padding-left: {indent * 1.1:.1f}rem">{label}</span>'
             f'<span class="bp-tree-kind">{kind}</span>'
             f'<span class="bp-tree-mark">{mark}</span>'
@@ -952,6 +980,7 @@ def _render_structure_page(
                 html.escape(node.declaration or node.kind),
                 f'<span class="bp-swatch bp-swatch-{state.key}"></span>'
                 f'<span class="bp-tree-state">{html.escape(state.label)}</span>',
+                node_id=node.id,
             )
         )
 
@@ -1363,23 +1392,37 @@ def _anchored_links(
     page: Path,
     *,
     extension: str = ".html",
+    hrefs: dict[Path, str] | None = None,
 ) -> dict[str, str]:
     """Link every node to its statement on the published chapter page.
 
     Use ``.md`` for links MkDocs will parse -- it validates and rewrites those
     itself -- and ``.html`` for raw HTML and Mermaid, which it never sees. A
-    statement on the current page is just a fragment.
+    statement on the current page is just a fragment. Calls for the same page
+    and extension can share *hrefs*, so each target page is linked once across
+    all of them.
     """
     resolved_page = page.resolve()
+    # Many nodes share a chapter page, and resolving a path walks the disk, so
+    # each target page is linked once. The current page is cached as "" and
+    # links as a bare fragment.
+    if hrefs is None:
+        hrefs = {}
     links: dict[str, str] = {}
     for node_id, (target, anchor) in targets.items():
-        if target.resolve() == resolved_page:
-            links[node_id] = f"#{anchor}" if anchor else "#"
-        else:
-            href = mermaid.relative_link(target, page, extension)
-            if extension == ".html":
-                href = _as_published(href)
+        href = hrefs.get(target)
+        if href is None:
+            if target.resolve() == resolved_page:
+                href = ""
+            else:
+                href = mermaid.relative_link(target, page, extension)
+                if extension == ".html":
+                    href = _as_published(href)
+            hrefs[target] = href
+        if href:
             links[node_id] = f"{href}#{anchor}" if anchor else href
+        else:
+            links[node_id] = f"#{anchor}" if anchor else "#"
     return links
 
 
@@ -1414,7 +1457,10 @@ def _rewrite_links(
     have to be recomputed from there. And source notes are not published at
     all when *sources_base* says where to reach them in the repository.
     """
-    anchored = _anchored_links(targets, page, extension=".md")
+    # Most pages name a few nodes, so each node link is built where it is used.
+    # A coverage page can name most of the graph, so one cache serves the whole
+    # text and each target page it reaches is linked once.
+    page_hrefs: dict[Path, str] = {}
 
     def moved_target(raw: str) -> str | None:
         """Where *raw* should point once published, or None to leave it alone."""
@@ -1425,7 +1471,7 @@ def _rewrite_links(
         candidate = (source_dir / unquote(path)).resolve()
         node_id = node_sources.get(candidate)
         if node_id is not None:
-            href = anchored[node_id]
+            href = _anchored_links({node_id: targets[node_id]}, page, extension=".md", hrefs=page_hrefs)[node_id]
             if not targets[node_id][1] and separator:
                 href = f"{'' if href == '#' else href}#{fragment}"
             return href
@@ -1677,7 +1723,9 @@ def _render_environment(
     mark = "✓" if node_status.key in {"fully_proved", "mathlib"} else "●"
 
     lines = [
-        f'<div class="bp-thmwrapper {style} bp-{node_status.key}" id="{html.escape(anchor, quote=True)}" markdown="1">',
+        f'<div class="bp-thmwrapper {style} bp-{node_status.key}" '
+        f'id="{html.escape(anchor, quote=True)}" '
+        f'data-autoform-node-id="{html.escape(node.id, quote=True)}" markdown="1">',
         '<div class="bp-thmheading">',
         f'<span class="bp-thmcaption">{html.escape(caption)}</span>'
         f'<span class="bp-thmlabel">{html.escape(number)}</span>'
@@ -2300,6 +2348,28 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 }}
 .bp-next-actions {{ font-family: {sans}; font-size: 0.85rem; margin-top: 0.5rem; }}
 
+.bp-live-claimed {{ outline: 2px solid #2D88FF; outline-offset: 2px; }}
+.bp-live-badge {{
+  margin-left: 0.55rem;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid #2D88FF;
+  border-radius: 999px;
+  color: #2D88FF;
+  font-family: {sans};
+  font-size: 0.68rem;
+  font-weight: 700;
+}}
+.bp-live-activity {{
+  margin: 1rem 0 1.5rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--bp-rule);
+  border-radius: 0.6rem;
+  background: var(--bp-surface);
+}}
+.bp-live-activity-title {{ font-weight: 700; margin-bottom: 0.35rem; }}
+.bp-live-row, .bp-live-empty, .bp-live-error {{ font-size: 0.85rem; color: var(--bp-muted); }}
+.bp-live-error {{ color: #D93025; }}
+
 /* On a graph page the legend hangs off an icon at the end of the lead. It
    opens on hover and on focus, so the button is reachable by keyboard; there
    is no script behind it. */
@@ -2550,6 +2620,7 @@ a:hover, a:visited:hover {{ color: var(--bp-link-hover); text-decoration: underl
 
 __all__ = [
     "DECLARATION_LABELS",
+    "LIVE_SCRIPT",
     "LOGO",
     "MERMAID_SCRIPT",
     "PUBLICATION_MANIFEST",
@@ -2557,4 +2628,5 @@ __all__ = [
     "STYLESHEET",
     "RenderReport",
     "render_site",
+    "publication_source_revision",
 ]
