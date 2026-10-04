@@ -207,6 +207,17 @@ def _inspect_snapshot(
         if (incomplete := _unrecorded_requirements(requirements, recorded)) is not None:
             diagnostics.append(ProjectDiagnostic("error", "lake-manifest-incomplete", incomplete, _MANIFEST))
     mathlib = locked if manifest_valid and overrides_valid else None
+    # Lake validates direct requirements against the root manifest before it
+    # loads workspace overrides, so an override does not suppress this warning.
+    if locked is not None and requirement is not None and _is_stale(requirement, locked):
+        diagnostics.append(
+            ProjectDiagnostic(
+                "warning",
+                "lake-manifest-stale",
+                "lakefile.toml requests a different Mathlib than the manifest locks; Lake builds the locked one.",
+                _MANIFEST,
+            )
+        )
     if override is not None:  # Lake applies overrides to a manifest's packages
         diagnostics.append(
             ProjectDiagnostic(
@@ -217,15 +228,6 @@ def _inspect_snapshot(
             )
         )
         mathlib = override
-    elif overrides_valid and locked is not None and requirement is not None and _is_stale(requirement, locked):
-        diagnostics.append(
-            ProjectDiagnostic(
-                "warning",
-                "lake-manifest-stale",
-                "lakefile.toml requests a different Mathlib than the manifest locks; Lake builds the locked one.",
-                _MANIFEST,
-            )
-        )
     if lake is not None and lake.config == "lakefile.lean":
         mathlib = None
     elif mathlib is not None and requirements is not None and (unused := _unused_mathlib(requirements)):

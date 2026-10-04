@@ -86,7 +86,7 @@ class MathlibLock:
 
         return (
             self.type == "git"
-            and self.sub_dir in (None, "", ".")
+            and self.sub_dir in (None, "", ".", "./")
             # Extensionless `lakefile` is Lake's default and resolves by
             # preferring lakefile.lean before lakefile.toml.
             and self.config_file in ("lakefile", "lakefile.lean")
@@ -375,10 +375,12 @@ def _is_stale(requirement: dict, locked: MathlibLock) -> bool:
     """Whether lakefile.toml asks for a different Mathlib source than the lock records."""
 
     kind, git, revision = _requirement_source(requirement)
-    if kind is not None and (kind == "path") != (locked.type == "path"):
+    if kind is None:
+        return False
+    if (kind == "path") != (locked.type == "path"):
         return True
     return locked.type == "git" and (
-        (revision is not None and revision != locked.input_rev)
+        revision != locked.input_rev
         or (git is not None and canonical_git_url(_redact(git)) != canonical_git_url(locked.url))
     )
 

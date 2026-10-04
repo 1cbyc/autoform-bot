@@ -95,6 +95,26 @@ def test_catalog_pair_from_lakes_math_template_is_supported(tmp_path: Path) -> N
     assert result.diagnostics == ()
 
 
+@pytest.mark.parametrize(
+    "toolchain",
+    ["v4.32.2\n", "4.32.2\n", "leanprover/lean4:4.32.2\n"],
+)
+def test_elan_release_aliases_match_the_catalog(tmp_path: Path, toolchain: str) -> None:
+    result = inspect_project(_project(tmp_path, toolchain=toolchain))
+
+    assert result.compatibility.status == "supported"
+    assert result.compatibility.release == "lean-v4.32.2-mathlib-v4.32.2"
+
+
+def test_git_url_scheme_and_host_case_do_not_change_the_repository(tmp_path: Path) -> None:
+    result = inspect_project(
+        _project(tmp_path, manifest=(_mathlib(url="HTTPS://GITHUB.COM/leanprover-community/mathlib4"),))
+    )
+
+    assert result.compatibility.status == "supported"
+    assert result.compatibility.release == "lean-v4.32.2-mathlib-v4.32.2"
+
+
 def test_json_report_has_a_stable_shape(tmp_path: Path) -> None:
     payload = json.loads(inspect_project(_project(tmp_path)).to_json())
 
@@ -143,14 +163,18 @@ def test_other_toolchain_is_unlisted(tmp_path: Path) -> None:
 def test_manifest_lock_decides_when_the_lakefile_moved_ahead(tmp_path: Path) -> None:
     # The lakefile asks for v4.32.2 but the manifest still locks v4.31.0; Lake builds the lock.
     old = _mathlib(rev=OTHER_COMMIT, input_rev="v4.31.0")
-    result = inspect_project(_project(tmp_path, manifest=(old,)))
+    lakefile = LAKEFILE.replace('scope = "leanprover-community"', f'git = "{MATHLIB_URL}"')
+    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(old,)))
 
     assert result.compatibility.status == "unlisted"
     assert "lake-manifest-stale" in _codes(result)
 
 
 def test_stale_requirement_still_reports_the_locked_catalog_pair(tmp_path: Path) -> None:
-    lakefile = LAKEFILE.replace('rev = "v4.32.2"', 'rev = "v4.31.0"')
+    lakefile = LAKEFILE.replace(
+        'scope = "leanprover-community"\nrev = "v4.32.2"',
+        f'git = "{MATHLIB_URL}"\nrev = "v4.31.0"',
+    )
     result = inspect_project(_project(tmp_path, lakefile=lakefile))
 
     assert result.compatibility.status == "supported"
@@ -162,6 +186,24 @@ def test_requirement_git_url_is_compared_with_the_lock(tmp_path: Path) -> None:
     result = inspect_project(_project(tmp_path, lakefile=lakefile))
 
     assert "lake-manifest-stale" in _codes(result)
+
+
+def test_explicit_git_requirement_without_a_revision_is_compared_with_the_lock(tmp_path: Path) -> None:
+    lakefile = LAKEFILE.replace(
+        'scope = "leanprover-community"\nrev = "v4.32.2"',
+        f'git = "{MATHLIB_URL}"',
+    )
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert "lake-manifest-stale" in _codes(result)
+
+
+def test_source_less_requirement_is_not_compared_with_the_lock(tmp_path: Path) -> None:
+    lakefile = 'name = "Example"\n\n[[require]]\nname = "mathlib"\nrev = "v4.31.0"\n'
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert result.compatibility.status == "supported"
+    assert "lake-manifest-stale" not in _codes(result)
 
 
 def test_last_duplicate_manifest_entry_wins(tmp_path: Path) -> None:
@@ -371,6 +413,13 @@ def test_lakes_default_extensionless_config_resolves_to_mathlibs_lakefile_lean(
     assert result.ok
     assert result.mathlib.config_file == "lakefile"
     assert result.compatibility.status == "supported"
+
+
+def test_lakes_explicit_current_directory_subdir_is_the_repository_root(tmp_path: Path) -> None:
+    result = inspect_project(_project(tmp_path, manifest=(_mathlib(subDir="./"),)))
+
+    assert result.compatibility.status == "supported"
+    assert result.compatibility.release == "lean-v4.32.2-mathlib-v4.32.2"
 
 
 def test_uppercase_commit_is_the_same_commit(tmp_path: Path) -> None:
@@ -626,6 +675,18 @@ def test_package_override_replaces_the_locked_mathlib(tmp_path: Path) -> None:
     assert result.mathlib.source == ".lake/package-overrides.json"
     assert result.compatibility.status == "indeterminate"
     assert "mathlib-overridden" in _codes(result)
+
+
+def test_override_does_not_suppress_root_manifest_freshness_warning(tmp_path: Path) -> None:
+    old = _mathlib(rev=OTHER_COMMIT, input_rev="v4.31.0")
+    lakefile = LAKEFILE.replace('scope = "leanprover-community"', f'git = "{MATHLIB_URL}"')
+    root = _project(tmp_path, lakefile=lakefile, manifest=(old,))
+    _write_overrides(root, _mathlib())
+
+    result = inspect_project(root)
+
+    assert result.compatibility.status == "supported"
+    assert {"lake-manifest-stale", "mathlib-overridden"} <= _codes(result)
 
 
 def test_override_needs_a_manifest_to_replace(tmp_path: Path) -> None:
@@ -1188,9 +1249,10 @@ def test_fifo_configuration_is_never_opened(tmp_path: Path) -> None:
     root = _project(tmp_path, lakefile=None)
     os.mkfifo(root / "lakefile.toml")
 
-    result = inspect_project(root)  # would block forever if opened
+    probe = _run_fifo_probe(root, "inspect")
+    result = probe["result"]
 
-    assert "unreadable-file" in _codes(result)
+    assert "unreadable-file" in {item["code"] for item in result["diagnostics"]}
 
 
 def test_decision_files_are_retried_as_one_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1363,29 +1425,32 @@ def test_autoform_paths_are_revalidated_with_the_snapshot(tmp_path: Path, monkey
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"), reason="needs POSIX FIFOs")
 def test_file_replaced_by_fifo_between_stat_and_open_never_blocks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     root = _project(tmp_path)
-    lakefile = root / "lakefile.toml"
-    original_open = project_snapshot.os.open
-    switched = False
+    probe = _run_fifo_probe(root, "swap")
+    result = probe["result"]
 
-    def racing_open(path, flags, *args, **kwargs):
-        nonlocal switched
-        if (Path(path) == lakefile or str(path) == "lakefile.toml") and not switched:
-            switched = True
-            lakefile.unlink()
-            os.mkfifo(lakefile)
-        return original_open(path, flags, *args, **kwargs)
+    assert probe["switched"]
+    assert not result["ok"]
+    assert result["compatibility"]["status"] == "indeterminate"
+    assert "unreadable-file" in {item["code"] for item in result["diagnostics"]}
 
-    monkeypatch.setattr(project_snapshot.os, "open", racing_open)
 
-    result = inspect_project(root)
-
-    assert switched
-    assert not result.ok
-    assert result.compatibility.status == "indeterminate"
-    assert "unreadable-file" in _codes(result)
+def _run_fifo_probe(root: Path, mode: str) -> dict:
+    fixture = Path(__file__).parent / "fixtures/project_inspect_fifo_probe.py"
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(fixture), mode, str(root)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        pytest.fail(f"project inspection blocked on the {mode} FIFO probe: {error}")
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
 
 
 def test_nearest_root_is_reported_relative_to_the_target(tmp_path: Path) -> None:

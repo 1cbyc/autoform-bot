@@ -36,6 +36,9 @@ precedence, as in Lake, but is never evaluated, so its projects stay
 snapshot; inspection retries or fails if their bytes, identities, presence, or
 case aliases change. As in elan, only the trimmed first line of
 `lean-toolchain` counts.
+Catalog matching treats elan's stable Lean release aliases, URI scheme and host
+case, and Mathlib's explicit `./` root subdirectory as equivalent while
+preserving the authored values in the report.
 
 This predicts an ordinary Lake invocation. CLI `--packages` / `--file`
 overrides, `LAKE_PKG_URL_MAP`, and edits inside an already-materialized checkout
