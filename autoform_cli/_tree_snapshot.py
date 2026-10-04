@@ -1469,17 +1469,33 @@ def _verify_snapshot(
     visited_directories: set[str] = set()
     visited_entries: set[str] = set()
 
+    def marker_names(descriptor: int, expected_name: str) -> list[str]:
+        folded = _normalized_name(expected_name)
+        if _DESCRIPTOR_SCANDIR_SUPPORTED:
+            matches: list[str] = []
+            with os.scandir(descriptor) as iterator:
+                for entry in iterator:
+                    if _valid_name(entry.name) and _normalized_name(entry.name) == folded:
+                        matches.append(entry.name)
+                        if len(matches) > 1:
+                            break
+            return matches
+        if _requires_bounded_enumeration(limits):
+            raise TreeSnapshotError(
+                "bounded directory enumeration is unavailable on this platform"
+            )
+        return [
+            name
+            for name in os.listdir(descriptor)
+            if _valid_name(name) and _normalized_name(name) == folded
+        ]
+
     def verify_marker(
         descriptor: int,
         relative: str,
         marker: _OpaqueMarkerRecord,
     ) -> None:
-        matches = [
-            name
-            for name in os.listdir(descriptor)
-            if _valid_name(name)
-            and _normalized_name(name) == _normalized_name(marker.name)
-        ]
+        matches = marker_names(descriptor, marker.name)
         if len(matches) != 1:
             raise _TreeChanged
         metadata = os.stat(matches[0], dir_fd=descriptor, follow_symlinks=False)
