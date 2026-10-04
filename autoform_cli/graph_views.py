@@ -571,10 +571,12 @@ def _enclosing_scopes(graph: Graph, node_id: str) -> dict[str, str]:
     """Map every container enclosing *node_id* to its child on the way down."""
     scopes: dict[str, str] = {}
     current = node_id
-    while current in graph.nodes and graph.nodes[current].parent is not None:
+    while current in graph.nodes:
         parent = graph.nodes[current].parent
-        scopes[parent] = current  # type: ignore[index]
-        current = parent  # type: ignore[assignment]
+        if parent is None:
+            break
+        scopes[parent] = current
+        current = parent
     return scopes
 
 

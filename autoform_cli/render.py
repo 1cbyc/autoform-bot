@@ -395,6 +395,7 @@ def render_site(
             repo_root=repo_root,
             destination=destination,
             node_sources=node_sources,
+            containers=containers,
             sources_base=sources_base,
         )
         page.write_text(chapter, encoding="utf-8")
@@ -1299,10 +1300,10 @@ def _render_overview_summary(
     graph: Graph,
     statuses: dict[str, status.NodeStatus],
     *,
+    containers: frozenset[str],
     node_ids: list[str] | None = None,
 ) -> str:
     """Render the compact, honest progress strip shown at the start of the book."""
-    containers = _containers(graph)
     selected_ids = [
         node_id
         for node_id in (node_ids if node_ids is not None else graph.nodes)
@@ -1576,6 +1577,7 @@ def _render_chapter(
     repo_root: Path,
     destination: Path,
     node_sources: dict[Path, str],
+    containers: frozenset[str],
     sources_base: "_SourceBase | None" = None,
 ) -> tuple[str, int, list[str]]:
     """Render one narrative article with statements at its authored link slots."""
@@ -1608,6 +1610,7 @@ def _render_chapter(
     chapter_summary = _render_overview_summary(
         graph,
         statuses,
+        containers=containers,
         node_ids=node_ids,
     )
     if narrative is None:

@@ -16,7 +16,7 @@ from autoform_cli.graph import (
     _find_rollup_cycles,
     load_graph,
 )
-from autoform_cli import graph_pages, graph_views
+from autoform_cli import graph_pages, graph_views, render
 from autoform_cli.audit import audit_graph
 from autoform_cli.graph_views import chapter_view, group_nodes, project_view, scope_view
 from autoform_cli.render import _book_page_order, render_site
@@ -447,6 +447,36 @@ def test_bulk_scope_views_equal_the_single_scope_view_of_every_container(
         assert views[scope] == scope_view(graph, statuses, scope, include_external=include_external)
 
 
+def test_bulk_scope_views_equal_single_scope_views_on_irregular_forests(tmp_path: Path) -> None:
+    roadmap = tmp_path / "blueprint" / "roadmap"
+    randomizer = random.Random(60)
+    for _ in range(40):
+        # Several roots, leaves beside containers, and edges that end on containers.
+        ids = [f"n{index:02d}" for index in range(randomizer.randint(2, 24))]
+        nodes: dict[str, Node] = {}
+        for index, node_id in enumerate(ids):
+            parent = randomizer.choice([None, *ids[:index]]) if index else None
+            earlier = randomizer.sample(ids[:index], min(index, randomizer.randint(0, 3)))
+            nodes[node_id] = Node(
+                node_id,
+                node_id,
+                roadmap / f"{node_id}.md",
+                tuple(earlier),
+                statement_dependencies=tuple(earlier[:1]),
+                proof_dependencies=tuple(earlier),
+                parent=parent,
+            )
+        graph = Graph(tmp_path / "blueprint", nodes)
+        statuses = derive(graph)
+
+        for include_external in (True, False):
+            views = graph_views.scope_views(graph, statuses, include_external=include_external)
+
+            assert list(views) == [node_id for node_id in ids if graph.children(node_id)]
+            for scope, view in views.items():
+                assert view == scope_view(graph, statuses, scope, include_external=include_external)
+
+
 def test_bulk_scope_views_reject_hand_built_containment_cycles(tmp_path: Path) -> None:
     roadmap = tmp_path / "blueprint" / "roadmap"
     graph = Graph(
@@ -516,26 +546,30 @@ def test_graph_page_publication_builds_whole_graph_indexes_a_fixed_number_of_tim
     assert max(small.values()) <= 4
 
 
-def _written_blueprint(tmp_path: Path) -> Path:
+def _written_blueprint(tmp_path: Path, sections: int = 1) -> Path:
     blueprint = tmp_path / "blueprint"
-    section = blueprint / "roadmap" / "chapter" / "section"
-    section.mkdir(parents=True)
+    chapter = blueprint / "roadmap" / "chapter"
+    names = [f"section{index}" for index in range(sections)]
+    for name in names:
+        (chapter / name).mkdir(parents=True)
     (blueprint / "README.md").write_text("# Book\n\n[Roadmap](roadmap/README.md)\n", encoding="utf-8")
     (blueprint / "roadmap" / "README.md").write_text("# Roadmap\n\n[Chapter](chapter/README.md)\n", encoding="utf-8")
-    (blueprint / "roadmap" / "chapter" / "README.md").write_text(
-        "# Chapter\n\n[Section](section/README.md)\n", encoding="utf-8"
+    (chapter / "README.md").write_text(
+        "# Chapter\n\n" + "".join(f"[{name}]({name}/README.md)\n" for name in names), encoding="utf-8"
     )
-    (section / "README.md").write_text("# Section\n\n[A](a.md)\n[B](b.md)\n", encoding="utf-8")
     (blueprint / "coverage").mkdir()
     (blueprint / "coverage" / "README.md").write_text(
         "# Coverage\n\n| Area | Coverage | Evidence |\n| --- | --- | --- |\n"
         "| Project scope | MAPPED | Source audit pending |\n",
         encoding="utf-8",
     )
-    (section / "a.md").write_text("---\ndeclaration: theorem\n---\n# A\n\nStatement.\n", encoding="utf-8")
-    (section / "b.md").write_text(
-        "---\ndeclaration: theorem\n---\n# B\n\nUses [A](a.md).\n", encoding="utf-8"
-    )
+    for name in names:
+        section = chapter / name
+        (section / "README.md").write_text(f"# {name}\n\n[A](a.md)\n[B](b.md)\n", encoding="utf-8")
+        (section / "a.md").write_text("---\ndeclaration: theorem\n---\n# A\n\nStatement.\n", encoding="utf-8")
+        (section / "b.md").write_text(
+            "---\ndeclaration: theorem\n---\n# B\n\nUses [A](a.md).\n", encoding="utf-8"
+        )
     return blueprint
 
 
@@ -555,7 +589,30 @@ def test_site_rendering_does_not_scan_for_children_per_node(
 
     render_site(blueprint, tmp_path / "site")
 
-    assert (tmp_path / "site" / "dependencies" / "scopes" / "chapter" / "section.md").is_file()
+    assert (tmp_path / "site" / "dependencies" / "scopes" / "chapter" / "section0.md").is_file()
+
+
+def _container_index_builds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sections: int) -> int:
+    blueprint = _written_blueprint(tmp_path / str(sections), sections)
+    builds = 0
+    original = render._containers
+
+    def counted(graph: Graph) -> frozenset[str]:
+        nonlocal builds
+        builds += 1
+        return original(graph)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(render, "_containers", counted)
+        render_site(blueprint, tmp_path / str(sections) / "site")
+    return builds
+
+
+def test_site_rendering_indexes_containers_a_fixed_number_of_times(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _container_index_builds(tmp_path, monkeypatch, 6) == _container_index_builds(tmp_path, monkeypatch, 2)
 
 
 def test_audit_does_not_scan_for_children_per_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
