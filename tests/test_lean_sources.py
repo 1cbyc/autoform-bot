@@ -1754,6 +1754,41 @@ def test_empty_non_source_directory_does_not_change_lean_generation(tmp_path: Pa
     assert after.generation_revision == before.generation_revision
 
 
+def test_directory_permission_churn_does_not_create_a_stale_generation_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_directory = tmp_path / "Project"
+    _index(tmp_path, "def stableAcrossDirectoryMode : Nat := 0\n")
+    source_directory.chmod(0o755)
+    assert stat.S_IMODE(source_directory.stat().st_mode) == 0o755
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    changed = False
+
+    def change_directory_mode(event: str, relative: str) -> None:
+        nonlocal changed
+        original_checkpoint(event, relative)
+        if event == "before-final-verification" and relative == "" and not changed:
+            source_directory.chmod(0o700)
+            changed = True
+
+    monkeypatch.setattr(
+        tree_snapshot_module,
+        "_tree_snapshot_checkpoint",
+        change_directory_mode,
+    )
+    during_change = snapshot_project_sources(tmp_path)
+    monkeypatch.setattr(
+        tree_snapshot_module,
+        "_tree_snapshot_checkpoint",
+        original_checkpoint,
+    )
+    after_change = snapshot_project_sources(tmp_path)
+
+    assert changed
+    assert during_change.generation_revision == after_change.generation_revision
+
+
 def test_replaced_source_changes_only_the_generation_revision(tmp_path: Path) -> None:
     source = tmp_path / "A.lean"
     source.write_text("def canonical : Nat := 0\n", encoding="utf-8")

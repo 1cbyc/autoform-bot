@@ -617,7 +617,11 @@ class TreeSnapshot:
         digest = hashlib.sha256(self.revision.encode("ascii"))
         directory_paths = set(self.directories)
         for relative, identity in self.identities:
-            stable_identity = identity[:3] if relative in directory_paths else identity
+            stable_identity = (
+                _stable_entry_identity(identity)
+                if relative in directory_paths
+                else identity
+            )
             encoded = ",".join(str(field) for field in stable_identity).encode("ascii")
             _update_digest(digest, b"identity", relative, encoded)
         return digest.hexdigest()
