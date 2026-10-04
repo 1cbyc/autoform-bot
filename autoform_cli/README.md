@@ -131,13 +131,41 @@ autoform init . --title "Finite Flat Group Schemes" \
 Pass `--autoform-ref <sha>` to pin the generated workflows at an immutable
 commit, `--force` to overwrite, and `--json` for machine-readable output.
 
-Inspect a Lean project and list Autoform's bundled known-good release pairs:
+Create or inspect a Lean project and list Autoform's bundled known-good release pairs:
 
 ```bash
+autoform project versions
+autoform project new ./FiniteFlat \
+  --package FiniteFlat \
+  --release lean-v4.32.2-mathlib-v4.32.2
 autoform project inspect .
 autoform project inspect path/inside/project --json
 autoform project versions --json
 ```
+
+`project new` requires an absent target and an explicit release ID. It builds a
+complete Lean shell with the release's Lake-generated resolved dependency
+manifest, blueprint, and site in a private sibling directory, validates the
+staged project, then publishes the directory with an atomic no-replace rename.
+It never overwrites an existing path. Failed and concurrent creations leave no
+partial target, and exactly one concurrent creator can win.
+A private creation bundle adds generated production-module roots, so package
+names cannot shadow Mathlib libraries such as `Archive` or `Counterexamples`.
+Its release identity is cross-checked with the public catalog and its complete
+Lake manifest before any filesystem state is created.
+Generated workflows are pinned as `init` pins them: `--autoform-ref` must be a
+full commit SHA, an explicit `--autoform-source` carries its own ref or none,
+and without flags the workflows pin the origin and HEAD commit of the Autoform
+checkout running the command, or of the marketplace checkout an installed
+plugin was copied from, read with local Git. Apart from those reads, the
+command runs no subprocesses, Lake, Lean, or network operations. Without a ref
+the local project is complete but the workflows are omitted.
+It fails closed where POSIX descriptor traversal, advisory locking, directory
+sync, or atomic no-replace rename is unavailable, including on Windows.
+Immediately before publication and after syncing it, Autoform reopens the
+requested parent without following links and rechecks its device, inode, and
+owner. A pre-publication mismatch preserves the stage; a later mismatch reports
+where publication was observed and tells the caller not to retry blindly.
 
 `project inspect` reads the nearest enclosing project's `lean-toolchain`,
 `lake-manifest.json`, and `lakefile.toml` without running Lake, Lean, Git, or

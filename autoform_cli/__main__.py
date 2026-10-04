@@ -21,7 +21,13 @@ from .doctor import diagnose_project
 from .dashboard import publication_bound_live_state, serve_dashboard
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
-from .project import ProjectCatalogError, inspect_project, load_release_catalog
+from .project import (
+    ProjectCatalogError,
+    ProjectCreateError,
+    create_project,
+    inspect_project,
+    load_release_catalog,
+)
 from .render import PublicationError, render_site
 from .runtime import RuntimeProjectionError, load_runtime_graph, resolve_runtime_paths
 from .scaffold import ScaffoldError, scaffold_project
@@ -96,8 +102,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="local port (default: choose an available port)",
     )
 
-    project = subparsers.add_parser("project", help="inspect local project configuration and releases")
+    project = subparsers.add_parser(
+        "project", help="create or inspect local projects and supported releases"
+    )
     project_subparsers = project.add_subparsers(dest="project_command", required=True)
+    project_new = project_subparsers.add_parser(
+        "new", help="atomically create a complete Lean and Autoform project"
+    )
+    project_new.add_argument(
+        "target", nargs="?", help="new project directory; it must not exist"
+    )
+    project_new.add_argument("--package", help="UpperCamelCase Lean package name")
+    project_new.add_argument("--release", help="release id from 'project versions'")
+    project_new.add_argument(
+        "--autoform-source",
+        default="",
+        help="Autoform Git source the generated workflows install from (default: this checkout's origin)",
+    )
+    project_new.add_argument(
+        "--autoform-ref",
+        default="",
+        help="full 40-character Autoform commit the workflows pin (default: this checkout's HEAD commit)",
+    )
+    project_new.add_argument("--json", action="store_true", help="write stable machine-readable output")
     project_inspect = project_subparsers.add_parser(
         "inspect", help="inspect a project without running Lake, Git, or network operations"
     )
@@ -378,7 +405,34 @@ def _dashboard(args: argparse.Namespace) -> int:
 
 def _project(args: argparse.Namespace) -> int:
     try:
+        if args.project_command == "new":
+            result = create_project(
+                args.target,
+                package=args.package,
+                release_id=args.release,
+                autoform_source=args.autoform_source,
+                autoform_ref=args.autoform_ref,
+            )
+            if args.json:
+                print(result.to_json())
+            else:
+                print(
+                    _human_text(
+                        f"Created {result.package} at {result.target} ({result.release})"
+                    )
+                )
+                if not result.workflows_pinned:
+                    print(
+                        "warning: workflows were omitted because no immutable Autoform pin was available"
+                    )
+            return 0
         catalog = load_release_catalog()
+    except ProjectCreateError as error:
+        if args.json:
+            print(error.to_json())
+        else:
+            print(f"error[{error.code}]: {error.message}", file=sys.stderr)
+        return 1
     except ProjectCatalogError as error:
         if args.json:
             print(json.dumps({"error": {"code": "project-catalog-invalid", "message": str(error)}, "ok": False}))
@@ -427,12 +481,9 @@ def _print_project_inspection(result) -> None:
 
 
 def _human_text(value: object) -> str:
-    """Escape nonprintable characters so project files cannot forge report lines."""
+    """Escape untrusted text into one printable ASCII report line."""
 
-    return "".join(
-        character if character.isprintable() else character.encode("unicode_escape").decode("ascii")
-        for character in str(value)
-    )
+    return ascii(str(value))[1:-1]
 
 
 def _claim(args: argparse.Namespace) -> int:

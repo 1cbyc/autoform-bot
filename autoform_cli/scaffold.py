@@ -41,6 +41,24 @@ _GITHUB_SCP_SOURCE = re.compile(
     r"git@github\.com:(?P<path>[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)+)"
 )
 _TEMPLATE_PLACEHOLDER = re.compile(r"\{\{(?P<name>[A-Z][A-Z0-9_]*)\}\}")
+#: Template files `autoform project new` refuses to publish a project without.
+_REQUIRED_TEMPLATE_PATHS = frozenset(
+    {
+        "README.md",
+        "blueprint/README.md",
+        "blueprint/coverage/README.md",
+        "blueprint/gitignore",
+        "blueprint/javascripts/mathjax.js",
+        "blueprint/roadmap/README.md",
+        "blueprint/sources/README.md",
+        "github/autoform_audit.py",
+        "github/workflows/autoform-verify.yml",
+        "github/workflows/blueprint-pages.yml",
+        "gitignore",
+        "mkdocs.yml",
+        "theme/main.html",
+    }
+)
 
 #: Where `claude plugin install` records the marketplace each plugin came from.
 _PLUGIN_REGISTRY = Path.home() / ".claude" / "plugins" / "known_marketplaces.json"
@@ -227,6 +245,13 @@ class ScaffoldResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _ScaffoldFile:
+    relative: str
+    content: bytes
+    mode: int
+
+
 def _destination(relative: str) -> str:
     for template_prefix, real_prefix in _DOTTED.items():
         if relative == template_prefix:
@@ -260,6 +285,81 @@ def _render(text: str, substitutions: dict[str, str]) -> str:
         lambda match: substitutions.get(match.group("name"), match.group(0)),
         text,
     )
+
+
+def _read_templates(root: Path) -> tuple[tuple[str, bytes, int], ...]:
+    """Every template file under *root* as ``(relative path, bytes, mode)``, sorted."""
+
+    templates: list[tuple[str, bytes, int]] = []
+    for template in sorted(root.rglob("*")):
+        relative_path = template.relative_to(root)
+        if (
+            not template.is_file()
+            or "__pycache__" in relative_path.parts
+            or template.suffix == ".pyc"
+        ):
+            continue
+        templates.append(
+            (relative_path.as_posix(), template.read_bytes(), stat.S_IMODE(template.stat().st_mode))
+        )
+    return tuple(templates)
+
+
+def _require_complete_templates(templates: tuple[tuple[str, bytes, int], ...]) -> None:
+    template_paths = [relative for relative, _content, _mode in templates]
+    if len(template_paths) != len(set(template_paths)) or not _REQUIRED_TEMPLATE_PATHS.issubset(
+        template_paths
+    ):
+        raise ScaffoldError(["the Autoform template tree is incomplete"])
+
+
+def _scaffold_plan(
+    templates: tuple[tuple[str, bytes, int], ...],
+    *,
+    title: str,
+    repository_url: str,
+    autoform_source: str,
+    autoform_ref: str,
+) -> tuple[tuple[_ScaffoldFile, ...], tuple[str, ...]]:
+    """Render *templates* into project files and list the workflows left out.
+
+    `autoform init` and `autoform project new` share this so both write the
+    same bytes. Without *autoform_ref* the CI workflows are omitted.
+    """
+
+    substitutions = {
+        "PROJECT_TITLE_YAML": _yaml_scalar(title),
+        "REPO_URL_YAML": _yaml_scalar(repository_url),
+        "PROJECT_TITLE": title,
+        "REPO_URL": repository_url,
+        "AUTOFORM_SOURCE": autoform_source,
+        "AUTOFORM_REF": autoform_ref,
+        "AUTOFORM_SOURCE_YAML": _yaml_scalar(autoform_source),
+        "AUTOFORM_REF_YAML": _yaml_scalar(autoform_ref),
+    }
+    files: list[_ScaffoldFile] = []
+    skipped: list[str] = []
+    for relative, template_content, template_mode in templates:
+        destination = _destination(relative)
+        if not autoform_ref and relative.startswith("github/"):
+            skipped.append(destination)
+            continue
+        if Path(relative).suffix in {".js", ".html"} or relative.endswith("gitignore"):
+            content = template_content
+        else:
+            try:
+                text = template_content.decode("utf-8")
+            except UnicodeError:
+                raise ScaffoldError(["the Autoform template tree contains invalid text"]) from None
+            content = _render(text, substitutions).encode("utf-8")
+        files.append(
+            _ScaffoldFile(
+                relative=destination,
+                content=content,
+                mode=template_mode,
+            )
+        )
+    return tuple(files), tuple(skipped)
 
 
 def _atomic_write(destination: Path, content: bytes, *, mode: int) -> None:
@@ -364,54 +464,40 @@ def scaffold_project(
     # project whose first CI step fails for a reason no file in it explains. So
     # the ref alone decides: without one the workflows are skipped and reported.
     unpinned = not ref
-    substitutions = {
-        "PROJECT_TITLE_YAML": _yaml_scalar(title.strip()),
-        "REPO_URL_YAML": _yaml_scalar(repository_url.strip()),
-        "PROJECT_TITLE": title.strip(),
-        "REPO_URL": repository_url.strip(),
-        "AUTOFORM_SOURCE": source,
-        "AUTOFORM_REF": ref,
-        "AUTOFORM_SOURCE_YAML": _yaml_scalar(source),
-        "AUTOFORM_REF_YAML": _yaml_scalar(ref),
-    }
+    templates = _read_templates(_TEMPLATES)
+    planned, omitted = _scaffold_plan(
+        templates,
+        title=title.strip(),
+        repository_url=repository_url.strip(),
+        autoform_source=source,
+        autoform_ref=ref,
+    )
 
     written: list[str] = []
-    skipped: list[str] = []
-    for template in sorted(_TEMPLATES.rglob("*")):
-        relative_path = template.relative_to(_TEMPLATES)
-        if (
-            not template.is_file()
-            or "__pycache__" in relative_path.parts
-            or template.suffix == ".pyc"
-        ):
-            continue
-        relative = relative_path.as_posix()
-        if unpinned and relative.startswith("github/"):
-            skipped.append(_destination(relative))
-            continue
-        destination = root / _destination(relative)
+    skipped = list(omitted)
+    for planned_file in planned:
+        destination = root / planned_file.relative
         # Confine every write, not just the root. Reject links outright before
         # checking whether the destination should be skipped: `exists()` is
         # false for a dangling symlink, but opening that path still follows the
         # link and can create a file outside the project.
         probe = root
-        for part in Path(_destination(relative)).parts:
+        for part in Path(planned_file.relative).parts:
             probe = probe / part
             if probe.is_symlink() or (probe.exists() and not _within(probe, root)):
                 raise ScaffoldError(
                     [f"refusing to write outside the project through a link: {probe}"]
                 )
         if destination.exists() and not force:
-            skipped.append(_destination(relative))
+            skipped.append(planned_file.relative)
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if template.suffix in {".js", ".html"} or relative.endswith("gitignore"):
-            content = template.read_bytes()
-        else:
-            rendered = _render(template.read_text(encoding="utf-8"), substitutions)
-            content = rendered.encode("utf-8")
-        _atomic_write(destination, content, mode=stat.S_IMODE(template.stat().st_mode))
-        written.append(_destination(relative))
+        _atomic_write(destination, planned_file.content, mode=planned_file.mode)
+        written.append(planned_file.relative)
+    # Report omitted workflows and files left alone in template order, as
+    # they were before the plan was shared with `project new`.
+    order = {_destination(relative): index for index, (relative, _content, _mode) in enumerate(templates)}
+    skipped.sort(key=order.__getitem__)
 
     return ScaffoldResult(title.strip(), tuple(written), tuple(skipped), unpinned)
 
