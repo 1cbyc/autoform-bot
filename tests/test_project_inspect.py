@@ -591,3 +591,7 @@ def test_human_report_escapes_characters_that_could_forge_lines(tmp_path: Path, 
 
     assert "Lake: Ex\\u202eample\\x9b\\n 0.1.0 (lakefile.toml)" in capsys.readouterr().out
     assert _human_text("\U000e0001") == "\\U000e0001"
+    # Readable names stay readable; only `project new` escapes to ASCII.
+    assert _human_text("Th\N{LATIN SMALL LETTER E WITH ACUTE}or\N{LATIN SMALL LETTER E WITH GRAVE}me") == (
+        "Th\N{LATIN SMALL LETTER E WITH ACUTE}or\N{LATIN SMALL LETTER E WITH GRAVE}me"
+    )

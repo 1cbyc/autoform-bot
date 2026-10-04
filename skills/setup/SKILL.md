@@ -27,8 +27,9 @@ mathematical planning.
 
 Read the repo-shaped [Cabannes thesis project](assets/cabannes-thesis-project/README.md)
 as a concrete setup example. Reuse its structure selectively: rename the Lean
-package, check the current matching stable Lean/Mathlib release, update branch
-and immutable workflow pins, and merge rather than overwrite. Its populated
+package, keep the recommended release from `autoform project versions` unless
+the user needs another Lean version, update branch and immutable workflow pins,
+and merge rather than overwrite. Its populated
 thesis notes illustrate later skills; Setup does not reproduce that mathematics.
 
 For a new repository, require a target directory that does not already exist,
@@ -48,14 +49,20 @@ Mathlib revision. Such a project is created without `lake-manifest.json` and
 with a warning: run `lake update` in it, which needs network access and
 downloads the Mathlib build cache, then commit the manifest it writes. Autoform
 needs Lean v4.27.0 or newer, and `project new` also warns below that.
+The target's parent must not be group- or world-writable unless it is a sticky
+directory owned by the user or root, such as `/tmp`. If `project new` reports
+`project-parent-unsafe`, choose another parent or, with the user's agreement,
+remove that write access with `chmod g-w,o-w`.
 
-`project new` writes matching `lean-toolchain` and Mathlib revisions,
-the Lean shell, and the Autoform vault without running Lake, Lean, or network
+`project new` writes the requested `lean-toolchain` and Mathlib revision (by
+default the recommended, locked catalog pair), the Lean shell, and the Autoform vault without running Lake, Lean, or network
 operations; it never overwrites an existing target. It fails closed on
 platforms without the required POSIX filesystem operations, including Windows.
 It pins generated workflows exactly as `init` does, described below, and omits
-them when there is no commit to pin. Do not invent workflow sources or
-revisions, and do not copy the populated example as a project generator.
+them when there is no commit to pin;
+`autoform init <TARGET> --autoform-ref <40-char-sha>` adds them later. Do not
+invent workflow sources or revisions, and do not copy the populated example as a
+project generator.
 
 For an incomplete existing repository, preserve its authored configuration and
 use `autoform init` only for the Autoform vault/site overlay until the dedicated
@@ -70,11 +77,11 @@ a book with no chapters. `init` never overwrites an existing file, so it is
 also the repair path; it reports what it left alone. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
-`init` pins the generated workflows to the Autoform commit that ran it, but it
-can only do that when Autoform is running from a Git checkout. Installed as a
-plugin it is a plain directory copy, so there is nothing to read and `init`
-writes no CI rather than guess a ref: guessing produced projects whose first
-push failed with nothing in the workflow to explain why. When it reports that,
+`init` pins the generated workflows to the Autoform commit that ran it: the
+origin and HEAD commit of the Autoform checkout it runs from, or of the
+marketplace checkout an installed plugin was copied from. When neither can be
+read, `init` writes no CI rather than guess a ref: guessing produced projects
+whose first push failed with nothing in the workflow to explain why. When it reports that,
 find the commit the plugin was installed from and pass
 `--autoform-ref <40-char-sha>`, or say plainly that CI was not configured.
 Never invent a ref. It must be a full 40-character commit sha: `init` refuses a

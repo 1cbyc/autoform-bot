@@ -193,6 +193,22 @@ def test_creation_with_an_explicit_pin_stays_offline(
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     monkeypatch.setattr(subprocess, "run", forbidden)
     monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    for name in (
+        "system",
+        "fork",
+        "posix_spawn",
+        "posix_spawnp",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+    ):
+        monkeypatch.setattr(os, name, forbidden, raising=False)
 
     result = create_project(
         tmp_path / "Project",
@@ -544,6 +560,7 @@ def test_unlisted_pair_is_written_without_a_lock(tmp_path: Path) -> None:
         ("v4.30.0", "bump/v4.30.0"),
         ("v4.30.0", "0123456789abcdef0123456789abcdef01234567"),
         ("v4.30.0", "a" * 255),
+        ("v4.30.0", "Feature/fix_x"),
         ("v4.32.0-rc1", "v4.32.0-rc1-patch1"),
     ],
 )
@@ -703,7 +720,7 @@ def test_reserved_mathlib_roots_are_refused(tmp_path: Path, package: str, toolch
 
 def test_catalog_releases_meet_the_lean_floor() -> None:
     for release in load_release_catalog().releases:
-        version = create_module._resolve_version(None, release.lean_toolchain, release.mathlib_rev)
+        version = create_module._resolve_version(None, release.lean_toolchain, None)
         assert version.release == release
         assert create_module._version_warnings(version) == ()
 
@@ -811,7 +828,8 @@ def test_normal_macos_tmp_alias_is_supported() -> None:
     if not Path("/tmp").is_symlink():
         pytest.skip("platform has no /tmp alias")
     parent = Path("/tmp") / f"autoform-new-test-{os.getpid()}"
-    parent.mkdir()
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o755)
     target = parent / "Project"
     try:
         create_project(target, package="Project", release_id=_RELEASE)
@@ -1220,14 +1238,16 @@ def test_requested_parent_rebind_before_publish_preserves_the_stage(
 ) -> None:
     parent = tmp_path / "parent"
     moved = tmp_path / "moved-parent"
-    parent.mkdir()
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o755)
     target = parent / "Project"
     original = create_module._validate_staged_project
 
     def rebind(*args, **kwargs) -> None:
         original(*args, **kwargs)
         parent.rename(moved)
-        parent.mkdir()
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o755)
 
     monkeypatch.setattr(create_module, "_validate_staged_project", rebind)
 
@@ -1247,7 +1267,8 @@ def test_requested_parent_rebind_after_parent_sync_reports_exact_state(
 ) -> None:
     parent = tmp_path / "parent"
     moved = tmp_path / "moved-parent"
-    parent.mkdir()
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o755)
     target = parent / "Project"
     original = create_module._reopen_bound_parent
     calls = 0
@@ -1257,7 +1278,8 @@ def test_requested_parent_rebind_after_parent_sync_reports_exact_state(
         calls += 1
         if calls == 2:
             parent.rename(moved)
-            parent.mkdir()
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o755)
         return original(path, expected_identity)
 
     monkeypatch.setattr(create_module, "_reopen_bound_parent", rebind)
@@ -1611,7 +1633,8 @@ def test_cli_unlisted_human_output_warns_on_stderr(tmp_path: Path, capsys) -> No
     assert captured.out == "Created Project at Project (unlisted: leanprover/lean4:v4.30.0, Mathlib v4.30.0)\n"
     assert captured.err.startswith("warning[project-release-unlisted]: ")
     assert captured.err.endswith(
-        "warning: workflows were omitted because no immutable Autoform pin was available\n"
+        "warning: workflows were omitted because no immutable Autoform pin was available; "
+        "add them with: autoform init <target> --autoform-ref <40-char-sha>\n"
     )
 
 
@@ -1762,3 +1785,283 @@ def test_cli_threads_the_explicit_workflow_pin(tmp_path: Path, capsys) -> None:
     workflow = (target / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
     assert f'AUTOFORM_SOURCE: "{source}"' in workflow
     assert f'AUTOFORM_REF: "{revision}"' in workflow
+
+
+@pytest.mark.parametrize(
+    ("toolchain", "revision"),
+    [
+        ("v4.32.2", "master"),
+        ("v4.32.2", "0123456789abcdef0123456789abcdef01234567"),
+        ("v4.30.0", "v4.32.2"),
+        ("v4.30.0", "905b95818eb32af7874a58b427f50c1711a5e96c"),
+    ],
+)
+def test_pair_matching_the_catalog_in_one_component_stays_unlisted(
+    tmp_path: Path, toolchain: str, revision: str
+) -> None:
+    target = tmp_path / "Project"
+
+    result = create_project(
+        target, package="Project", release_id=None, lean_toolchain=toolchain, mathlib_rev=revision
+    )
+
+    assert result.release is None
+    assert [code for code, _message in result.warnings] == ["project-release-unlisted"]
+    assert not (target / "lake-manifest.json").exists()
+    assert (target / "lean-toolchain").read_text(encoding="utf-8") == f"leanprover/lean4:{toolchain}\n"
+    with (target / "lakefile.toml").open("rb") as lakefile:
+        assert tomllib.load(lakefile)["require"][0]["rev"] == revision
+
+
+@pytest.mark.parametrize(
+    ("versions", "code"),
+    [
+        ({"release_id": ""}, "project-release-unknown"),
+        ({"release_id": None, "mathlib_rev": ""}, "project-version-invalid"),
+    ],
+)
+def test_empty_version_options_are_not_defaults(
+    tmp_path: Path, versions: dict[str, str | None], code: str
+) -> None:
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(tmp_path / "Project", package="Project", **versions)
+
+    assert raised.value.code == code
+    assert not list(tmp_path.iterdir())
+
+
+def test_version_conflict_and_floor_messages_name_the_problem(tmp_path: Path) -> None:
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(tmp_path / "Project", package="Project", release_id=_RELEASE, mathlib_rev="master")
+    assert raised.value.message == "Choose a catalog release or a Lean toolchain and Mathlib revision, not both."
+
+    result = create_project(tmp_path / "Old", package="Project", release_id=None, lean_toolchain="v4.26.0")
+    message = dict(result.warnings)["project-lean-below-minimum"]
+    assert "v4.27.0" in message
+    assert "leanprover/lean4:v4.26.0" in message
+
+
+@pytest.mark.parametrize(
+    "toolchain",
+    ["v4." + "1" * 4301 + ".0", "v4.1234567890.0", "v4.30.0-rc1234567890"],
+)
+def test_oversized_version_components_are_invalid_not_a_crash(tmp_path: Path, toolchain: str) -> None:
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(
+            tmp_path / "Project",
+            package="Project",
+            release_id=None,
+            lean_toolchain=toolchain,
+            mathlib_rev="master",
+        )
+
+    assert raised.value.code == "project-version-invalid"
+    assert "Lean toolchain" in raised.value.message
+    assert not list(tmp_path.iterdir())
+
+
+def test_version_components_accept_nine_digits() -> None:
+    assert create_module._LEAN_TOOLCHAIN.fullmatch("v123456789.123456789.123456789-rc123456789")
+
+
+def test_group_writable_parent_is_refused_with_a_remedy(tmp_path: Path) -> None:
+    parent = tmp_path / "group"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o775)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(parent / "Project", package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-parent-unsafe"
+    assert "chmod g-w,o-w" in raised.value.message
+    assert not list(parent.iterdir())
+
+
+_NEEDS_PERMISSIONS = pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="permission checks do not apply"
+)
+
+
+@_NEEDS_PERMISSIONS
+def test_untraversable_ancestor_is_a_stable_error(tmp_path: Path, capsys) -> None:
+    locked = tmp_path / "locked"
+    (locked / "sub").mkdir(parents=True)
+    target = os.fspath(locked / "sub" / "Project")
+    locked.chmod(0o600)
+    try:
+        with pytest.raises(ProjectCreateError) as raised:
+            create_project(target, package="Project", release_id=_RELEASE)
+        assert raised.value.code == "project-parent-inaccessible"
+
+        assert main(["project", "new", target, "--package", "Project", "--json"]) == 1
+        assert json.loads(capsys.readouterr().out)["error"]["code"] == "project-parent-inaccessible"
+    finally:
+        locked.chmod(0o700)
+    assert not (locked / "sub" / "Project").exists()
+
+
+@_NEEDS_PERMISSIONS
+def test_unreadable_parent_is_inaccessible_not_a_symlink(tmp_path: Path) -> None:
+    parent = tmp_path / "write-only"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o300)
+    try:
+        with pytest.raises(ProjectCreateError) as raised:
+            create_project(parent / "Project", package="Project", release_id=_RELEASE)
+    finally:
+        parent.chmod(0o700)
+
+    assert raised.value.code == "project-parent-inaccessible"
+    assert not list(parent.iterdir())
+
+
+def test_overlong_parent_component_is_a_stable_error(tmp_path: Path) -> None:
+    name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+    target = tmp_path / ("p" * (name_limit + 1)) / "Project"
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-parent-invalid"
+
+
+def test_symlinked_parent_at_open_is_reported_as_a_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    target = link / "Project"
+    monkeypatch.setattr(create_module, "_validate_target", lambda _target: target)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-path-is-symlink"
+    assert not list(real.iterdir())
+
+
+def test_parent_lock_held_elsewhere_fails_as_busy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    monkeypatch.setattr(create_module, "_LOCK_WAIT_SECONDS", 0.2)
+    holder = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with pytest.raises(ProjectCreateError) as raised:
+            create_project(tmp_path / "Project", package="Project", release_id=_RELEASE)
+    finally:
+        os.close(holder)
+
+    assert raised.value.code == "project-parent-busy"
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_cli_interrupt_reports_the_possible_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, json_mode: bool
+) -> None:
+    def interrupt(*_args, **_kwargs) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(create_module, "_materialize_project", interrupt)
+    arguments = ["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project"]
+
+    assert main([*arguments, "--json"] if json_mode else arguments) == 130
+
+    captured = capsys.readouterr()
+    if json_mode:
+        assert json.loads(captured.out)["error"]["code"] == "project-create-interrupted"
+        assert captured.err == ""
+    else:
+        assert captured.out == ""
+        assert captured.err.startswith("error[project-create-interrupted]: ")
+        assert ".autoform-new-*" in captured.err
+    assert not (tmp_path / "Project").exists()
+    assert len(list(tmp_path.glob(".autoform-new-*"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (["project", "new"], "error[project-target-invalid]: A new project directory is required.\n"),
+        (
+            ["project", "new", "Project"],
+            "error[project-name-invalid]: --package is required (an UpperCamelCase Lean package name).\n",
+        ),
+    ],
+)
+def test_cli_names_missing_required_options(arguments: list[str], expected: str, capsys) -> None:
+    assert main(arguments) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == expected
+
+
+def test_cli_human_errors_go_to_stderr(tmp_path: Path, capsys) -> None:
+    arguments = ["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project"]
+
+    assert main([*arguments, "--release", _RELEASE, "--mathlib-rev", "master"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "error[project-version-invalid]: "
+        "Choose a catalog release or a Lean toolchain and Mathlib revision, not both.\n"
+    )
+
+
+def test_cli_human_output_for_a_pinned_catalog_release(tmp_path: Path, capsys) -> None:
+    arguments = ["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project"]
+
+    assert main([*arguments, "--release", _RELEASE, "--autoform-source", _SOURCE, "--autoform-ref", "5" * 40]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == f"Created Project at Project ({_RELEASE})\n"
+    assert captured.err == ""
+
+
+def test_cli_threads_the_toolchain_and_revision_together(tmp_path: Path, capsys) -> None:
+    target = tmp_path / "Project"
+    arguments = ["project", "new", os.fspath(target), "--package", "Project"]
+
+    assert main([*arguments, "--lean-toolchain", "v4.30.0", "--mathlib-rev", "master", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["lean_toolchain"] == "leanprover/lean4:v4.30.0"
+    assert payload["mathlib_rev"] == "master"
+    with (target / "lakefile.toml").open("rb") as lakefile:
+        assert tomllib.load(lakefile)["require"][0]["rev"] == "master"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="project creation is POSIX-only")
+def test_cli_warnings_follow_the_created_line_on_a_shared_pipe(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "autoform_cli",
+            "project",
+            "new",
+            os.fspath(tmp_path / "Project"),
+            "--package",
+            "Project",
+            "--lean-toolchain",
+            "v4.26.0",
+        ],
+        cwd=Path(__file__).parents[1],
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    lines = completed.stdout.splitlines()
+    assert lines[0].startswith("Created Project at Project (unlisted: ")
+    assert [line.partition("]")[0] for line in lines[1:3]] == [
+        "warning[project-lean-below-minimum",
+        "warning[project-release-unlisted",
+    ]

@@ -148,7 +148,11 @@ complete Lean shell with the release's Lake-generated resolved dependency
 manifest, blueprint, and site in a private sibling directory, validates the
 staged project, then publishes the directory with an atomic no-replace rename.
 It never overwrites an existing path. Failed and concurrent creations leave no
-partial target, and exactly one concurrent creator can win.
+partial target, and exactly one concurrent creator can win. A failure or
+interrupt after staging can leave a hidden `.autoform-new-*` directory in the
+parent, and the error says so; inspect it before removing it. The published
+tree has fixed modes, 0755 for directories and 0644 for files (0755 for
+executables), whatever the umask.
 A private creation bundle adds generated production-module roots, so package
 names cannot shadow Mathlib libraries such as `Archive` or `Counterexamples`.
 Its release identity is cross-checked with the public catalog and its complete
@@ -162,6 +166,13 @@ command runs no subprocesses, Lake, Lean, or network operations. Without a ref
 the local project is complete but the workflows are omitted.
 It fails closed where POSIX descriptor traversal, advisory locking, directory
 sync, or atomic no-replace rename is unavailable, including on Windows.
+The parent and each of its ancestors must be readable, because each is opened
+without following links (`project-parent-inaccessible` otherwise). The parent
+must not be group- or world-writable unless it is a sticky directory owned by
+you or root, such as `/tmp`; otherwise creation fails with
+`project-parent-unsafe`, which `chmod g-w,o-w` on the parent fixes. Creations in
+one parent are serialized with an advisory lock, and a lock held elsewhere for
+30 seconds fails with `project-parent-busy`.
 Immediately before publication and after syncing it, Autoform reopens the
 requested parent without following links and rechecks its device, inode, and
 owner. A pre-publication mismatch preserves the stage; a later mismatch reports
@@ -178,7 +189,8 @@ locks Mathlib, and downloads the Mathlib build cache, then commit the manifest.
 Use the toolchain that Mathlib revision declares in its own `lean-toolchain`;
 otherwise Lake may rewrite the project's toolchain, warn, or fail to build.
 Until the manifest exists, `project inspect` reports `indeterminate` with
-`missing-lake-manifest`; afterwards, `unlisted`. Autoform needs Lean v4.27.0 or
+`missing-lake-manifest`; afterwards, `unlisted`, or `supported` when Lake locks a
+catalog commit. Autoform needs Lean v4.27.0 or
 newer (the skeleton probe uses that release's `String` API and the generated
 audit reads ILean `decls`); older toolchains get a `project-lean-below-minimum`
 warning. With `--json`, such a pair reports `"release": null` and its warnings

@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import stat
+import time
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path, PurePosixPath
@@ -36,13 +37,22 @@ _RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _STAGE_ATTEMPTS = 32
 _TOOLCHAIN_MODULE_ROOTS = frozenset({"Init", "Lake", "Lean", "Std"})
 _MATHLIB_PRODUCTION_ROOTS = frozenset({"Archive", "Counterexamples", "Mathlib"})
+# Bounded components keep int() conversion and the derived default revision small.
 _LEAN_TOOLCHAIN = re.compile(
-    r"(?:leanprover/lean4:)?(?P<tag>v(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)"
-    r"\.(?P<patch>0|[1-9][0-9]*)(?:-rc[1-9][0-9]*)?)"
+    r"(?:leanprover/lean4:)?(?P<tag>v(?P<major>0|[1-9][0-9]{0,8})\.(?P<minor>0|[1-9][0-9]{0,8})"
+    r"\.(?P<patch>0|[1-9][0-9]{0,8})(?:-rc[1-9][0-9]{0,8})?)"
 )
-# Safe inside a TOML basic string, and never a Git option or revision expression.
+# Safe inside a TOML basic string, never a Git option, and free of the
+# `: ^ ~ @ { ? * [` revision operators. Ranges such as a..b and other names Git
+# refuses as refs still pass and fail at `lake update`.
 _MATHLIB_REV = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
 _MINIMUM_LEAN = (4, 27, 0)
+_LOCK_WAIT_SECONDS = 30.0
+_LOCK_POLL_SECONDS = 0.05
+_UNSAFE_PARENT_MESSAGE = (
+    "The target parent is group- or world-writable and is not a sticky directory owned by you "
+    "or root. Remove group and world write access (chmod g-w,o-w) or choose another parent."
+)
 # Mathlib library roots that no creation descriptor lists: `docs` (every tag from
 # v4.27.0, and outside the descriptor root grammar), LongestPole (v4.27.0), and
 # Wanted (v4.34.1 on).
@@ -520,8 +530,9 @@ def _version_warnings(version: _ProjectVersion) -> tuple[tuple[str, str], ...]:
         warnings.append(
             (
                 "project-release-unlisted",
-                f"{version.lean_toolchain} with Mathlib {version.mathlib_rev} is not a bundled "
-                "known-good release, so no lake-manifest.json was written. Run `lake update` in "
+                f"{version.lean_toolchain} with Mathlib {version.mathlib_rev} does not name a bundled "
+                "known-good release by its tag or full commit, so no lake-manifest.json was written. "
+                "Run `lake update` in "
                 "the project to resolve and lock Mathlib; it needs network access and also "
                 "downloads the Mathlib build cache. The project's lean-toolchain must match the "
                 "lean-toolchain of that Mathlib revision.",
@@ -603,24 +614,35 @@ def _validate_target(target: str | Path | None) -> Path:
     if raw.name in {"", ".", ".."}:
         raise ProjectCreateError("project-target-invalid", "The project target must name a new directory.")
     parent = raw.parent
-    if not parent.exists():
-        raise ProjectCreateError("project-parent-missing", "The target parent directory does not exist.")
-    if not parent.is_dir():
-        raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.")
     try:
         metadata = parent.stat()
-    except OSError:
-        raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.") from None
+    except OSError as error:
+        raise _parent_access_error(error) from None
+    except ValueError:
+        raise ProjectCreateError("project-parent-invalid", "The target parent cannot be inspected.") from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.")
     if _unsafe_parent_metadata(metadata.st_mode, metadata.st_uid):
-        raise ProjectCreateError(
-            "project-parent-unsafe",
-            "The target parent has unsafe write permissions or ownership.",
-        )
+        raise ProjectCreateError("project-parent-unsafe", _UNSAFE_PARENT_MESSAGE)
     try:
         canonical_parent = parent.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.") from None
     return canonical_parent / raw.name
+
+
+def _parent_access_error(error: OSError) -> ProjectCreateError:
+    """Classify a failure to inspect or open the target parent or an ancestor."""
+
+    if error.errno in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}:
+        return ProjectCreateError("project-parent-missing", "The target parent directory does not exist.")
+    if error.errno in {errno.EACCES, errno.EPERM}:
+        return ProjectCreateError(
+            "project-parent-inaccessible",
+            "The target parent or one of its ancestors is not accessible; project new needs read "
+            "and search permission on each of them.",
+        )
+    return ProjectCreateError("project-parent-invalid", "The target parent cannot be inspected.")
 
 
 def _unsafe_parent_metadata(mode: int, owner: int) -> bool:
@@ -660,15 +682,22 @@ def _open_parent(parent: Path) -> int:
                 descriptor = child
             metadata = os.fstat(descriptor)
             if _unsafe_parent_metadata(metadata.st_mode, metadata.st_uid):
-                raise ProjectCreateError(
-                    "project-parent-unsafe",
-                    "The target parent has unsafe write permissions or ownership.",
-                )
+                raise ProjectCreateError("project-parent-unsafe", _UNSAFE_PARENT_MESSAGE)
         except BaseException:
             os.close(descriptor)
             raise
-    except (OSError, UnicodeError):
-        raise ProjectCreateError("project-path-is-symlink", "The target path contains a symbolic link.") from None
+    except OSError as error:
+        # Depending on the platform, O_DIRECTORY|O_NOFOLLOW reports a symbolic
+        # link as ELOOP, EMLINK, or ENOTDIR (macOS).
+        if error.errno in {errno.ELOOP, errno.EMLINK, errno.ENOTDIR}:
+            raise ProjectCreateError(
+                "project-path-is-symlink", "The target path contains a symbolic link."
+            ) from None
+        if error.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
+            raise _parent_access_error(error) from None
+        raise ProjectCreateError("project-create-failed", "Project creation failed; no project was created.") from None
+    except UnicodeError:
+        raise ProjectCreateError("project-target-invalid", "The project target cannot be resolved safely.") from None
     return descriptor
 
 
@@ -726,15 +755,31 @@ def _open_planned_file(parent_descriptor: int, name: str) -> int:
 
 
 def _lock_parent(parent_descriptor: int) -> None:
+    """Serialize creation in the parent, giving up if another holder keeps the lock."""
+
+    unavailable = ProjectCreateError(
+        "project-create-safety-unavailable",
+        "This platform cannot serialize concurrent project creation safely.",
+    )
     try:
         import fcntl
-
-        fcntl.flock(parent_descriptor, fcntl.LOCK_EX)
-    except (ImportError, OSError):
-        raise ProjectCreateError(
-            "project-create-safety-unavailable",
-            "This platform cannot serialize concurrent project creation safely.",
-        ) from None
+    except ImportError:
+        raise unavailable from None
+    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(parent_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise ProjectCreateError(
+                    "project-parent-busy",
+                    f"Another process kept the target parent locked for {_LOCK_WAIT_SECONDS:g} "
+                    "seconds; retry when it finishes.",
+                ) from None
+        except OSError:
+            raise unavailable from None
+        time.sleep(_LOCK_POLL_SECONDS)
 
 
 def _list_directory(directory_descriptor: int) -> list[str]:

@@ -185,7 +185,8 @@ finally:
     assert installed.returncode == 0, installed.stderr
     command = environment / ("Scripts/autoform.exe" if sys.platform == "win32" else "bin/autoform")
     outside = tmp_path / "outside"
-    outside.mkdir()
+    outside.mkdir(mode=0o700)
+    outside.chmod(0o755)
     project = outside / "project"
     versions = subprocess.run(
         [str(command), "project", "versions", "--json"],
@@ -211,7 +212,7 @@ finally:
         capture_output=True,
         text=True,
     )
-    assert creation.returncode == 0, creation.stderr
+    assert creation.returncode == 0, creation.stdout + creation.stderr
     assert json.loads(creation.stdout)["package"] == "WheelProject"
     inspection = subprocess.run(
         [str(command), "project", "inspect", str(project), "--json"],

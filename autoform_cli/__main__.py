@@ -110,17 +110,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "new", help="atomically create a complete Lean and Autoform project"
     )
     project_new.add_argument(
-        "target", nargs="?", help="new project directory; it must not exist"
+        "target", nargs="?", help="new project directory (required); it must not exist"
     )
-    project_new.add_argument("--package", help="UpperCamelCase Lean package name")
+    project_new.add_argument("--package", help="UpperCamelCase Lean package name (required)")
     project_new.add_argument(
         "--release", help="release id from 'project versions' (default: the recommended release)"
     )
     project_new.add_argument(
         "--lean-toolchain",
         help=(
-            "Lean release tag for a version pair outside the catalog, such as v4.30.0; "
-            "no lake-manifest.json is written, so run 'lake update' in the project"
+            "Lean release tag such as v4.30.0; a pair the catalog does not list is written "
+            "without lake-manifest.json, so run 'lake update' in the project"
         ),
     )
     project_new.add_argument(
@@ -133,12 +133,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     project_new.add_argument(
         "--autoform-source",
         default="",
-        help="Autoform Git source the generated workflows install from (default: this checkout's origin)",
+        help=(
+            "Autoform Git source the generated workflows install from (default: the origin of "
+            "this checkout, or of the marketplace checkout an installed copy came from)"
+        ),
     )
     project_new.add_argument(
         "--autoform-ref",
         default="",
-        help="full 40-character Autoform commit the workflows pin (default: this checkout's HEAD commit)",
+        help=(
+            "full 40-character Autoform commit the workflows pin (default: the HEAD commit of "
+            "that checkout; none when --autoform-source is given)"
+        ),
     )
     project_new.add_argument("--json", action="store_true", help="write stable machine-readable output")
     project_inspect = project_subparsers.add_parser(
@@ -422,27 +428,48 @@ def _dashboard(args: argparse.Namespace) -> int:
 def _project(args: argparse.Namespace) -> int:
     try:
         if args.project_command == "new":
-            result = create_project(
-                args.target,
-                package=args.package,
-                release_id=args.release,
-                lean_toolchain=args.lean_toolchain,
-                mathlib_rev=args.mathlib_rev,
-                autoform_source=args.autoform_source,
-                autoform_ref=args.autoform_ref,
-            )
+            if args.target is None:
+                raise ProjectCreateError("project-target-invalid", "A new project directory is required.")
+            if args.package is None:
+                raise ProjectCreateError(
+                    "project-name-invalid", "--package is required (an UpperCamelCase Lean package name)."
+                )
+            try:
+                result = create_project(
+                    args.target,
+                    package=args.package,
+                    release_id=args.release,
+                    lean_toolchain=args.lean_toolchain,
+                    mathlib_rev=args.mathlib_rev,
+                    autoform_source=args.autoform_source,
+                    autoform_ref=args.autoform_ref,
+                )
+            except KeyboardInterrupt:
+                # create_project reports an interrupt once publication has begun
+                # as project-create-commit-uncertain, so this one published nothing.
+                error = ProjectCreateError(
+                    "project-create-interrupted",
+                    "Project creation was interrupted and no project was published. A hidden "
+                    ".autoform-new-* stage may remain in the target parent; inspect it before removal.",
+                )
+                if args.json:
+                    print(error.to_json())
+                else:
+                    print(f"error[{error.code}]: {error.message}", file=sys.stderr)
+                return 130
             if args.json:
                 print(result.to_json())
             else:
                 label = result.release or f"unlisted: {result.lean_toolchain}, Mathlib {result.mathlib_rev}"
-                print(_human_text(f"Created {result.package} at {result.target} ({label})"))
+                print(_ascii_text(f"Created {result.package} at {result.target} ({label})"))
                 # Flush first so the warnings never appear ahead of the line they qualify.
                 sys.stdout.flush()
                 for code, message in result.warnings:
-                    print(_human_text(f"warning[{code}]: {message}"), file=sys.stderr)
+                    print(_ascii_text(f"warning[{code}]: {message}"), file=sys.stderr)
                 if not result.workflows_pinned:
                     print(
-                        "warning: workflows were omitted because no immutable Autoform pin was available",
+                        "warning: workflows were omitted because no immutable Autoform pin was "
+                        "available; add them with: autoform init <target> --autoform-ref <40-char-sha>",
                         file=sys.stderr,
                     )
             return 0
@@ -501,7 +528,20 @@ def _print_project_inspection(result) -> None:
 
 
 def _human_text(value: object) -> str:
-    """Escape untrusted text into one printable ASCII report line."""
+    """Escape nonprintable characters so project files cannot forge report lines."""
+
+    return "".join(
+        character if character.isprintable() else character.encode("unicode_escape").decode("ascii")
+        for character in str(value)
+    )
+
+
+def _ascii_text(value: object) -> str:
+    """Escape untrusted text into one unambiguous printable ASCII line.
+
+    `project new` reports after publishing, when a non-UTF-8 stream must not
+    turn success into a traceback.
+    """
 
     return ascii(str(value))[1:-1]
 
