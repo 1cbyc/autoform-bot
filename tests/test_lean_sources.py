@@ -1586,6 +1586,61 @@ def test_snapshot_materialization_closes_descriptors_after_failure(
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("attack", ["replace", "overwrite", "inject"])
+def test_snapshot_materialization_rejects_final_tree_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    snapshot = TreeSnapshot(
+        root_identity=(1, 1),
+        directories=("",),
+        files=(("first.txt", b"first\n"), ("second.txt", b"second\n")),
+        symlinks=(),
+        special=(),
+        placeholders=(),
+        omitted=(),
+        identities=(),
+    )
+    destination = tmp_path / "destination"
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    attacked = False
+
+    def tamper_before_second_file(event: str, relative: str) -> None:
+        nonlocal attacked
+        original_checkpoint(event, relative)
+        if (
+            event != "before-materialization-file-open"
+            or relative != "second.txt"
+            or attacked
+        ):
+            return
+        attacked = True
+        first = destination / "first.txt"
+        if attack == "replace":
+            first.unlink()
+            first.write_bytes(b"evil!\n")
+        elif attack == "overwrite":
+            first.write_bytes(b"evil!\n")
+        else:
+            (destination / "injected.lean").write_text("def injected : Nat := 0\n")
+
+    monkeypatch.setattr(
+        tree_snapshot_module,
+        "_tree_snapshot_checkpoint",
+        tamper_before_second_file,
+    )
+    try:
+        with pytest.raises(TreeSnapshotError):
+            snapshot.materialize_regular_files(destination)
+        assert attacked
+    finally:
+        if destination.exists():
+            for child in destination.iterdir():
+                child.unlink()
+            destination.rmdir()
+
+
 def test_outer_managed_marker_ignores_unrelated_files_below_it(
     tmp_path: Path,
 ) -> None:
@@ -1759,6 +1814,55 @@ def test_managed_output_descendant_churn_does_not_retry_source_capture(
     snapshot = snapshot_project_sources(tmp_path)
 
     assert edits == 1
+    assert snapshot.index.find("authored") is not None
+    assert snapshot.index.find("generated") is None
+
+
+def test_managed_marker_verification_never_reenumerates_opaque_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _index(tmp_path, "def authored : Nat := 0\n", "Authored.lean")
+    generated = tmp_path / "review-packets"
+    generated.mkdir()
+    (generated / "Packet.lean").write_text("def generated : Nat := 0\n")
+    (generated / "manifest.json").write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+    generated_identity = (generated.stat().st_dev, generated.stat().st_ino)
+    original_scandir = tree_snapshot_module.os.scandir
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    opaque_scans = 0
+
+    def one_opaque_scan(path):
+        nonlocal opaque_scans
+        if isinstance(path, int):
+            metadata = os.fstat(path)
+            if (metadata.st_dev, metadata.st_ino) == generated_identity:
+                opaque_scans += 1
+                if opaque_scans > 1:
+                    raise AssertionError("opaque siblings were re-enumerated")
+        return original_scandir(path)
+
+    def add_irrelevant_churn(event: str, relative: str) -> None:
+        original_checkpoint(event, relative)
+        if event == "before-final-verification" and relative == "":
+            for index in range(100):
+                (generated / f"junk-{index}").write_text("junk\n")
+
+    monkeypatch.setattr(tree_snapshot_module.os, "scandir", one_opaque_scan)
+    monkeypatch.setattr(
+        tree_snapshot_module,
+        "_tree_snapshot_checkpoint",
+        add_irrelevant_churn,
+    )
+
+    snapshot = snapshot_project_sources(
+        tmp_path,
+        limits=TreeCaptureLimits(max_entries=4),
+    )
+
+    assert opaque_scans == 1
     assert snapshot.index.find("authored") is not None
     assert snapshot.index.find("generated") is None
 
@@ -2015,6 +2119,22 @@ def test_permalink_pins_the_commit(tmp_path: Path) -> None:
     assert linker.url("Outer.missing") is None
 
 
+def test_permalink_percent_encodes_source_path_components(tmp_path: Path) -> None:
+    linker = SourceLinker(
+        index=_index(
+            tmp_path,
+            "def encodedPath : Nat := 0\n",
+            "Part#1/A file.lean",
+        ),
+        repository_url="https://github.com/owner/repo",
+        ref="deadbeef",
+    )
+
+    assert linker.url("encodedPath") == (
+        "https://github.com/owner/repo/blob/deadbeef/Part%231/A%20file.lean#L1"
+    )
+
+
 def test_no_link_without_repository_coordinates(tmp_path: Path) -> None:
     linker = SourceLinker(index=_index(tmp_path))
 
@@ -2216,3 +2336,63 @@ def test_build_linker_preserves_alias_spelled_exclusions(tmp_path: Path) -> None
 
     assert linker.location("keptByLinker") is not None
     assert linker.location("leakedByLinker") is None
+
+
+def test_auto_linker_supports_a_symlinked_repository_root(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    _index(root, "def linkedThroughAlias : Nat := 0\n", "A.lean")
+    commit = _init_git_repository(root)
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(root, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    linker = build_linker(alias)
+
+    assert linker.ref == commit
+    assert linker.url("linkedThroughAlias") == (
+        f"https://github.com/owner/repo/blob/{commit}/A.lean#L1"
+    )
+
+
+def test_auto_linker_ignores_git_replace_objects(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "A.lean"
+    source.write_text("def originalTree : Nat := 0\n")
+    original = _init_git_repository(root)
+    source.write_text("def replacementTree : Nat := 0\n")
+    subprocess.run(["git", "add", "A.lean"], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Autoform Tests",
+            "-c",
+            "user.email=autoform@example.invalid",
+            "commit",
+            "-m",
+            "replacement",
+        ],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    )
+    replacement = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "--detach", original], cwd=root, check=True)
+    source.write_text("def replacementTree : Nat := 0\n")
+    subprocess.run(["git", "replace", original, replacement], cwd=root, check=True)
+
+    linker = build_linker(root)
+
+    assert linker.ref == original
+    assert linker.location("replacementTree") is not None
+    assert linker.url("replacementTree") is None

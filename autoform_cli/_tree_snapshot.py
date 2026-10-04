@@ -173,7 +173,7 @@ def _materialize_regular_files(
     descriptors: dict[tuple[str, ...], int] = {}
     directory_identities: dict[tuple[str, ...], tuple[int, int, int]] = {}
     created_directories: list[tuple[str, ...]] = []
-    created_files: list[tuple[tuple[str, ...], tuple[int, int, int]]] = []
+    created_files: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
     root_created = False
     succeeded = False
     try:
@@ -254,8 +254,13 @@ def _materialize_regular_files(
                 )
             )
 
-        for parts in sorted(descriptors, key=len):
-            _verify_materialization_parent(parts, descriptors, directory_identities)
+        _verify_materialized_snapshot(
+            descriptors[()],
+            root_identity,
+            directories,
+            files,
+            placeholders,
+        )
         parent.verify()
         _verify_named_directory(parent.descriptor, name, root_identity)
         succeeded = True
@@ -325,7 +330,7 @@ def _materialize_file(
     identities: dict[tuple[str, ...], tuple[int, int, int]],
     parts: tuple[str, ...],
     data: bytes,
-) -> tuple[int, int, int]:
+) -> tuple[int, ...]:
     parent_parts = parts[:-1]
     _tree_snapshot_checkpoint("before-materialization-file-open", "/".join(parts))
     _verify_materialization_parent(parent_parts, descriptors, identities)
@@ -351,15 +356,20 @@ def _materialize_file(
             if count <= 0:
                 raise OSError(errno.EIO, "short materialization write")
             written += count
-        final = _file_entry_identity(os.fstat(descriptor))
-        named = _file_entry_identity(
-            os.stat(parts[-1], dir_fd=parent_descriptor, follow_symlinks=False)
+        final_metadata = os.fstat(descriptor)
+        named_metadata = os.stat(
+            parts[-1],
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
         )
-        if final != identity or named != identity:
+        if (
+            _file_entry_identity(final_metadata) != identity
+            or _stat_signature(named_metadata) != _stat_signature(final_metadata)
+        ):
             raise TreeSnapshotError("materialized file changed while it was written")
         _verify_materialization_parent(parent_parts, descriptors, identities)
         completed = True
-        return identity
+        return _stat_signature(final_metadata)
     finally:
         if descriptor is not None:
             _close_descriptor(descriptor)
@@ -374,13 +384,63 @@ def _materialize_file(
                 pass
 
 
+def _verify_materialized_snapshot(
+    root_descriptor: int,
+    root_identity: tuple[int, int, int],
+    directories: tuple[tuple[str, tuple[str, ...]], ...],
+    files: tuple[tuple[str, tuple[str, ...], bytes], ...],
+    placeholders: tuple[tuple[str, tuple[str, ...]], ...],
+) -> None:
+    """Verify exact names, kinds and bytes at the successful commit boundary."""
+
+    expected_directories = tuple(sorted(relative for relative, _parts in directories))
+    expected_files = tuple(
+        sorted(
+            [
+                *((relative, data) for relative, _parts, data in files),
+                *((relative, b"") for relative, _parts in placeholders),
+            ]
+        )
+    )
+    all_parts = [
+        *(parts for _relative, parts in directories),
+        *(parts for _relative, parts, _data in files),
+        *(parts for _relative, parts in placeholders),
+    ]
+    limits = TreeCaptureLimits(
+        max_entries=max(0, len(expected_directories) - 1) + len(expected_files),
+        max_depth=max((len(parts) for parts in all_parts), default=0),
+        max_file_bytes=max((len(data) for _relative, data in expected_files), default=0),
+        max_total_bytes=sum(len(data) for _relative, data in expected_files),
+    )
+    observed = capture_directory_descriptor(
+        root_descriptor,
+        expected_identity=root_identity[:2],
+        selection=TreeSelection(
+            include=lambda _path, _mode: True,
+            descend=lambda _path: True,
+            limits=limits,
+        ),
+    )
+    if (
+        observed.directories != expected_directories
+        or observed.files != expected_files
+        or observed.symlinks
+        or observed.special
+        or observed.placeholders
+        or observed.omitted
+        or observed.opaque_directories
+    ):
+        raise TreeSnapshotError("materialized tree changed before commit")
+
+
 def _cleanup_materialization(
     parent: RetainedDirectory | None,
     root_name: str,
     descriptors: dict[tuple[str, ...], int],
     identities: dict[tuple[str, ...], tuple[int, int, int]],
     directories: list[tuple[str, ...]],
-    files: list[tuple[tuple[str, ...], tuple[int, int, int]]],
+    files: list[tuple[tuple[str, ...], tuple[int, ...]]],
     root_created: bool,
 ) -> None:
     """Best-effort cleanup that never follows or removes a substituted entry."""
@@ -390,10 +450,12 @@ def _cleanup_materialization(
         if parent_descriptor is None:
             continue
         try:
-            observed = _file_entry_identity(
-                os.stat(parts[-1], dir_fd=parent_descriptor, follow_symlinks=False)
+            observed = os.stat(
+                parts[-1],
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
             )
-            if observed == expected:
+            if stat.S_ISREG(observed.st_mode) and _stat_signature(observed) == expected:
                 os.unlink(parts[-1], dir_fd=parent_descriptor)
         except (OSError, TreeSnapshotError, ValueError):
             pass
@@ -1469,49 +1531,25 @@ def _verify_snapshot(
     visited_directories: set[str] = set()
     visited_entries: set[str] = set()
 
-    def marker_names(descriptor: int, expected_name: str) -> list[str]:
-        folded = _normalized_name(expected_name)
-        if _DESCRIPTOR_SCANDIR_SUPPORTED:
-            matches: list[str] = []
-            with os.scandir(descriptor) as iterator:
-                for entry in iterator:
-                    if _valid_name(entry.name) and _normalized_name(entry.name) == folded:
-                        matches.append(entry.name)
-                        if len(matches) > 1:
-                            break
-            return matches
-        if _requires_bounded_enumeration(limits):
-            raise TreeSnapshotError(
-                "bounded directory enumeration is unavailable on this platform"
-            )
-        return [
-            name
-            for name in os.listdir(descriptor)
-            if _valid_name(name) and _normalized_name(name) == folded
-        ]
-
     def verify_marker(
         descriptor: int,
         relative: str,
         marker: _OpaqueMarkerRecord,
     ) -> None:
-        matches = marker_names(descriptor, marker.name)
-        if len(matches) != 1:
-            raise _TreeChanged
-        metadata = os.stat(matches[0], dir_fd=descriptor, follow_symlinks=False)
+        metadata = os.stat(marker.name, dir_fd=descriptor, follow_symlinks=False)
         if _stat_signature(metadata) != marker.identity:
             raise _TreeChanged
         if (
             _read_file(
                 descriptor,
-                matches[0],
+                marker.name,
                 marker.identity,
                 max_bytes=marker.max_bytes,
             )
             != marker.data
         ):
             raise _TreeChanged
-        marker_relative = f"{relative}/{matches[0]}" if relative else matches[0]
+        marker_relative = f"{relative}/{marker.name}" if relative else marker.name
         expected_entry = expected_entries.get(marker_relative)
         if expected_entry is None or expected_entry.identity != marker.identity:
             raise _TreeChanged

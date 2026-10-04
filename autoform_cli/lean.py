@@ -24,6 +24,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from urllib.parse import quote_from_bytes
 
 from . import _directory_binding as directory_binding
 from ._tree_snapshot import (
@@ -790,7 +791,10 @@ class SourceLinker:
             )
         ):
             return None
-        path = declaration.path.as_posix()
+        path = "/".join(
+            quote_from_bytes(os.fsencode(part), safe="")
+            for part in declaration.path.parts
+        )
         return f"{self.repository_url}/blob/{self.ref}/{path}#L{declaration.line}"
 
 
@@ -810,6 +814,10 @@ def build_linker(
     """
     requested_root = directory_binding.lexical_absolute_path(lean_root)
     resolved_root = requested_root.resolve()
+    remapped_exclusions = tuple(
+        _remap_resolved_root_exclusion(requested_root, resolved_root, value)
+        for value in exclude_roots
+    )
     if source_index is not None and source_index.root != resolved_root:
         raise ValueError("captured source index belongs to a different Lean root")
     resolved_repository_url = repository_url
@@ -819,14 +827,17 @@ def build_linker(
     if source_index is None:
         if detect_missing and ref is None:
             snapshot, detected_url, detected_ref, linkable_paths = _capture_link_state(
-                requested_root,
-                exclude_roots,
+                resolved_root,
+                remapped_exclusions,
             )
             index = snapshot.index
             resolved_repository_url = repository_url or detected_url
             resolved_ref = detected_ref
         else:
-            index = index_project(requested_root, exclude_roots=exclude_roots)
+            index = index_project(
+                resolved_root,
+                exclude_roots=remapped_exclusions,
+            )
     if detect_missing and resolved_repository_url is None:
         resolved_repository_url = detect_repository_url(requested_root)
     assert index is not None
@@ -934,6 +945,7 @@ def _git_tree_oids(
                 ["git", "ls-tree", "-rz", "--full-tree", commit, "--", *batch],
                 cwd=str(root),
                 capture_output=True,
+                env=_git_environment(),
                 timeout=10,
                 check=False,
             )
@@ -987,6 +999,7 @@ def _git(root: str | Path, *arguments: str) -> str | None:
             ["git", *arguments],
             cwd=str(root),
             capture_output=True,
+            env=_git_environment(),
             text=True,
             timeout=10,
             check=False,
@@ -995,6 +1008,14 @@ def _git(root: str | Path, *arguments: str) -> str | None:
         return None
     output = result.stdout.strip()
     return output if result.returncode == 0 and output else None
+
+
+def _git_environment() -> dict[str, str]:
+    """Disable local history-rewrite refs while attesting committed bytes."""
+
+    environment = os.environ.copy()
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
 
 
 __all__ = [
