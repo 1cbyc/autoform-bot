@@ -95,6 +95,7 @@ def test_render_writes_a_derived_tree_and_leaves_the_vault_alone(tmp_path: Path)
     assert (out / "dependencies/full.md").is_file()
     assert (out / "stylesheets/blueprint.css").is_file()
     assert (out / "javascripts/blueprint-mermaid.js").is_file()
+    assert (out / "javascripts/blueprint-live.js").is_file()
     assert (out / PUBLICATION_MANIFEST).is_file()
     # Nodes are absorbed into their chapter, not published one page each.
     assert not (out / "roadmap/base.md").exists()
@@ -286,6 +287,8 @@ def test_a_chapter_places_statements_in_the_authored_narrative(tmp_path: Path) -
     assert page.index("## Results") < page.index('id="top"')
     assert '<div class="bp-thmwrapper theorem-style-definition bp-fully_proved" id="base"' in page
     assert '<div class="bp-thmwrapper theorem-style-plain bp-fully_proved" id="top"' in page
+    assert 'data-autoform-node-id="base"' in page
+    assert 'data-autoform-node-id="top"' in page
     assert '<span class="bp-thmcaption">Definition</span><span class="bp-thmlabel">1</span>' in page
     assert '<span class="bp-thmtitle">Top</span>' in page
     assert "The main result." in page
@@ -598,6 +601,10 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     _render(tmp_path)
     css = (tmp_path / "out/stylesheets/blueprint.css").read_text(encoding="utf-8")
     script = (tmp_path / "out/javascripts/blueprint-mermaid.js").read_text(encoding="utf-8")
+    live = (tmp_path / "out/javascripts/blueprint-live.js").read_text(encoding="utf-8")
+    packaged_live = (
+        Path(__file__).resolve().parent.parent / "autoform_cli/assets/blueprint-live.js"
+    ).read_text(encoding="utf-8")
 
     # Facebook's surface greys and Meta blue, not Material's defaults, and both
     # schemes hang off the theme's own data-md-color-scheme attribute.
@@ -607,6 +614,13 @@ def test_both_colour_schemes_are_published(tmp_path: Path) -> None:
     assert "--bp-link: #2D88FF" in css
     assert "--bp-surface: #242526" in css
     assert "background-color: #18191A" in css
+    assert "/__autoform/live.json" in live
+    assert 'window.location.hostname !== "127.0.0.1"' in live
+    assert "data-autoform-node-id" in live
+    assert "setInterval" not in live
+    assert "setTimeout(refresh, pollDelayMs)" in live
+    assert 'render({ claims: [], error: "Live overlay unavailable" })' in live
+    assert live == packaged_live
     # The brand sweep is defined once and reused, rather than pasted per rule.
     assert css.count("--bp-sweep:") == 1
     assert css.count("var(--bp-sweep)") >= 3
