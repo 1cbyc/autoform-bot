@@ -997,6 +997,9 @@ def test_render_omits_benign_hidden_files(tmp_path: Path) -> None:
         ("https://github.com/owner/repo.git", "https://github.com/owner/repo"),
         ("https://github.com/owner/repo/", "https://github.com/owner/repo"),
         ("ssh://git@github.com/owner/repo.git", "https://github.com/owner/repo"),
+        ("https://user:secret@github.com/owner/repo.git", None),
+        ("https://github.com/owner/repo.git?access_token=secret", None),
+        ("https://github.com/owner/repo.git#secret", None),
         ("/local/path", None),
     ],
 )

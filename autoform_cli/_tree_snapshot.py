@@ -172,6 +172,7 @@ def _materialize_regular_files(
     parent: RetainedDirectory | None = None
     descriptors: dict[tuple[str, ...], int] = {}
     directory_identities: dict[tuple[str, ...], tuple[int, int, int]] = {}
+    directory_permissions: dict[tuple[str, ...], int] = {}
     created_directories: list[tuple[str, ...]] = []
     created_files: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
     root_created = False
@@ -180,10 +181,10 @@ def _materialize_regular_files(
         parent = open_directory(absolute.parent)
         os.mkdir(name, 0o700, dir_fd=parent.descriptor)
         root_created = True
-        root_identity = _directory_entry_identity(
-            os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
-        )
+        root_metadata = os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+        root_identity = _directory_entry_identity(root_metadata)
         directory_identities[()] = root_identity
+        directory_permissions[()] = stat.S_IMODE(root_metadata.st_mode)
         root_descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent.descriptor)
         descriptors[()] = root_descriptor
         if _directory_entry_identity(os.fstat(root_descriptor)) != root_identity:
@@ -204,14 +205,14 @@ def _materialize_regular_files(
                 directory_identities,
             )
             os.mkdir(parts[-1], 0o700, dir_fd=parent_descriptor)
-            child_identity = _directory_entry_identity(
-                os.stat(
-                    parts[-1],
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
+            child_metadata = os.stat(
+                parts[-1],
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
             )
+            child_identity = _directory_entry_identity(child_metadata)
             directory_identities[parts] = child_identity
+            directory_permissions[parts] = stat.S_IMODE(child_metadata.st_mode)
             created_directories.append(parts)
             child_descriptor = os.open(
                 parts[-1],
@@ -260,6 +261,9 @@ def _materialize_regular_files(
             directories,
             files,
             placeholders,
+            directory_identities,
+            directory_permissions,
+            created_files,
         )
         parent.verify()
         _verify_named_directory(parent.descriptor, name, root_identity)
@@ -390,6 +394,9 @@ def _verify_materialized_snapshot(
     directories: tuple[tuple[str, tuple[str, ...]], ...],
     files: tuple[tuple[str, tuple[str, ...], bytes], ...],
     placeholders: tuple[tuple[str, tuple[str, ...]], ...],
+    directory_identities: dict[tuple[str, ...], tuple[int, int, int]],
+    directory_permissions: dict[tuple[str, ...], int],
+    created_files: list[tuple[tuple[str, ...], tuple[int, ...]]],
 ) -> None:
     """Verify exact names, kinds and bytes at the successful commit boundary."""
 
@@ -432,6 +439,18 @@ def _verify_materialized_snapshot(
         or observed.opaque_directories
     ):
         raise TreeSnapshotError("materialized tree changed before commit")
+    observed_identities = dict(observed.identities)
+    for relative, parts in directories:
+        signature = observed_identities.get(relative)
+        if signature is None or (
+            _stable_entry_identity(signature) != directory_identities.get(parts)
+            or stat.S_IMODE(signature[2]) != directory_permissions.get(parts)
+        ):
+            raise TreeSnapshotError("materialized directory metadata changed before commit")
+    for parts, expected_signature in created_files:
+        signature = observed_identities.get("/".join(parts))
+        if signature != expected_signature:
+            raise TreeSnapshotError("materialized file metadata changed before commit")
 
 
 def _cleanup_materialization(
@@ -1383,7 +1402,7 @@ def _scan_directory(
                     child_identity
                 ):
                     raise _TreeChanged
-                opaque = _scan_directory(
+                _scan_directory(
                     child_descriptor,
                     relative=child_relative,
                     depth=depth + 1,
@@ -1402,14 +1421,8 @@ def _scan_directory(
                 final_identity = _stat_signature(
                     os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                 )
-                if (
-                    _stable_entry_identity(final_identity)
-                    if opaque
-                    else final_identity
-                ) != (
-                    _stable_entry_identity(opened_identity)
-                    if opaque
-                    else opened_identity
+                if _stable_entry_identity(final_identity) != _stable_entry_identity(
+                    opened_identity
                 ):
                     raise _TreeChanged
             finally:
@@ -1462,7 +1475,9 @@ def _scan_directory(
         else:
             special.append((child_relative, stat.S_IFMT(metadata.st_mode)))
     if (
-        _stat_signature(os.fstat(descriptor)) != identity
+        _stable_entry_identity(
+            _stat_signature(os.fstat(descriptor))
+        ) != _stable_entry_identity(identity)
         or not _directory_names_match(
             descriptor,
             names,
@@ -1573,7 +1588,11 @@ def _verify_snapshot(
             limits=limits,
         )
         names = expected.names
-        if _stat_signature(os.fstat(descriptor)) != expected.identity or not names_match:
+        if (
+            _stable_entry_identity(_stat_signature(os.fstat(descriptor)))
+            != _stable_entry_identity(expected.identity)
+            or not names_match
+        ):
             raise _TreeChanged
         for name in names:
             child_relative = f"{relative}/{name}" if relative else name
@@ -1593,49 +1612,33 @@ def _verify_snapshot(
                 continue
             observed_identity = _stat_signature(metadata)
             expected_identity = directory.identity
-            if not stat.S_ISDIR(metadata.st_mode) or (
-                _stable_entry_identity(observed_identity)
-                if directory.marker is not None
-                else observed_identity
-            ) != (
-                _stable_entry_identity(expected_identity)
-                if directory.marker is not None
-                else expected_identity
-            ):
+            if not stat.S_ISDIR(metadata.st_mode) or _stable_entry_identity(
+                observed_identity
+            ) != _stable_entry_identity(expected_identity):
                 raise _TreeChanged
             child_descriptor: int | None = None
             try:
                 child_descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
                 opened_identity = _stat_signature(os.fstat(child_descriptor))
-                if (
-                    _stable_entry_identity(opened_identity)
-                    if directory.marker is not None
-                    else opened_identity
-                ) != (
-                    _stable_entry_identity(directory.identity)
-                    if directory.marker is not None
-                    else directory.identity
+                if _stable_entry_identity(opened_identity) != _stable_entry_identity(
+                    directory.identity
                 ):
                     raise _TreeChanged
                 verify_directory(child_descriptor, child_relative)
                 final_identity = _stat_signature(
                     os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                 )
-                if (
-                    _stable_entry_identity(final_identity)
-                    if directory.marker is not None
-                    else final_identity
-                ) != (
-                    _stable_entry_identity(directory.identity)
-                    if directory.marker is not None
-                    else directory.identity
+                if _stable_entry_identity(final_identity) != _stable_entry_identity(
+                    directory.identity
                 ):
                     raise _TreeChanged
             finally:
                 if child_descriptor is not None:
                     _close_descriptor(child_descriptor)
         if (
-            _stat_signature(os.fstat(descriptor)) != expected.identity
+            _stable_entry_identity(
+                _stat_signature(os.fstat(descriptor))
+            ) != _stable_entry_identity(expected.identity)
             or not _directory_names_match(
                 descriptor,
                 expected.names,

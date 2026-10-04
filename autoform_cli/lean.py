@@ -24,7 +24,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote_from_bytes
+from urllib.parse import quote_from_bytes, urlsplit, urlunsplit
 
 from . import _directory_binding as directory_binding
 from ._tree_snapshot import (
@@ -415,11 +415,18 @@ def _lean_snapshot_includes(
 ) -> bool:
     if _lean_path_is_excluded(relative, excluded):
         return False
+    if stat.S_ISLNK(mode):
+        return (
+            relative.suffix.casefold() == ".lean"
+            and not relative.name.startswith(".#")
+        )
     return (
         stat.S_ISDIR(mode)
-        or stat.S_ISLNK(mode)
         or relative.suffix.casefold() == ".lean"
-        or _is_managed_output_manifest_name(relative.name)
+        or (
+            len(relative.parts) > 1
+            and _is_managed_output_manifest_name(relative.name)
+        )
     )
 
 
@@ -986,17 +993,36 @@ def _git_tree_oids(
 
 def detect_repository_url(root: str | Path) -> str | None:
     """Find the project's web URL from the CI environment or the git remote."""
-    repository = os.environ.get("GITHUB_REPOSITORY")
+    repository = (
+        os.environ.get("GITHUB_REPOSITORY")
+        if _is_github_workspace(root)
+        else None
+    )
     if repository:
         server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
         return f"{server.rstrip('/')}/{repository}"
-    remote = _git(root, "config", "--get", "remote.origin.url")
+    remote = _git(root, "config", "--local", "--get", "remote.origin.url")
     return _normalize_remote(remote) if remote else None
 
 
 def detect_ref(root: str | Path) -> str | None:
     """Prefer the exact commit so links keep pointing at the reviewed code."""
-    return os.environ.get("GITHUB_SHA") or _git(root, "rev-parse", "HEAD")
+    github_sha = os.environ.get("GITHUB_SHA") if _is_github_workspace(root) else None
+    return github_sha or _git(root, "rev-parse", "HEAD")
+
+
+def _is_github_workspace(root: str | Path) -> bool:
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if not workspace:
+        return False
+    try:
+        resolved_root = Path(root).resolve()
+        resolved_workspace = Path(workspace).resolve()
+    except (OSError, RuntimeError):
+        return False
+    return resolved_root == resolved_workspace or resolved_root.is_relative_to(
+        resolved_workspace
+    )
 
 
 def _normalize_remote(remote: str) -> str | None:
@@ -1006,11 +1032,46 @@ def _normalize_remote(remote: str) -> str | None:
         if not path:
             return None
         remote = f"https://{host}/{path}"
-    elif remote.startswith("ssh://git@"):
-        remote = "https://" + remote[len("ssh://git@") :]
-    if not remote.startswith(("http://", "https://")):
+    try:
+        parsed = urlsplit(remote)
+    except ValueError:
         return None
-    return remote[: -len(".git")] if remote.endswith(".git") else remote.rstrip("/")
+    if parsed.scheme == "ssh" and parsed.username == "git" and parsed.hostname:
+        host = (
+            f"[{parsed.hostname}]"
+            if ":" in parsed.hostname
+            else parsed.hostname
+        )
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        remote = f"https://{host}{f':{port}' if port is not None else ''}{parsed.path}"
+        try:
+            parsed = urlsplit(remote)
+        except ValueError:
+            return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    netloc = f"{host}:{port}" if port is not None else host
+    path = parsed.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    if not path or path == "/":
+        return None
+    return urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
 def _git(root: str | Path, *arguments: str) -> str | None:
@@ -1031,9 +1092,13 @@ def _git(root: str | Path, *arguments: str) -> str | None:
 
 
 def _git_environment() -> dict[str, str]:
-    """Disable local history-rewrite refs while attesting committed bytes."""
+    """Make the explicit working directory the only Git repository selector."""
 
-    environment = os.environ.copy()
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("GIT_")
+    }
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     return environment
 

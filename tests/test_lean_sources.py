@@ -1315,6 +1315,37 @@ def test_editor_lock_lean_symlinks_are_skipped(tmp_path: Path) -> None:
     assert after.generation_revision == before.generation_revision
 
 
+@pytest.mark.parametrize("name", [".#Lock.lean", "notes-link.txt"])
+def test_ignored_symlink_target_churn_does_not_invalidate_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    _index(tmp_path, "def stableBesideLink : Nat := 0\n")
+    link = tmp_path / name
+    try:
+        link.symlink_to("target-0")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    edits = 0
+
+    def churn_link(event: str, relative: str) -> None:
+        nonlocal edits
+        original_checkpoint(event, relative)
+        if event == "before-final-verification" and relative == "":
+            edits += 1
+            link.unlink()
+            link.symlink_to(f"target-{edits}")
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", churn_link)
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert edits == 1
+    assert snapshot.index.find("stableBesideLink") is not None
+
+
 @pytest.mark.parametrize("target", ["Basic.lean", "Moved.lean"], ids=["live", "dangling"])
 def test_lean_symlink_is_refused_whether_or_not_its_target_exists(tmp_path: Path, target: str) -> None:
     _index(tmp_path, "def canonical : Nat := 0\n")
@@ -1465,7 +1496,7 @@ def test_snapshot_materialization_root_swap_never_redirects_bytes(
 ) -> None:
     snapshot = TreeSnapshot(
         root_identity=(1, 1),
-        directories=("",),
+        directories=("", "nested"),
         files=(("result.txt", b"captured\n"),),
         symlinks=(),
         special=(),
@@ -1617,7 +1648,10 @@ def test_snapshot_materialization_closes_descriptors_after_failure(
     assert not destination.exists()
 
 
-@pytest.mark.parametrize("attack", ["replace", "overwrite", "inject"])
+@pytest.mark.parametrize(
+    "attack",
+    ["replace", "overwrite", "inject", "chmod", "hardlink"],
+)
 def test_snapshot_materialization_rejects_final_tree_tampering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1625,7 +1659,7 @@ def test_snapshot_materialization_rejects_final_tree_tampering(
 ) -> None:
     snapshot = TreeSnapshot(
         root_identity=(1, 1),
-        directories=("",),
+        directories=("", "nested"),
         files=(("first.txt", b"first\n"), ("second.txt", b"second\n")),
         symlinks=(),
         special=(),
@@ -1653,8 +1687,14 @@ def test_snapshot_materialization_rejects_final_tree_tampering(
             first.write_bytes(b"evil!\n")
         elif attack == "overwrite":
             first.write_bytes(b"evil!\n")
-        else:
+        elif attack == "inject":
             (destination / "injected.lean").write_text("def injected : Nat := 0\n")
+        elif attack == "chmod":
+            destination.chmod(0o777)
+            (destination / "nested").chmod(0o777)
+            first.chmod(0o666)
+        else:
+            os.link(first, tmp_path / "outside-link")
 
     monkeypatch.setattr(
         tree_snapshot_module,
@@ -1666,9 +1706,12 @@ def test_snapshot_materialization_rejects_final_tree_tampering(
             snapshot.materialize_regular_files(destination)
         assert attacked
     finally:
+        outside_link = tmp_path / "outside-link"
+        if outside_link.exists():
+            outside_link.unlink()
         if destination.exists():
             for child in destination.iterdir():
-                child.unlink()
+                child.rmdir() if child.is_dir() else child.unlink()
             destination.rmdir()
 
 
@@ -1951,6 +1994,37 @@ def test_managed_marker_at_requested_root_never_prunes_the_root(tmp_path: Path) 
     index = index_project(tmp_path)
 
     assert index.find("rootSource") is not None
+
+
+def test_root_managed_marker_churn_does_not_invalidate_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "Root.lean").write_text("def stableRootSource : Nat := 0\n")
+    marker = tmp_path / "manifest.json"
+    marker.write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    edits = 0
+
+    def churn_root_marker(event: str, relative: str) -> None:
+        nonlocal edits
+        original_checkpoint(event, relative)
+        if event == "before-final-verification" and relative == "":
+            edits += 1
+            marker.write_text(f"{{\"irrelevant\": {edits}}}\n")
+
+    monkeypatch.setattr(
+        tree_snapshot_module,
+        "_tree_snapshot_checkpoint",
+        churn_root_marker,
+    )
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert edits == 1
+    assert snapshot.index.find("stableRootSource") is not None
 
 
 @pytest.mark.parametrize(
@@ -2476,4 +2550,46 @@ def test_explicit_ref_linker_keeps_remote_bound_to_resolved_root(
     assert linker.location("fromFirstRepository") is not None
     assert linker.url("fromFirstRepository") == (
         f"https://github.com/owner/A/blob/{commit}/A.lean#L1"
+    )
+
+
+def test_auto_linker_ignores_inherited_repo_and_ci_redirects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first"
+    first.mkdir()
+    (first / "A.lean").write_text("def stableRepository : Nat := 0\n")
+    first_commit = _init_git_repository(first)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "https://github.com/owner/A.git"],
+        cwd=first,
+        check=True,
+    )
+    second = tmp_path / "second"
+    second.mkdir()
+    (second / "A.lean").write_text("def stableRepository : Nat := 0\n")
+    (second / "OnlyB.txt").write_text("different tree\n")
+    second_commit = _init_git_repository(second)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "https://github.com/owner/B.git"],
+        cwd=second,
+        check=True,
+    )
+    monkeypatch.setenv("GIT_DIR", str(second / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(second))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/owner/evil.git")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(second))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/ci-wrong")
+    monkeypatch.setenv("GITHUB_SHA", second_commit)
+
+    linker = build_linker(first)
+
+    assert first_commit != second_commit
+    assert linker.ref == first_commit
+    assert linker.repository_url == "https://github.com/owner/A"
+    assert linker.url("stableRepository") == (
+        f"https://github.com/owner/A/blob/{first_commit}/A.lean#L1"
     )
