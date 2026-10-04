@@ -677,7 +677,17 @@ def _open_parent(parent: Path) -> int:
         descriptor = os.open(absolute.anchor, flags)
         try:
             for part in absolute.parts[1:]:
-                child = os.open(part, flags, dir_fd=descriptor)
+                try:
+                    child = os.open(part, flags, dir_fd=descriptor)
+                except NotADirectoryError:
+                    # macOS reports a symbolic link as ENOTDIR too, so look
+                    # before calling the component a link.
+                    if not stat.S_ISLNK(os.stat(part, dir_fd=descriptor, follow_symlinks=False).st_mode):
+                        raise ProjectCreateError(
+                            "project-parent-invalid",
+                            "The target parent or one of its ancestors is not a directory.",
+                        ) from None
+                    raise
                 os.close(descriptor)
                 descriptor = child
             metadata = os.fstat(descriptor)
@@ -728,6 +738,9 @@ def _require_absent(parent_descriptor: int, name: str) -> None:
         os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except FileNotFoundError:
         return
+    except PermissionError as error:
+        # Opening the parent needs only read permission; a lookup inside it also needs search.
+        raise _parent_access_error(error) from None
     except OSError:
         raise ProjectCreateError("project-create-failed", "Project creation failed; no project was created.") from None
     raise ProjectCreateError("project-target-exists", "The target already exists; project new never overwrites it.")
@@ -741,6 +754,11 @@ def _create_stage(parent_descriptor: int) -> str:
             return name
         except FileExistsError:
             continue
+        except PermissionError:
+            raise ProjectCreateError(
+                "project-parent-inaccessible",
+                "The target parent is not writable; project new needs write permission on it.",
+            ) from None
     raise ProjectCreateError("project-create-failed", "Project creation failed; no project was created.")
 
 

@@ -540,6 +540,7 @@ def test_unlisted_pair_is_written_without_a_lock(tmp_path: Path) -> None:
     assert result.lean_toolchain == "leanprover/lean4:v4.30.0"
     assert result.mathlib_rev == "v4.30.0"
     assert [code for code, _message in result.warnings] == ["project-release-unlisted"]
+    assert "by its tag or full commit" in result.warnings[0][1]
     assert (target / "lean-toolchain").read_text(encoding="utf-8") == "leanprover/lean4:v4.30.0\n"
     assert (target / "lakefile.toml").read_text(encoding="utf-8") == _UNLISTED_LAKEFILE
     assert not (target / "lake-manifest.json").exists()
@@ -860,6 +861,7 @@ def test_rechecks_parent_mode_on_the_open_descriptor(
         create_project(target, package="Project", release_id=_RELEASE)
 
     assert raised.value.code == "project-parent-unsafe"
+    assert "chmod g-w,o-w" in raised.value.message
     assert not target.exists()
     assert not list(parent.glob(".autoform-new-*"))
 
@@ -1587,7 +1589,11 @@ def test_concurrent_creation_has_exactly_one_winner(tmp_path: Path) -> None:
         ),
     ],
 )
-def test_cli_missing_creation_options_are_json(arguments: list[str], code: str, capsys) -> None:
+def test_cli_missing_creation_options_are_json(
+    arguments: list[str], code: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    # The relative target's parent must pass the safety checks whatever the checkout's mode is.
+    monkeypatch.chdir(tmp_path)
     assert main(arguments) == 1
     captured = capsys.readouterr()
     assert json.loads(captured.out)["error"]["code"] == code
@@ -1635,6 +1641,19 @@ def test_cli_unlisted_human_output_warns_on_stderr(tmp_path: Path, capsys) -> No
     assert captured.err.endswith(
         "warning: workflows were omitted because no immutable Autoform pin was available; "
         "add them with: autoform init <target> --autoform-ref <40-char-sha>\n"
+    )
+
+
+def test_cli_omitted_workflows_hint_keeps_an_explicit_source(tmp_path: Path, capsys) -> None:
+    source = "https://example.com/~team/autoform-bot.git"
+    arguments = ["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project"]
+
+    assert main([*arguments, "--release", _RELEASE, "--autoform-source", source]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err.endswith(
+        "add them with: autoform init <target> --autoform-source "
+        "'https://example.com/~team/autoform-bot.git' --autoform-ref <40-char-sha>\n"
     )
 
 
@@ -1915,6 +1934,62 @@ def test_unreadable_parent_is_inaccessible_not_a_symlink(tmp_path: Path) -> None
     assert not list(parent.iterdir())
 
 
+@_NEEDS_PERMISSIONS
+@pytest.mark.parametrize(
+    ("mode", "needed"),
+    [(0o600, "read and search permission"), (0o400, "read and search permission"), (0o500, "write permission")],
+    ids=["unsearchable", "read-only-unsearchable", "unwritable"],
+)
+def test_parent_permission_failures_name_the_missing_permission(
+    tmp_path: Path, capsys, mode: int, needed: str
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    target = os.fspath(parent / "Project")
+    parent.chmod(mode)
+    try:
+        with pytest.raises(ProjectCreateError) as raised:
+            create_project(target, package="Project", release_id=_RELEASE)
+        assert main(["project", "new", target, "--package", "Project", "--json"]) == 1
+    finally:
+        parent.chmod(0o700)
+
+    assert raised.value.code == "project-parent-inaccessible"
+    assert needed in raised.value.message
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "project-parent-inaccessible"
+    assert not list(parent.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("relative", "code"),
+    [
+        ("missing/Project", "project-parent-missing"),
+        ("file/sub/Project", "project-parent-missing"),
+        ("file/Project", "project-parent-invalid"),
+    ],
+)
+def test_missing_or_non_directory_parent_is_a_stable_error(tmp_path: Path, relative: str, code: str) -> None:
+    (tmp_path / "file").write_text("", encoding="utf-8")
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(tmp_path / relative, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("component", "code"),
+    [("missing", "project-parent-missing"), ("overlong", "project-create-failed")],
+)
+def test_open_parent_classifies_lookup_failures(tmp_path: Path, component: str, code: str) -> None:
+    name = "p" * (os.pathconf(tmp_path, "PC_NAME_MAX") + 1) if component == "overlong" else component
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_module._open_parent(tmp_path / name)
+
+    assert raised.value.code == code
+
+
 def test_overlong_parent_component_is_a_stable_error(tmp_path: Path) -> None:
     name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
     target = tmp_path / ("p" * (name_limit + 1)) / "Project"
@@ -1940,6 +2015,34 @@ def test_symlinked_parent_at_open_is_reported_as_a_link(
 
     assert raised.value.code == "project-path-is-symlink"
     assert not list(real.iterdir())
+
+
+@pytest.mark.parametrize("component", ["parent", "ancestor"])
+def test_file_swapped_in_before_open_is_not_called_a_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    ancestor = tmp_path / "ancestor"
+    parent = ancestor / "parent"
+    parent.mkdir(parents=True)
+    swapped = parent if component == "parent" else ancestor
+    validate_package = create_module._validate_package
+
+    def validate_then_swap(package, directory):
+        validated = validate_package(package, directory)
+        shutil.rmtree(swapped)
+        swapped.write_text("", encoding="utf-8")
+        return validated
+
+    monkeypatch.setattr(create_module, "_validate_package", validate_then_swap)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(parent / "Project", package="Project", release_id=_RELEASE)
+
+    assert (raised.value.code, raised.value.message) == (
+        "project-parent-invalid",
+        "The target parent or one of its ancestors is not a directory.",
+    )
+    assert swapped.is_file()
 
 
 def test_parent_lock_held_elsewhere_fails_as_busy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1979,6 +2082,40 @@ def test_cli_interrupt_reports_the_possible_stage(
         assert ".autoform-new-*" in captured.err
     assert not (tmp_path / "Project").exists()
     assert len(list(tmp_path.glob(".autoform-new-*"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("existing", "interrupted", "expected"),
+    [
+        (False, "_publication_state", "may be this run's complete project"),
+        (True, "_build_project_plan", "no project was published"),
+    ],
+    ids=["after-publication", "target-already-existed"],
+)
+def test_cli_interrupt_says_whether_the_target_appeared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    existing: bool,
+    interrupted: str,
+    expected: str,
+) -> None:
+    def interrupt(*_args, **_kwargs) -> None:
+        raise KeyboardInterrupt
+
+    target = tmp_path / "Project"
+    if existing:
+        target.mkdir()
+    # On success, create_project checks the publication state only in its final cleanup.
+    monkeypatch.setattr(create_module, interrupted, interrupt)
+
+    assert main(["project", "new", os.fspath(target), "--package", "Project"]) == 130
+
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error[project-create-interrupted]: ")
+    assert expected in captured.err
+    assert not list(tmp_path.glob(".autoform-new-*"))
+    assert (target / "lakefile.toml").is_file() is not existing
 
 
 @pytest.mark.parametrize(

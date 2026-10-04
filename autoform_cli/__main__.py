@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -434,6 +435,8 @@ def _project(args: argparse.Namespace) -> int:
                 raise ProjectCreateError(
                     "project-name-invalid", "--package is required (an UpperCamelCase Lean package name)."
                 )
+            target = os.path.expanduser(args.target)
+            existed = os.path.lexists(target)
             try:
                 result = create_project(
                     args.target,
@@ -445,13 +448,20 @@ def _project(args: argparse.Namespace) -> int:
                     autoform_ref=args.autoform_ref,
                 )
             except KeyboardInterrupt:
-                # create_project reports an interrupt once publication has begun
-                # as project-create-commit-uncertain, so this one published nothing.
-                error = ProjectCreateError(
-                    "project-create-interrupted",
-                    "Project creation was interrupted and no project was published. A hidden "
-                    ".autoform-new-* stage may remain in the target parent; inspect it before removal.",
-                )
+                # An interrupt during create_project's final cleanup can follow a
+                # successful publication, so look before saying nothing was published.
+                if not existed and os.path.lexists(target):
+                    message = (
+                        "Project creation was interrupted after the target was created, so it may be "
+                        "this run's complete project. Check it with autoform project inspect before "
+                        "using or removing it."
+                    )
+                else:
+                    message = (
+                        "Project creation was interrupted and no project was published. A hidden "
+                        ".autoform-new-* stage may remain in the target parent; inspect it before removal."
+                    )
+                error = ProjectCreateError("project-create-interrupted", message)
                 if args.json:
                     print(error.to_json())
                 else:
@@ -467,9 +477,13 @@ def _project(args: argparse.Namespace) -> int:
                 for code, message in result.warnings:
                     print(_ascii_text(f"warning[{code}]: {message}"), file=sys.stderr)
                 if not result.workflows_pinned:
+                    init_command = "autoform init <target>"
+                    if args.autoform_source:
+                        # Without the source, init would pin this checkout's origin instead.
+                        init_command += f" --autoform-source {shlex.quote(args.autoform_source)}"
                     print(
                         "warning: workflows were omitted because no immutable Autoform pin was "
-                        "available; add them with: autoform init <target> --autoform-ref <40-char-sha>",
+                        f"available; add them with: {init_command} --autoform-ref <40-char-sha>",
                         file=sys.stderr,
                     )
             return 0
