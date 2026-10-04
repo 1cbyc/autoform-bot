@@ -1437,6 +1437,34 @@ def test_file_replaced_by_fifo_between_stat_and_open_never_blocks(
     assert "unreadable-file" in {item["code"] for item in result["diagnostics"]}
 
 
+def test_decision_file_accepts_windows_path_and_handle_stat_views(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    original_fstat = project_snapshot.os.fstat
+
+    class WindowsHandleStat:
+        def __init__(self, metadata: os.stat_result) -> None:
+            self.st_dev = metadata.st_dev
+            self.st_ino = metadata.st_ino
+            self.st_mode = metadata.st_mode
+            self.st_size = metadata.st_size
+            self.st_mtime_ns = metadata.st_mtime_ns
+            self.st_ctime_ns = metadata.st_ctime_ns + 1
+
+    monkeypatch.setattr(
+        project_snapshot.os,
+        "fstat",
+        lambda descriptor: WindowsHandleStat(original_fstat(descriptor)),
+    )
+    monkeypatch.setattr(project_snapshot, "_WINDOWS_STAT_VIEWS", True)
+
+    captured = project_snapshot._capture_file(root, "lakefile.toml")
+
+    assert captured.state == "regular"
+    assert captured.content == (root / "lakefile.toml").read_bytes()
+
+
 def _run_fifo_probe(root: Path, mode: str) -> dict:
     fixture = Path(__file__).parent / "fixtures/project_inspect_fifo_probe.py"
     try:

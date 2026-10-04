@@ -12,6 +12,7 @@ _ROOT_MARKERS = ("lakefile.lean", "lakefile.toml", "lean-toolchain")
 _MANIFEST = "lake-manifest.json"
 _OVERRIDES = ".lake/package-overrides.json"
 _DECISION_FILES = (*_ROOT_MARKERS, _MANIFEST, _OVERRIDES)
+_WINDOWS_STAT_VIEWS = os.name == "nt"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +104,11 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
         descriptor = _open_beneath(root, relative, flags)
         opened = os.fstat(descriptor)
         opened_token = _node_identity(opened)
-        if not stat.S_ISREG(opened.st_mode) or opened_token != before_token:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _cross_interface_identity(opened_token)
+            != _cross_interface_identity(before_token)
+        ):
             return _FileSnapshot("changed", opened_token)
         chunks: list[bytes] = []
         remaining = _MAX_FILE_BYTES + 1
@@ -122,7 +127,11 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
             )
         except (OSError, TypeError, ValueError):
             return _FileSnapshot("changed", after_token)
-        if before_token != after_token or after_token != path_token or not parents_unchanged:
+        if (
+            opened_token != after_token
+            or before_token != path_token
+            or not parents_unchanged
+        ):
             return _FileSnapshot("changed", after_token)
         if len(data) > _MAX_FILE_BYTES:
             return _FileSnapshot("unreadable", after_token)
@@ -222,6 +231,18 @@ def _node_identity(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def _cross_interface_identity(identity: tuple[int, ...]) -> tuple[int, ...]:
+    """Normalize fields Windows exposes differently through stat and fstat.
+
+    Path ``stat`` reports birth time as ``st_ctime_ns`` while descriptor
+    ``fstat`` reports filesystem change time. Comparisons within either
+    interface retain the complete identity; only the admission comparison
+    between those two views omits that field.
+    """
+
+    return identity[:-1] if _WINDOWS_STAT_VIEWS else identity
 
 
 def _directory_generation(path: Path) -> tuple[str, tuple[int, ...] | None]:
