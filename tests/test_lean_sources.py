@@ -814,7 +814,7 @@ def test_portable_capture_rejects_an_unrestored_nested_directory_redirection(
     raises=pytest.fail.Exception,
     reason=(
         "the portable fallback is best effort: a redirection restored before the "
-        "directory is re-examined, with its times reset, is not detected"
+        "directory is re-examined, with directory times reset, is not detected"
     ),
 )
 def test_portable_capture_rejects_a_restored_nested_directory_redirection(

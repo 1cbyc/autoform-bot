@@ -1128,8 +1128,10 @@ def _capture_portable(
 
     Paths are re-resolved on every access, so this is not a generation
     boundary.  On Windows, path ``stat`` reports birth time as ``st_ctime_ns``;
-    a directory junction swapped in, read through, and restored with its
-    modification time reset can pass both captures unnoticed.
+    a directory junction swapped in for a subdirectory, read through, and
+    swapped back out can pass both captures unnoticed if the parent's
+    modification time is reset.  One swapped in for the root needs no reset,
+    because the root's ancestors are compared only by identity.
     """
 
     path_identities = _portable_directory_identities(root)
