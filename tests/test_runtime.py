@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from autoform_cli.graph import Graph, Node, load_graph
+from autoform_cli.lean import LeanSourceError
 from autoform_cli.runtime import (
     RUNTIME_AUTHORITY,
     RUNTIME_SCHEMA,
@@ -254,12 +255,24 @@ def test_rejects_nonportable_authored_file_paths(tmp_path: Path) -> None:
     assert str(tmp_path) not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (None, "Lean sources could not be indexed"),
+        (
+            "permission denied: Project/Secret.lean",
+            "Lean sources could not be indexed: permission denied: Project/Secret.lean",
+        ),
+    ],
+)
 def test_runtime_translates_source_index_io_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str | None, message: str
 ) -> None:
     project = _project(tmp_path)
 
     def fail_index(root: Path):
+        if reason is not None:
+            raise LeanSourceError(reason)
         raise OSError(f"private host detail: {root}")
 
     monkeypatch.setattr("autoform_cli.runtime.index_project", fail_index)
@@ -267,7 +280,7 @@ def test_runtime_translates_source_index_io_failure(
     with pytest.raises(RuntimeProjectionError) as error:
         load_runtime_graph(project, lean_root=project)
 
-    assert error.value.issues == ("Lean sources could not be indexed",)
+    assert error.value.issues == (message,)
     assert str(tmp_path) not in str(error.value)
 
 

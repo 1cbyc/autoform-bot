@@ -360,6 +360,29 @@ def test_check_cli_reports_source_index_io_failure_before_success(
     assert str(tmp_path) not in captured.out
 
 
+def test_check_cli_names_an_unsafe_lean_source_without_host_paths(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    blueprint = tmp_path / "blueprint"
+    _node(blueprint, "base.md", "# Base\n", lean="Project.base")
+    lean_root = tmp_path / "lean"
+    lean_root.mkdir()
+    outside = tmp_path / "Outside.lean"
+    outside.write_text("def Project.base : Nat := 0\n", encoding="utf-8")
+    try:
+        (lean_root / "Linked.lean").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    assert main(["check", str(blueprint), "--lean-root", str(lean_root)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "error: Lean sources could not be indexed: "
+        "unsafe Lean source Linked.lean: symbolic links are not supported\n"
+    )
+    assert str(tmp_path) not in captured.out
+
+
 def test_a_chapter_directory_with_no_chapter_page_is_refused(tmp_path: Path) -> None:
     """The layout decides what the book is, so check has to assert it.
 

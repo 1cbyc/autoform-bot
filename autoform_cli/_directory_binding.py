@@ -1,4 +1,4 @@
-"""Retain and verify one lexical absolute directory generation."""
+"""Retain and verify one directory root generation."""
 
 from __future__ import annotations
 
@@ -16,76 +16,57 @@ DIRECTORY_BINDING_SUPPORTED = (
     and os.stat in getattr(os, "supports_follow_symlinks", ())
 )
 
-_DIRECTORY_FLAGS = (
+_ROOT_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_DIRECTORY", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
     | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
 )
+
+
+class DirectoryChangedError(OSError):
+    """The directory root changed while it was opened or verified; a retry may succeed."""
 
 
 @dataclass(slots=True)
 class RetainedDirectory:
-    """A lexical absolute directory chain retained by open descriptors."""
+    """A directory root retained by one open descriptor."""
 
     path: Path
-    descriptors: tuple[int, ...]
-    identities: tuple[tuple[int, int], ...]
+    _descriptor: int
+    _identity: tuple[int, int]
     _closed: bool = False
 
     @property
     def descriptor(self) -> int:
         if self._closed:
             raise OSError("directory binding is closed")
-        return self.descriptors[-1]
+        return self._descriptor
 
     @property
     def identity(self) -> tuple[int, int]:
         if self._closed:
             raise OSError("directory binding is closed")
-        return self.identities[-1]
+        return self._identity
 
     def verify(self) -> None:
-        """Verify that every retained component still selects its bound inode."""
+        """Verify that the path still names the retained directory."""
 
-        if self._closed or len(self.descriptors) != len(self.identities):
-            raise OSError("directory binding is incomplete")
-        anchor = self.path.anchor
-        if not anchor:
-            raise OSError("directory path is not absolute")
-        opened = os.fstat(self.descriptors[0])
-        named = os.stat(anchor, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(opened.st_mode)
-            or not stat.S_ISDIR(named.st_mode)
-            or (opened.st_dev, opened.st_ino) != self.identities[0]
-            or (named.st_dev, named.st_ino) != self.identities[0]
+        if self._closed:
+            raise OSError("directory binding is closed")
+        if not _same_directory(
+            os.fstat(self._descriptor),
+            os.stat(self.path, follow_symlinks=False),
+            self._identity,
         ):
-            raise OSError("directory anchor changed")
-        for index, part in enumerate(self.path.parts[1:], start=1):
-            opened = os.fstat(self.descriptors[index])
-            named = os.stat(
-                part,
-                dir_fd=self.descriptors[index - 1],
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or not stat.S_ISDIR(named.st_mode)
-                or (opened.st_dev, opened.st_ino) != self.identities[index]
-                or (named.st_dev, named.st_ino) != self.identities[index]
-            ):
-                raise OSError("directory component changed")
+            raise DirectoryChangedError("directory root changed")
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        for descriptor in reversed(self.descriptors):
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+        _close_quietly(self._descriptor)
 
     def __del__(self) -> None:
         self.close()
@@ -99,63 +80,78 @@ def lexical_absolute_path(path: str | Path) -> Path:
 
 
 def open_directory(path: str | Path) -> RetainedDirectory:
-    """Bind every component of *path* without following symbolic links."""
+    """Open *path* as a retained directory root.
+
+    The kernel resolves the ancestors, so they may be symbolic links and need
+    only search permission.  The root itself must not be a symbolic link.
+    """
 
     if not DIRECTORY_BINDING_SUPPORTED:
         raise OSError("this platform cannot retain directory descriptors safely")
     absolute = lexical_absolute_path(path)
-    descriptors: list[int] = []
-    identities: list[tuple[int, int]] = []
     try:
-        anchor = absolute.anchor
-        if not anchor:
-            raise OSError("directory path is not absolute")
-        descriptor = os.open(anchor, _DIRECTORY_FLAGS)
-        descriptors.append(descriptor)
+        descriptor = os.open(absolute, _ROOT_FLAGS)
+    except ValueError as error:
+        raise OSError("directory path is invalid") from error
+    except OSError as error:
+        raise _open_failure(absolute, error) from error
+    binding: RetainedDirectory | None = None
+    try:
         opened = os.fstat(descriptor)
-        named = os.stat(anchor, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(opened.st_mode)
-            or not stat.S_ISDIR(named.st_mode)
-            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
-        ):
-            raise OSError("directory anchor changed")
-        identities.append((opened.st_dev, opened.st_ino))
-        for part in absolute.parts[1:]:
-            expected = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
-            if not stat.S_ISDIR(expected.st_mode):
-                raise OSError("directory component is not a directory")
-            child = os.open(part, _DIRECTORY_FLAGS, dir_fd=descriptor)
-            descriptors.append(child)
-            opened = os.fstat(child)
-            named = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
-            identity = (opened.st_dev, opened.st_ino)
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or identity != (expected.st_dev, expected.st_ino)
-                or identity != (named.st_dev, named.st_ino)
-            ):
-                raise OSError("directory component changed")
-            identities.append(identity)
-            descriptor = child
-        binding = RetainedDirectory(absolute, tuple(descriptors), tuple(identities))
-        binding.verify()
-        return binding
-    except BaseException as error:
-        for descriptor in reversed(descriptors):
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if isinstance(error, (OSError, ValueError, NotImplementedError)):
-            raise OSError(
-                "directory path must not contain a symbolic link or change while opening"
-            ) from error
-        raise
+        named = os.stat(absolute, follow_symlinks=False)
+        identity = (opened.st_dev, opened.st_ino)
+        if _same_directory(opened, named, identity):
+            binding = RetainedDirectory(absolute, descriptor, identity)
+    except OSError as error:
+        raise DirectoryChangedError("directory root changed while it was opened") from error
+    finally:
+        if binding is None:
+            _close_quietly(descriptor)
+    if binding is None:
+        raise DirectoryChangedError("directory root changed while it was opened")
+    return binding
+
+
+def _same_directory(
+    opened: os.stat_result,
+    named: os.stat_result,
+    identity: tuple[int, int],
+) -> bool:
+    return (
+        stat.S_ISDIR(opened.st_mode)
+        and stat.S_ISDIR(named.st_mode)
+        and (opened.st_dev, opened.st_ino) == identity
+        and (named.st_dev, named.st_ino) == identity
+    )
+
+
+def _open_failure(path: Path, error: OSError) -> OSError:
+    """Name why the root was refused without echoing the host path."""
+
+    try:
+        if stat.S_ISLNK(os.stat(path, follow_symlinks=False).st_mode):
+            return OSError("directory root must not be a symbolic link")
+    except (OSError, ValueError):
+        pass
+    if isinstance(error, PermissionError):
+        return OSError("permission denied while opening the directory root")
+    if isinstance(error, FileNotFoundError):
+        return OSError("directory root does not exist")
+    if isinstance(error, NotADirectoryError):
+        return OSError("directory root is not a directory")
+    return OSError("directory root cannot be opened")
+
+
+def _close_quietly(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 __all__ = [
     "DIRECTORY_BINDING_SUPPORTED",
+    "DirectoryChangedError",
     "RetainedDirectory",
     "lexical_absolute_path",
     "open_directory",

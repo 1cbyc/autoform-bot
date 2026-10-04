@@ -16,7 +16,7 @@ from pathlib import Path
 from . import status
 from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, GraphValidationError, Node, load_graph
-from .lean import SourceIndex, declaration_names, index_project
+from .lean import SourceIndex, declaration_names, index_failure_message, index_project
 from .markdown import FENCE as _FENCE
 from .markdown import frontmatter_end as _frontmatter_end
 from .markdown import HEADING as _HEADING
@@ -365,12 +365,12 @@ def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
     findings: list[AuditFinding] = []
     try:
         index = index_project(root)
-    except OSError:
+    except OSError as error:
         return [
             AuditFinding(
                 ".",
                 "unreadable-lean-sources",
-                "Lean sources could not be indexed",
+                index_failure_message(error),
             )
         ]
     spans = _source_spans(index)

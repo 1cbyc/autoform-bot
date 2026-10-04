@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -121,6 +123,29 @@ def test_build_output_is_skipped(tmp_path: Path) -> None:
     index = _index(tmp_path)
 
     assert index.find("vendored") is None
+
+
+def test_case_distinct_build_namespace_is_indexed(tmp_path: Path) -> None:
+    index = _index(tmp_path, "theorem buildResult : True := trivial\n", "Build/Actual.lean")
+
+    assert index.find("buildResult") is not None
+
+
+def test_lowercase_build_directories_are_skipped_at_any_depth(tmp_path: Path) -> None:
+    for relative, name in (
+        ("build/Skipped.lean", "topSkipped"),
+        ("Nested/build/Skipped.lean", "nestedSkipped"),
+        ("Other/Build/Kept.lean", "kept"),
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True)
+        path.write_text(f"def {name} : Nat := 0\n", encoding="utf-8")
+
+    index = index_project(tmp_path)
+
+    assert index.find("topSkipped") is None
+    assert index.find("nestedSkipped") is None
+    assert index.find("kept") is not None
 
 
 def test_hidden_lean_source_directories_are_indexed(tmp_path: Path) -> None:
@@ -354,6 +379,214 @@ def test_source_capture_rejects_mid_capture_change(
     assert changed
 
 
+@pytest.mark.parametrize("portable", [False, True])
+def test_snapshot_retries_a_capture_that_races_one_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    portable: bool,
+) -> None:
+    if portable:
+        monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+    source = tmp_path / "Project" / "Basic.lean"
+    _index(tmp_path, "def before : Nat := 0\n")
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    changed = False
+
+    def change_source_once(event: str, relative: str) -> None:
+        nonlocal changed
+        original_checkpoint(event, relative)
+        if event == "before-final-verification" and not changed:
+            changed = True
+            source.write_text("def after : Nat := 1000\n", encoding="utf-8")
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", change_source_once)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert changed
+    assert snapshot.index.find("after") is not None
+    assert snapshot.index.find("before") is None
+
+
+def test_snapshot_reports_sources_that_keep_changing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "Project" / "Basic.lean"
+    _index(tmp_path, "def churn : Nat := 0\n")
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    edits = 0
+
+    def change_source(event: str, relative: str) -> None:
+        nonlocal edits
+        original_checkpoint(event, relative)
+        if event == "before-final-verification":
+            edits += 1
+            # Each edit also changes the size, so coarse timestamps cannot hide it.
+            source.write_text(f"def churn : Nat := {'1' * (edits + 1)}\n", encoding="utf-8")
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", change_source)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+
+    with pytest.raises(lean_module.LeanSourceError, match="Lean sources kept changing while they were indexed"):
+        snapshot_project_sources(tmp_path)
+
+    assert edits == lean_module._SNAPSHOT_ATTEMPTS
+
+
+def test_snapshot_retries_a_root_replaced_while_it_is_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not (
+        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
+        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
+    ):
+        pytest.skip("directory descriptor capture is unavailable")
+    project = tmp_path / "project"
+    _index(project, "def canonical : Nat := 0\n")
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    original_stat = os.stat
+    swapped = False
+
+    def stat_once_replaced(path, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and os.fspath(path) == os.fspath(project) and kwargs.get("follow_symlinks") is False:
+            swapped = True
+            return original_stat(replacement, *args, **kwargs)
+        return original_stat(path, *args, **kwargs)
+
+    original_bind = lean_module.bind_project_sources
+    attempts = 0
+
+    def counted_bind(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+    with monkeypatch.context() as context:
+        context.setattr(directory_binding_module.os, "stat", stat_once_replaced)
+        snapshot = snapshot_project_sources(project)
+
+    assert swapped
+    assert attempts == 2
+    assert snapshot.index.find("canonical") is not None
+
+
+@pytest.mark.parametrize("failure", ["io-error", "recursion"])
+@pytest.mark.parametrize("portable", [False, True])
+def test_lasting_capture_failure_is_reported_without_retrying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    portable: bool,
+    failure: str,
+) -> None:
+    if portable:
+        monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+    elif not (
+        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
+        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
+    ):
+        pytest.skip("directory descriptor capture is unavailable")
+    _index(tmp_path, "def canonical : Nat := 0\n")
+
+    def fail_read(*_args, **_kwargs):
+        if failure == "io-error":
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(
+        tree_snapshot_module,
+        "_read_portable_file" if portable else "_read_file",
+        fail_read,
+    )
+    original_bind = lean_module.bind_project_sources
+    attempts = 0
+
+    def counted_bind(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    reason = (
+        f"directory tree could not be read: {os.strerror(errno.EIO)}"
+        if failure == "io-error"
+        else "directory tree is nested too deeply to capture"
+    )
+
+    with pytest.raises(lean_module.LeanSourceError, match=rf"^{re.escape(reason)}$"):
+        snapshot_project_sources(tmp_path)
+
+    assert attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("relative", "directory"),
+    [("Project/Secret.lean", False), ("Project/Private", True)],
+)
+@pytest.mark.parametrize("portable", [False, True])
+def test_unreadable_lean_source_is_named_by_its_relative_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    portable: bool,
+    relative: str,
+    directory: bool,
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses file permissions")
+    if portable:
+        monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+    _index(tmp_path, "def canonical : Nat := 0\n")
+    secret = tmp_path / relative
+    if directory:
+        secret.mkdir()
+        (secret / "Hidden.lean").write_text("def hidden : Nat := 0\n", encoding="utf-8")
+    else:
+        secret.write_text("def secret : Nat := 0\n", encoding="utf-8")
+    secret.chmod(0)
+    try:
+        if os.access(secret, os.R_OK):
+            pytest.skip("read permission is not enforced")
+        with pytest.raises(lean_module.LeanSourceError, match=rf"^permission denied: {re.escape(relative)}$") as caught:
+            snapshot_project_sources(tmp_path)
+    finally:
+        secret.chmod(0o755 if directory else 0o644)
+
+    assert str(tmp_path) not in str(caught.value)
+
+
+def test_unsupported_entry_name_is_reported_without_retrying(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("backslashes separate Windows path components")
+    _index(tmp_path, "def canonical : Nat := 0\n")
+    try:
+        (tmp_path / "Project" / "Odd\\Name.lean").write_text("def odd : Nat := 0\n", encoding="utf-8")
+    except OSError:
+        pytest.skip("backslashes in file names are unavailable")
+    original_bind = lean_module.bind_project_sources
+    attempts = 0
+
+    def counted_bind(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+
+    with pytest.raises(lean_module.LeanSourceError, match="directory tree contains an unsupported entry name"):
+        snapshot_project_sources(tmp_path)
+
+    assert attempts == 1
+
+
 def test_portable_binding_rejects_a_replacement_root_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -525,7 +758,7 @@ def test_portable_capture_does_not_require_path_stat_no_follow(
     assert snapshot.index.find("portable") is not None
 
 
-def test_portable_capture_rejects_repeatable_nested_directory_redirection(
+def test_portable_capture_rejects_an_unrestored_nested_directory_redirection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -574,6 +807,88 @@ def test_portable_capture_rejects_repeatable_nested_directory_redirection(
     finally:
         restore()
         bound.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=pytest.fail.Exception,
+    reason=(
+        "the portable fallback is best effort: a redirection restored before the "
+        "directory is re-examined, with its times reset, is not detected"
+    ),
+)
+def test_portable_capture_rejects_a_restored_nested_directory_redirection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        (tmp_path / "symlink-probe").symlink_to("target", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    root = tmp_path / "project"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "Local.lean").write_text("def local : Nat := 0\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Escaped.lean").write_text("def escaped : Nat := 0\n", encoding="utf-8")
+    displaced = root / "nested-displaced"
+    redirected = 0
+    restored = 0
+
+    def restore() -> None:
+        nonlocal restored
+        if nested.is_symlink():
+            nested.unlink()
+            displaced.rename(nested)
+            restored += 1
+
+    original_names = tree_snapshot_module._capture_path_names
+    original_read = tree_snapshot_module._read_portable_file
+    original_signature = tree_snapshot_module._stat_signature
+
+    def redirect_then_list(directory, **kwargs):
+        nonlocal redirected
+        if os.fspath(directory) == os.fspath(nested) and not nested.is_symlink():
+            nested.rename(displaced)
+            nested.symlink_to(outside, target_is_directory=True)
+            redirected += 1
+        return original_names(directory, **kwargs)
+
+    def read_then_restore(path, *args, **kwargs):
+        data = original_read(path, *args, **kwargs)
+        restore()
+        return data
+
+    def coarse_directory_signature(metadata):
+        signature = original_signature(metadata)
+        if stat.S_ISDIR(metadata.st_mode):
+            return (*signature[:3], 0, 0, 0, 0)
+        return signature
+
+    monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+    monkeypatch.setattr(tree_snapshot_module, "_capture_path_names", redirect_then_list)
+    monkeypatch.setattr(tree_snapshot_module, "_read_portable_file", read_then_restore)
+    monkeypatch.setattr(tree_snapshot_module, "_stat_signature", coarse_directory_signature)
+    bound = BoundDirectoryTree(
+        root,
+        selection=TreeSelection(include=lambda _path, _mode: True, descend=lambda _path: True),
+    )
+    try:
+        try:
+            snapshot = bound.capture()
+        except TreeSnapshotError as error:
+            assert "changed while it was captured" in str(error)
+            return
+        staged = (redirected, restored)
+    finally:
+        restore()
+        bound.close()
+
+    # The xfail must come from an undetected redirection, not a broken setup.
+    assert staged == (2, 2)
+    assert ("nested/Escaped.lean", b"def escaped : Nat := 0\n") in snapshot.files
+    pytest.fail("a restored nested directory redirection was not detected")
 
 
 def test_portable_capture_rejects_a_file_swapped_to_fifo_without_blocking(
@@ -645,26 +960,96 @@ def test_source_binding_normalizes_an_invalid_exclusion_path(
         snapshot_project_sources(tmp_path, exclude_roots=("bad\0name",))
 
 
-def test_directory_binding_does_not_normalize_away_a_symlink(
+def test_directory_binding_resolves_dot_dot_after_a_symlinked_ancestor_physically(
     tmp_path: Path,
 ) -> None:
     if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
         pytest.skip("directory descriptors are unavailable")
     holder = tmp_path / "holder"
-    holder.mkdir()
-    (holder / "target").mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
+    (holder / "target").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "inner").mkdir(parents=True)
+    (elsewhere / "target").mkdir()
     try:
-        (holder / "link").symlink_to(outside, target_is_directory=True)
+        (holder / "link").symlink_to(elsewhere / "inner", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    physical = (elsewhere / "target").stat()
+    lexical = (holder / "target").stat()
+
+    binding = directory_binding_module.open_directory(holder / "link" / ".." / "target")
+    try:
+        assert binding.identity == (physical.st_dev, physical.st_ino)
+        assert binding.identity != (lexical.st_dev, lexical.st_ino)
+    finally:
+        binding.close()
+
+
+def test_directory_binding_refuses_a_symlinked_root(tmp_path: Path) -> None:
+    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
+        pytest.skip("directory descriptors are unavailable")
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(real, target_is_directory=True)
     except OSError:
         pytest.skip("symlinks are unavailable")
 
-    with pytest.raises(OSError, match="must not contain a symbolic link"):
-        directory_binding_module.open_directory(holder / "link" / ".." / "target")
+    with pytest.raises(OSError, match="directory root must not be a symbolic link"):
+        directory_binding_module.open_directory(alias)
 
 
-def test_directory_binding_closes_descriptors_after_invalid_path(
+def test_directory_binding_accepts_a_symlinked_ancestor(tmp_path: Path) -> None:
+    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
+        pytest.skip("directory descriptors are unavailable")
+    real = tmp_path / "real"
+    project = real / "project"
+    _index(project, "def throughAncestorLink : Nat := 0\n")
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    expected = project.stat()
+
+    binding = directory_binding_module.open_directory(alias / "project")
+    try:
+        assert binding.identity == (expected.st_dev, expected.st_ino)
+        binding.verify()
+    finally:
+        binding.close()
+    snapshot = snapshot_project_sources(alias / "project")
+
+    assert snapshot.index.find("throughAncestorLink") is not None
+
+
+def test_directory_binding_needs_only_search_permission_on_ancestors(
+    tmp_path: Path,
+) -> None:
+    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
+        pytest.skip("directory descriptors are unavailable")
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions")
+    ancestor = tmp_path / "search-only"
+    project = ancestor / "project"
+    _index(project, "def searchOnlyAncestor : Nat := 0\n")
+    ancestor.chmod(0o311)
+    try:
+        if os.access(ancestor, os.R_OK):
+            pytest.skip("directory read permission is not enforced")
+        binding = directory_binding_module.open_directory(project)
+        binding.close()
+        snapshot = snapshot_project_sources(project)
+        index = index_project(project)
+    finally:
+        ancestor.chmod(0o755)
+
+    assert snapshot.index.find("searchOnlyAncestor") is not None
+    assert index.find("searchOnlyAncestor") is not None
+
+
+def test_directory_binding_rejects_an_invalid_path_without_opening_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -673,7 +1058,38 @@ def test_directory_binding_closes_descriptors_after_invalid_path(
     parent = tmp_path / "parent"
     parent.mkdir()
     original_open = os.open
+    opened: list[int] = []
+
+    def tracked_open(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    try:
+        with monkeypatch.context() as context:
+            context.setattr(directory_binding_module.os, "open", tracked_open)
+            with pytest.raises(OSError, match="directory path is invalid"):
+                directory_binding_module.open_directory(parent / "bad\0name")
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+
+    assert opened == []
+
+
+def test_directory_binding_closes_its_descriptor_when_the_root_changes_while_opening(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
+        pytest.skip("directory descriptors are unavailable")
+    root = tmp_path / "root"
+    root.mkdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    original_open = os.open
     original_close = os.close
+    original_stat = os.stat
     opened: list[int] = []
     closed: list[int] = []
 
@@ -686,20 +1102,25 @@ def test_directory_binding_closes_descriptors_after_invalid_path(
         closed.append(descriptor)
         original_close(descriptor)
 
+    def replaced_stat(path, *args, **kwargs):
+        if os.fspath(path) == os.fspath(root):
+            return original_stat(replacement, *args, **kwargs)
+        return original_stat(path, *args, **kwargs)
+
     leaked: list[int] = []
     try:
         with monkeypatch.context() as context:
             context.setattr(directory_binding_module.os, "open", tracked_open)
             context.setattr(directory_binding_module.os, "close", tracked_close)
-            for _attempt in range(20):
-                with pytest.raises(OSError, match="must not contain a symbolic link"):
-                    directory_binding_module.open_directory(parent / "bad\0name")
+            context.setattr(directory_binding_module.os, "stat", replaced_stat)
+            with pytest.raises(OSError, match="directory root changed while it was opened"):
+                directory_binding_module.open_directory(root)
         leaked = [descriptor for descriptor in opened if descriptor not in closed]
     finally:
         for descriptor in leaked:
             original_close(descriptor)
 
-    assert opened
+    assert len(opened) == 1
     assert leaked == []
 
 
@@ -931,26 +1352,71 @@ def test_lean_symlink_is_rejected(tmp_path: Path) -> None:
         index_project(tmp_path)
 
 
-def test_portable_source_scanner_rejects_a_directory_reparse_point(
+def test_editor_lock_lean_symlinks_are_skipped(tmp_path: Path) -> None:
+    _index(tmp_path, "def canonical : Nat := 0\n")
+    before = snapshot_project_sources(tmp_path)
+    project = tmp_path / "Project"
+    try:
+        (project / ".#Basic.lean").symlink_to("editor@host.1234:1700000000")
+        (project / ".#Live.lean").symlink_to(project / "Basic.lean")
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    after = snapshot_project_sources(tmp_path)
+
+    assert after.index.find("canonical").path == Path("Project/Basic.lean")
+    assert after.index.line_counts == {Path("Project/Basic.lean"): 1}
+    assert after.generation_revision == before.generation_revision
+
+
+@pytest.mark.parametrize("target", ["Basic.lean", "Moved.lean"], ids=["live", "dangling"])
+def test_lean_symlink_is_refused_whether_or_not_its_target_exists(tmp_path: Path, target: str) -> None:
+    _index(tmp_path, "def canonical : Nat := 0\n")
+    project = tmp_path / "Project"
+    try:
+        (project / "Old.lean").symlink_to(project / target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    with pytest.raises(
+        lean_module.LeanSourceError,
+        match=r"^unsafe Lean source Project/Old\.lean: symbolic links are not supported$",
+    ) as caught:
+        snapshot_project_sources(tmp_path)
+
+    assert str(tmp_path) not in str(caught.value)
+
+
+def test_portable_source_scanner_does_not_descend_into_a_directory_reparse_point(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _index(tmp_path, "def canonical : Nat := 0\n")
     source = tmp_path / "Src"
     source.mkdir()
     (source / "Hidden.lean").write_text("def hidden : Nat := 0\n", encoding="utf-8")
     source_identity = (source.stat().st_dev, source.stat().st_ino)
     original = tree_snapshot_module._is_reparse_point
+    original_readlink = os.readlink
 
     def mark_source(metadata) -> bool:
         return (metadata.st_dev, metadata.st_ino) == source_identity or original(metadata)
+
+    def read_junction(path, *args, **kwargs):
+        if Path(path).name == "Src":
+            return "elsewhere"
+        return original_readlink(path, *args, **kwargs)
 
     monkeypatch.setattr(
         directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
     )
     monkeypatch.setattr(tree_snapshot_module, "_is_reparse_point", mark_source)
+    monkeypatch.setattr(tree_snapshot_module.os, "readlink", read_junction)
 
-    with pytest.raises(OSError, match="directory tree changed while it was captured"):
-        index_project(tmp_path)
+    index = index_project(tmp_path)
+
+    assert index.find("canonical") is not None
+    assert index.find("hidden") is None
 
 
 def test_source_digest_preserves_surrogate_escaped_filename_bytes(tmp_path: Path) -> None:
@@ -996,6 +1462,7 @@ def test_oversized_publication_manifest_read_is_bounded(
     (generated / "publication.json").write_bytes(
         b"x" * (lean_module._PUBLICATION_MANIFEST_BYTE_LIMIT + 4096)
     )
+    (generated / "Kept.lean").write_text("def keptBesideOversized : Nat := 0\n", encoding="utf-8")
     observed_lengths: list[int] = []
     original = lean_module._is_publication_manifest_bytes
 
@@ -1005,10 +1472,11 @@ def test_oversized_publication_manifest_read_is_bounded(
 
     monkeypatch.setattr(lean_module, "_is_publication_manifest_bytes", record_length)
 
-    with pytest.raises(OSError, match="publication manifest exceeds"):
-        index_project(tmp_path)
+    index = index_project(tmp_path)
 
     assert observed_lengths == [lean_module._PUBLICATION_MANIFEST_BYTE_LIMIT + 1]
+    assert index.find("canonical") is not None
+    assert index.find("keptBesideOversized") is not None
 
 
 @pytest.mark.parametrize("manifest_name", ["publication.json", "manifest.json"])
@@ -1091,7 +1559,9 @@ def test_publication_marker_survives_case_alias(tmp_path: Path) -> None:
     assert index.find("copiedThroughMarkerAlias") is None
 
 
-def test_portably_ambiguous_publication_markers_fail_closed(tmp_path: Path) -> None:
+def test_portably_ambiguous_publication_markers_leave_the_directory_indexed(
+    tmp_path: Path,
+) -> None:
     _index(tmp_path, "def canonical : Nat := 0\n")
     generated = tmp_path / "generated"
     generated.mkdir()
@@ -1101,12 +1571,17 @@ def test_portably_ambiguous_publication_markers_fail_closed(tmp_path: Path) -> N
     upper.write_text("{}\n", encoding="utf-8")
     if lower.samefile(upper):
         pytest.skip("filesystem does not permit case-colliding marker names")
+    (generated / "Copied.lean").write_text("def besideAmbiguity : Nat := 0\n", encoding="utf-8")
 
-    with pytest.raises(OSError, match="ambiguous publication manifests"):
-        index_project(tmp_path)
+    index = index_project(tmp_path)
+
+    assert index.find("canonical") is not None
+    assert index.find("besideAmbiguity") is not None
 
 
-def test_publication_marker_file_and_symlink_alias_fail_closed(tmp_path: Path) -> None:
+def test_publication_marker_file_and_symlink_alias_leave_the_directory_indexed(
+    tmp_path: Path,
+) -> None:
     snapshot = TreeSnapshot(
         root_identity=(1, 1),
         directories=("", "generated"),
@@ -1124,8 +1599,9 @@ def test_publication_marker_file_and_symlink_alias_fail_closed(tmp_path: Path) -
         identities=(),
     )
 
-    with pytest.raises(OSError, match="ambiguous publication manifests"):
-        lean_module._indexed_source_snapshot(tmp_path, snapshot, ())
+    indexed = lean_module._indexed_source_snapshot(tmp_path, snapshot, ())
+
+    assert indexed.index.find("hiddenByAmbiguity") is not None
 
 
 @pytest.mark.parametrize(
@@ -1427,12 +1903,14 @@ def test_large_managed_skeleton_manifest_still_excludes_generated_sources(
     assert index.find("target").path == Path("Actual.lean")
 
 
-def test_oversized_managed_manifest_fails_closed_at_its_read_bound(
+def test_oversized_managed_manifest_leaves_its_directory_indexed_at_its_read_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     packets = tmp_path / "review-packets"
-    packets.mkdir()
+    packet = packets / "node" / "target.lean"
+    packet.parent.mkdir(parents=True)
+    packet.write_text("def oversizedPacket : Nat := 0\n", encoding="utf-8")
     (packets / "manifest.json").write_text(
         json.dumps(
             {
@@ -1444,10 +1922,20 @@ def test_oversized_managed_manifest_fails_closed_at_its_read_bound(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(lean_module, "_MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT", 64)
+    observed_lengths: list[int] = []
+    original = lean_module._is_managed_output_manifest_bytes
 
-    with pytest.raises(OSError, match="managed output manifest exceeds"):
-        index_project(tmp_path)
+    def record_length(data: bytes) -> bool:
+        observed_lengths.append(len(data))
+        return original(data)
+
+    monkeypatch.setattr(lean_module, "_MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT", 64)
+    monkeypatch.setattr(lean_module, "_is_managed_output_manifest_bytes", record_length)
+
+    index = index_project(tmp_path)
+
+    assert observed_lengths == [65]
+    assert index.find("oversizedPacket") is not None
 
 
 def test_anonymous_instances_are_not_mistaken_for_names(tmp_path: Path) -> None:

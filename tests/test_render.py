@@ -10,7 +10,7 @@ import pytest
 
 from autoform_cli.coverage import COVERAGE_DISPOSITIONS
 from autoform_cli.graph import load_graph
-from autoform_cli.lean import _normalize_remote
+from autoform_cli.lean import LeanSourceError, _normalize_remote
 from autoform_cli.render import (
     PUBLICATION_MANIFEST,
     PublicationError,
@@ -662,12 +662,24 @@ def test_refuses_overlapping_source_and_output(tmp_path: Path, destination: str)
         render_site(blueprint, output)
 
 
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (None, "Lean sources could not be indexed"),
+        (
+            "permission denied: Project/Secret.lean",
+            "Lean sources could not be indexed: permission denied: Project/Secret.lean",
+        ),
+    ],
+)
 def test_render_translates_source_index_io_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str | None, message: str
 ) -> None:
     project = _project(tmp_path)
 
     def fail_linker(root: Path, **kwargs: object):
+        if reason is not None:
+            raise LeanSourceError(reason)
         raise OSError(f"private host detail: {root}")
 
     monkeypatch.setattr("autoform_cli.render.build_linker", fail_linker)
@@ -675,7 +687,7 @@ def test_render_translates_source_index_io_failure(
     with pytest.raises(PublicationError) as error:
         render_site(project / "blueprint", tmp_path / "out", lean_root=project)
 
-    assert error.value.issues == ("Lean sources could not be indexed",)
+    assert error.value.issues == (message,)
     assert str(tmp_path) not in str(error.value)
 
 

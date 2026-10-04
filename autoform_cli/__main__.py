@@ -18,7 +18,7 @@ from .audit import audit_blueprint
 from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
 from .doctor import diagnose_project
 from .graph import GraphValidationError, load_graph
-from .lean import build_linker, declaration_names
+from .lean import build_linker, declaration_names, index_failure_message
 from .project import ProjectCatalogError, inspect_project, load_release_catalog
 from .render import PublicationError, render_site
 from .scaffold import ScaffoldError, scaffold_project
@@ -259,8 +259,8 @@ def _check(args: argparse.Namespace) -> int:
     if args.lean_root is not None:
         try:
             linker = build_linker(args.lean_root)
-        except OSError:
-            print("error: Lean sources could not be indexed")
+        except OSError as error:
+            print(f"error: {index_failure_message(error)}")
             return 1
 
     statuses = status.derive(graph)

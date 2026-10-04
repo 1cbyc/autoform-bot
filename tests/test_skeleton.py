@@ -17,7 +17,7 @@ import pytest
 import psutil
 
 from autoform_cli.__main__ import main
-from autoform_cli.lean import PACKET_SCHEMA, PASSAGE_SCHEMA, index_project
+from autoform_cli.lean import PACKET_SCHEMA, PASSAGE_SCHEMA, LeanSourceError, index_project
 from autoform_cli.skeleton import (
     DeclarationSkeleton,
     NodeSkeleton,
@@ -1223,9 +1223,19 @@ def test_custom_runner_rejects_sources_changed_during_probe(tmp_path: Path) -> N
         extract_skeletons(blueprint, lean_root=project, runner=changing_runner)
 
 
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (None, "Lean sources could not be indexed"),
+        (
+            "permission denied: Project/Secret.lean",
+            "Lean sources could not be indexed: permission denied: Project/Secret.lean",
+        ),
+    ],
+)
 @pytest.mark.parametrize("failure_call", (1, 2))
 def test_extraction_translates_source_index_io_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_call: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_call: int, reason: str | None, message: str
 ) -> None:
     project = _project(tmp_path)
     blueprint = _blueprint(tmp_path, lean={"determined": "Skel.observation_determined"})
@@ -1236,6 +1246,8 @@ def test_extraction_translates_source_index_io_failure(
         nonlocal calls
         calls += 1
         if calls == failure_call:
+            if reason is not None:
+                raise LeanSourceError(reason)
             raise OSError(f"private host detail: {root}")
         return real_index_project(root)
 
@@ -1248,7 +1260,7 @@ def test_extraction_translates_source_index_io_failure(
             runner=lambda probe, root: _fake_probe_output(),
         )
 
-    assert error.value.issues == ("Lean sources could not be indexed",)
+    assert error.value.issues == (message,)
     assert str(tmp_path) not in str(error.value)
     assert calls == failure_call
 

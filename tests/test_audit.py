@@ -7,6 +7,7 @@ import pytest
 
 import autoform_cli.audit as audit_module
 from autoform_cli.audit import audit_blueprint
+from autoform_cli.lean import LeanSourceError
 
 
 def _ensure_chapter(blueprint: Path, relative: str) -> None:
@@ -494,8 +495,18 @@ def test_audit_measures_source_spans_from_the_captured_index(
     ]
 
 
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        (None, "Lean sources could not be indexed"),
+        (
+            "permission denied: Project/Secret.lean",
+            "Lean sources could not be indexed: permission denied: Project/Secret.lean",
+        ),
+    ],
+)
 def test_audit_reports_source_index_io_failure_without_host_details(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str | None, message: str
 ) -> None:
     blueprint = tmp_path / "blueprint"
     _coverage(blueprint)
@@ -504,6 +515,8 @@ def test_audit_reports_source_index_io_failure_without_host_details(
     lean_root.mkdir()
 
     def fail_index(root: Path):
+        if reason is not None:
+            raise LeanSourceError(reason)
         raise OSError(f"private host detail: {root}")
 
     monkeypatch.setattr(audit_module, "index_project", fail_index)
@@ -511,7 +524,7 @@ def test_audit_reports_source_index_io_failure_without_host_details(
     result = audit_blueprint(blueprint, lean_root=lean_root)
 
     assert [(finding.article_path, finding.code, finding.reason) for finding in result.findings] == [
-        (".", "unreadable-lean-sources", "Lean sources could not be indexed")
+        (".", "unreadable-lean-sources", message)
     ]
     assert str(tmp_path) not in result.to_json()
 

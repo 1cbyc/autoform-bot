@@ -18,6 +18,7 @@ import os
 import re
 import stat
 import subprocess
+import time
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from pathlib import Path, PurePosixPath
 from . import _directory_binding as directory_binding
 from ._tree_snapshot import (
     BoundDirectoryTree,
+    TreeChangedError,
     TreeSelection,
     TreeSnapshot,
     TreeSnapshotError,
@@ -48,10 +50,11 @@ _IGNORED_DIRECTORIES = frozenset(
         ".obsidian",
         ".trash",
         ".venv",
-        "build",
         "lake-packages",
     }
 )
+# ``Build`` can be a Lean namespace directory, so only this spelling is ignored.
+_EXACT_IGNORED_DIRECTORIES = frozenset({"build"})
 _IGNORED_DIRECTORY_PREFIXES = (".autoform-publication-",)
 _PUBLICATION_MANIFEST = "publication.json"
 _PUBLICATION_SCHEMAS = frozenset({"autoform-publication/v1", "autoform-publication/v2"})
@@ -67,6 +70,8 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
 )
 _DESCRIPTOR_LISTING_SUPPORTED = os.listdir in getattr(os, "supports_fd", ())
+_SNAPSHOT_ATTEMPTS = 3
+_SNAPSHOT_RETRY_DELAY_SECONDS = 0.05
 #: Known schemas of the skeleton command's packet and passage manifests.
 PACKET_SCHEMA = "autoform-skeleton-packets/v2"
 PASSAGE_SCHEMA = "autoform-skeleton-passages/v2"
@@ -148,6 +153,26 @@ class BoundProjectSources:
         self.tree.close()
 
 
+class LeanSourceError(OSError):
+    """Lean sources could not be indexed; the reason names only project-relative paths."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            "".join(
+                character if character.isprintable() else character.encode("unicode_escape").decode("ascii")
+                for character in reason
+            )
+        )
+
+
+def index_failure_message(error: OSError) -> str:
+    """Describe an indexing failure without exposing host paths."""
+
+    if isinstance(error, LeanSourceError):
+        return f"Lean sources could not be indexed: {error}"
+    return "Lean sources could not be indexed"
+
+
 def index_project(
     root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
 ) -> SourceIndex:
@@ -187,13 +212,25 @@ def _remap_resolved_root_exclusion(
 def snapshot_project_sources(
     root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
 ) -> IndexedSourceSnapshot:
-    """Read each Lean source once and derive its index and revision together."""
+    """Read each Lean source once and derive its index and revision together.
 
-    with bind_project_sources(root, exclude_roots=exclude_roots) as bound:
+    A bind or capture that races a concurrent edit is retried a bounded number
+    of times.
+    """
+
+    exclusions = tuple(exclude_roots)
+    changed: TreeChangedError | None = None
+    for attempt in range(_SNAPSHOT_ATTEMPTS):
+        if attempt:
+            time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS * attempt)
         try:
-            return bound.capture()
+            with bind_project_sources(root, exclude_roots=exclusions) as bound:
+                return bound.capture()
+        except TreeChangedError as error:
+            changed = error
         except TreeSnapshotError as error:
-            raise OSError(str(error)) from error
+            raise LeanSourceError(str(error)) from error
+    raise LeanSourceError("Lean sources kept changing while they were indexed") from changed
 
 
 def project_source_revision(
@@ -223,14 +260,20 @@ def open_project_sources(
     *,
     exclude_roots: Iterable[str | Path] = (),
 ) -> BoundProjectSources:
-    """Open a retained Lean source root; the caller must close it."""
+    """Open a retained Lean source root; the caller must close it.
+
+    A root that changes while it is bound raises ``TreeChangedError``, which a
+    retry may clear.
+    """
 
     root_path = directory_binding.lexical_absolute_path(root)
     exclusion_paths = tuple(Path(value).expanduser() for value in exclude_roots)
     try:
         tree = BoundDirectoryTree(root_path)
+    except TreeChangedError:
+        raise
     except TreeSnapshotError as error:
-        raise OSError(str(error)) from error
+        raise LeanSourceError(str(error)) from error
     try:
         excluded = _project_exclusions(
             root_path,
@@ -331,6 +374,7 @@ def _lean_path_is_excluded(
     folded_parts = _folded_path(relative)
     return (
         bool(_IGNORED_DIRECTORIES.intersection(folded_parts))
+        or bool(_EXACT_IGNORED_DIRECTORIES.intersection(relative.parts))
         or any(
             part.startswith(_IGNORED_DIRECTORY_PREFIXES) for part in folded_parts
         )
@@ -374,9 +418,10 @@ def _indexed_source_snapshot(
     for relative in snapshot.directories:
         add_manifest(relative, "directory")
 
+    # An unrecognized manifest marks nothing; its directory stays Lean source.
     manifest_groups = (
-        ("publication", publication_manifests, _is_publication_manifest_bytes),
-        ("managed output", managed_output_manifests, _is_managed_output_manifest_bytes),
+        (publication_manifests, _is_publication_manifest_bytes),
+        (managed_output_manifests, _is_managed_output_manifest_bytes),
     )
     ignored_roots: set[PurePosixPath] = set()
     for parent in sorted(
@@ -385,8 +430,7 @@ def _indexed_source_snapshot(
     ):
         if _path_is_within_roots(parent, ignored_roots):
             continue
-        recognized = False
-        for _label, groups, recognizes in manifest_groups:
+        for groups, recognizes in manifest_groups:
             manifests = groups.get(parent)
             if (
                 manifests is not None
@@ -395,35 +439,31 @@ def _indexed_source_snapshot(
                 and manifests[0][1] is not None
                 and recognizes(manifests[0][1])
             ):
-                recognized = True
+                ignored_roots.add(parent)
                 break
-        if recognized:
-            ignored_roots.add(parent)
-            continue
-        for label, groups, _recognizes in manifest_groups:
-            manifests = groups.get(parent)
-            if manifests is None:
-                continue
-            if len(manifests) != 1:
-                raise OSError(f"ambiguous {label} manifests in {parent.as_posix()}")
-            kind, data = manifests[0]
-            if kind != "file" or data is None:
-                raise OSError(
-                    f"{label} manifest is not a regular file in {parent.as_posix()}"
-                )
 
     def in_ignored_root(relative_text: str) -> bool:
         return _path_is_within_roots(PurePosixPath(relative_text), ignored_roots)
 
+    # Editor lock links (``.#Name.lean``) are never read, so they are skipped;
+    # any other ``.lean`` link, live or dangling, is refused.
+    tolerated_links = frozenset(
+        relative
+        for relative, _target in snapshot.symlinks
+        if PurePosixPath(relative).suffix.casefold() == ".lean"
+        and not in_ignored_root(relative)
+        and PurePosixPath(relative).name.startswith(".#")
+    )
     unsupported = [
         (relative, reason)
         for relative, reason in snapshot.unsupported_entries()
         if not in_ignored_root(relative)
         and PurePosixPath(relative).suffix.casefold() == ".lean"
+        and relative not in tolerated_links
     ]
     if unsupported:
         relative, reason = unsupported[0]
-        raise OSError(f"unsafe Lean source {relative}: {reason}")
+        raise LeanSourceError(f"unsafe Lean source {relative}: {reason}")
 
     declarations: dict[str, Declaration] = {}
     line_counts: dict[Path, int] = {}
@@ -455,13 +495,14 @@ def _indexed_source_snapshot(
             line_counts=line_counts,
         ),
         source_digest,
-        _lean_generation_revision(snapshot, ignored_roots),
+        _lean_generation_revision(snapshot, ignored_roots, tolerated_links),
     )
 
 
 def _lean_generation_revision(
     snapshot: TreeSnapshot,
     ignored_roots: set[PurePosixPath],
+    tolerated_links: frozenset[str],
 ) -> str:
     """Hash only effective Lean inputs and their ancestor directories."""
 
@@ -473,7 +514,11 @@ def _lean_generation_revision(
         )
 
     files = tuple(entry for entry in snapshot.files if retained_entry(entry[0]))
-    symlinks = tuple(entry for entry in snapshot.symlinks if retained_entry(entry[0]))
+    symlinks = tuple(
+        entry
+        for entry in snapshot.symlinks
+        if retained_entry(entry[0]) and entry[0] not in tolerated_links
+    )
     special = tuple(entry for entry in snapshot.special if retained_entry(entry[0]))
     placeholders = tuple(path for path in snapshot.placeholders if retained_entry(path))
     omitted = tuple(entry for entry in snapshot.omitted if retained_entry(entry[0]))
@@ -510,7 +555,7 @@ def _lean_generation_revision(
 
 def _is_publication_manifest_bytes(data: bytes) -> bool:
     if len(data) > _PUBLICATION_MANIFEST_BYTE_LIMIT:
-        raise OSError("publication manifest exceeds its inspection bound")
+        return False
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeError, ValueError, RecursionError):
@@ -527,7 +572,7 @@ def _is_publication_manifest_name(name: str) -> bool:
 
 def _is_managed_output_manifest_bytes(data: bytes) -> bool:
     if len(data) > _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT:
-        raise OSError("managed output manifest exceeds its inspection bound")
+        return False
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeError, ValueError, RecursionError):
@@ -990,6 +1035,7 @@ def _git(root: str | Path, *arguments: str) -> str | None:
 __all__ = [
     "IndexedSourceSnapshot",
     "Declaration",
+    "LeanSourceError",
     "MANAGED_OUTPUT_SCHEMAS",
     "PACKET_SCHEMA",
     "PASSAGE_SCHEMA",
@@ -999,6 +1045,7 @@ __all__ = [
     "declaration_names",
     "detect_ref",
     "detect_repository_url",
+    "index_failure_message",
     "index_project",
     "project_source_revision",
     "snapshot_project_sources",
