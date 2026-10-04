@@ -301,6 +301,17 @@ def _inspect_snapshot(
         if (incomplete := _unrecorded_requirements(requirements, recorded)) is not None:
             diagnostics.append(ProjectDiagnostic("error", "lake-manifest-incomplete", incomplete, _MANIFEST))
     mathlib = locked if manifest_valid and overrides_valid else None
+    # Lake validates direct requirements against the root manifest before it
+    # loads workspace overrides, so an override does not suppress this warning.
+    if locked is not None and requirement is not None and _is_stale(requirement, locked):
+        diagnostics.append(
+            ProjectDiagnostic(
+                "warning",
+                "lake-manifest-stale",
+                "lakefile.toml requests a different Mathlib than the manifest locks; Lake builds the locked one.",
+                _MANIFEST,
+            )
+        )
     if override is not None:  # Lake applies overrides to a manifest's packages
         diagnostics.append(
             ProjectDiagnostic(
@@ -311,15 +322,6 @@ def _inspect_snapshot(
             )
         )
         mathlib = override
-    elif overrides_valid and locked is not None and requirement is not None and _is_stale(requirement, locked):
-        diagnostics.append(
-            ProjectDiagnostic(
-                "warning",
-                "lake-manifest-stale",
-                "lakefile.toml requests a different Mathlib than the manifest locks; Lake builds the locked one.",
-                _MANIFEST,
-            )
-        )
     if lake is not None and lake.config == "lakefile.lean":
         mathlib = None
     elif mathlib is not None and requirements is not None and (unused := _unused_mathlib(requirements)):
@@ -892,10 +894,12 @@ def _is_stale(requirement: dict, locked: MathlibLock) -> bool:
     """Whether lakefile.toml asks for a different Mathlib source than the lock records."""
 
     kind, git, revision = _requirement_source(requirement)
-    if kind is not None and (kind == "path") != (locked.type == "path"):
+    if kind is None:
+        return False
+    if (kind == "path") != (locked.type == "path"):
         return True
     return locked.type == "git" and (
-        (revision is not None and revision != locked.input_rev)
+        revision != locked.input_rev
         or (git is not None and canonical_git_url(_redact(git)) != canonical_git_url(locked.url))
     )
 

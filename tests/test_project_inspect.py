@@ -162,14 +162,18 @@ def test_other_toolchain_is_unlisted(tmp_path: Path) -> None:
 def test_manifest_lock_decides_when_the_lakefile_moved_ahead(tmp_path: Path) -> None:
     # The lakefile asks for v4.32.2 but the manifest still locks v4.31.0; Lake builds the lock.
     old = _mathlib(rev=OTHER_COMMIT, input_rev="v4.31.0")
-    result = inspect_project(_project(tmp_path, manifest=(old,)))
+    lakefile = LAKEFILE.replace('scope = "leanprover-community"', f'git = "{MATHLIB_URL}"')
+    result = inspect_project(_project(tmp_path, lakefile=lakefile, manifest=(old,)))
 
     assert result.compatibility.status == "unlisted"
     assert "lake-manifest-stale" in _codes(result)
 
 
 def test_stale_requirement_still_reports_the_locked_catalog_pair(tmp_path: Path) -> None:
-    lakefile = LAKEFILE.replace('rev = "v4.32.2"', 'rev = "v4.31.0"')
+    lakefile = LAKEFILE.replace(
+        'scope = "leanprover-community"\nrev = "v4.32.2"',
+        f'git = "{MATHLIB_URL}"\nrev = "v4.31.0"',
+    )
     result = inspect_project(_project(tmp_path, lakefile=lakefile))
 
     assert result.compatibility.status == "supported"
@@ -181,6 +185,24 @@ def test_requirement_git_url_is_compared_with_the_lock(tmp_path: Path) -> None:
     result = inspect_project(_project(tmp_path, lakefile=lakefile))
 
     assert "lake-manifest-stale" in _codes(result)
+
+
+def test_explicit_git_requirement_without_a_revision_is_compared_with_the_lock(tmp_path: Path) -> None:
+    lakefile = LAKEFILE.replace(
+        'scope = "leanprover-community"\nrev = "v4.32.2"',
+        f'git = "{MATHLIB_URL}"',
+    )
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert "lake-manifest-stale" in _codes(result)
+
+
+def test_source_less_requirement_is_not_compared_with_the_lock(tmp_path: Path) -> None:
+    lakefile = 'name = "Example"\n\n[[require]]\nname = "mathlib"\nrev = "v4.31.0"\n'
+    result = inspect_project(_project(tmp_path, lakefile=lakefile))
+
+    assert result.compatibility.status == "supported"
+    assert "lake-manifest-stale" not in _codes(result)
 
 
 def test_last_duplicate_manifest_entry_wins(tmp_path: Path) -> None:
@@ -652,6 +674,18 @@ def test_package_override_replaces_the_locked_mathlib(tmp_path: Path) -> None:
     assert result.mathlib.source == ".lake/package-overrides.json"
     assert result.compatibility.status == "indeterminate"
     assert "mathlib-overridden" in _codes(result)
+
+
+def test_override_does_not_suppress_root_manifest_freshness_warning(tmp_path: Path) -> None:
+    old = _mathlib(rev=OTHER_COMMIT, input_rev="v4.31.0")
+    lakefile = LAKEFILE.replace('scope = "leanprover-community"', f'git = "{MATHLIB_URL}"')
+    root = _project(tmp_path, lakefile=lakefile, manifest=(old,))
+    _write_overrides(root, _mathlib())
+
+    result = inspect_project(root)
+
+    assert result.compatibility.status == "supported"
+    assert {"lake-manifest-stale", "mathlib-overridden"} <= _codes(result)
 
 
 def test_override_needs_a_manifest_to_replace(tmp_path: Path) -> None:
