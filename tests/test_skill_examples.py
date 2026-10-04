@@ -101,6 +101,10 @@ def test_setup_guidance_uses_the_offline_atomic_project_creator(repo_root: Path)
     assert "without running Lake, Lean, or network operations" in normalized
     assert "pins generated workflows exactly as `init` does" in normalized
     assert "fails closed" in normalized and "including Windows" in normalized
+    assert "Do not invent version pairs" not in normalized
+    assert "--lean-toolchain" in normalized
+    assert "lake update" in normalized
+    assert "v4.27.0" in normalized
 
 
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:

@@ -16,7 +16,7 @@ not an installation target. New formalization execution work belongs on
 
 - Python 3.10 or newer and [`uv`](https://docs.astral.sh/uv/)
 - Git
-- Lean and Lake for Lean tooling and verification
+- Lean and Lake (v4.27.0 or newer) for Lean tooling and verification
 - Claude Code or Codex for the installation flows below
 
 ## Install

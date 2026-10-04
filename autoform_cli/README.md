@@ -135,15 +135,15 @@ Create or inspect a Lean project and list Autoform's bundled known-good release 
 
 ```bash
 autoform project versions
-autoform project new ./FiniteFlat \
-  --package FiniteFlat \
-  --release lean-v4.32.2-mathlib-v4.32.2
+autoform project new ./FiniteFlat --package FiniteFlat
+autoform project new ./FiniteFlat430 --package FiniteFlat --lean-toolchain v4.30.0
 autoform project inspect .
 autoform project inspect path/inside/project --json
 autoform project versions --json
 ```
 
-`project new` requires an absent target and an explicit release ID. It builds a
+`project new` requires an absent target and uses the catalog's recommended
+release unless `--release` names another listed one. It builds a
 complete Lean shell with the release's Lake-generated resolved dependency
 manifest, blueprint, and site in a private sibling directory, validates the
 staged project, then publishes the directory with an atomic no-replace rename.
@@ -167,6 +167,24 @@ requested parent without following links and rechecks its device, inode, and
 owner. A pre-publication mismatch preserves the stage; a later mismatch reports
 where publication was observed and tells the caller not to retry blindly.
 
+`--lean-toolchain` takes a Lean release tag (`v4.30.0`, `v4.30.0-rc1`, or
+`leanprover/lean4:v4.30.0`) and `--mathlib-rev` a Mathlib tag, branch, or
+commit, defaulting to the same tag; `--mathlib-rev` requires `--lean-toolchain`,
+and neither combines with `--release`. A pair equal to a catalog entry gets that
+entry's bundled manifest. Any other pair is written without
+`lake-manifest.json` and reported with a `project-release-unlisted` warning:
+run `lake update` in the project, which needs network access, resolves and
+locks Mathlib, and downloads the Mathlib build cache, then commit the manifest.
+Use the toolchain that Mathlib revision declares in its own `lean-toolchain`;
+otherwise Lake may rewrite the project's toolchain, warn, or fail to build.
+Until the manifest exists, `project inspect` reports `indeterminate` with
+`missing-lake-manifest`; afterwards, `unlisted`. Autoform needs Lean v4.27.0 or
+newer (the skeleton probe uses that release's `String` API and the generated
+audit reads ILean `decls`); older toolchains get a `project-lean-below-minimum`
+warning. With `--json`, such a pair reports `"release": null` and its warnings
+go to the `warnings` array; otherwise warnings go to stderr. Either way the
+exit status stays 0.
+
 `project inspect` reads the nearest enclosing project's `lean-toolchain`,
 `lake-manifest.json`, and `lakefile.toml` without running Lake, Lean, Git, or
 the network. Compatibility is decided by the toolchain and the Mathlib commit
@@ -180,7 +198,8 @@ in Lake, but is never evaluated, so its projects stay `indeterminate`. As in
 elan, only the trimmed first line of `lean-toolchain` counts.
 
 `project versions` lists the bundled catalog of known-good Lean and Mathlib
-pairs. It is an allowlist, not a resolver.
+pairs. These are the pairs `project new` can lock offline; it does not resolve
+others, which it writes unlocked for `lake update`.
 
 Publishing a project runs four steps in order: validate, write the Mermaid
 graph into the vault, render the site source, then strict-build the site.

@@ -31,21 +31,30 @@ package, check the current matching stable Lean/Mathlib release, update branch
 and immutable workflow pins, and merge rather than overwrite. Its populated
 thesis notes illustrate later skills; Setup does not reproduce that mathematics.
 
-For a new repository, require a target directory that does not already exist.
-Have the user select a release from `autoform project versions`, then create the
-complete local project atomically:
+For a new repository, require a target directory that does not already exist,
+then create the complete local project atomically:
 
 ```bash
-autoform project new <TARGET> --package <UpperCamelCaseName> --release <RELEASE_ID>
+autoform project new <TARGET> --package <UpperCamelCaseName>
 ```
 
-The catalog is a bundled known-good allowlist, not an automatic selection
-mechanism. `project new` writes matching `lean-toolchain` and Mathlib revisions,
+Without version flags `project new` uses the recommended release from
+`autoform project versions`: a tested Lean/Mathlib pair whose resolved
+`lake-manifest.json` is bundled. Pass `--release <RELEASE_ID>` for another
+listed pair. If the user needs a different Lean version, pass
+`--lean-toolchain <vX.Y.Z>`; `--mathlib-rev <REV>` overrides the default Mathlib
+tag of the same name, and the toolchain must match the `lean-toolchain` of that
+Mathlib revision. Such a project is created without `lake-manifest.json` and
+with a warning: run `lake update` in it, which needs network access and
+downloads the Mathlib build cache, then commit the manifest it writes. Autoform
+needs Lean v4.27.0 or newer, and `project new` also warns below that.
+
+`project new` writes matching `lean-toolchain` and Mathlib revisions,
 the Lean shell, and the Autoform vault without running Lake, Lean, or network
 operations; it never overwrites an existing target. It fails closed on
 platforms without the required POSIX filesystem operations, including Windows.
 It pins generated workflows exactly as `init` does, described below, and omits
-them when there is no commit to pin. Do not invent version pairs, sources, or
+them when there is no commit to pin. Do not invent workflow sources or
 revisions, and do not copy the populated example as a project generator.
 
 For an incomplete existing repository, preserve its authored configuration and
@@ -96,6 +105,7 @@ Validate the prepared repository before reporting it ready. Build Lean first,
 then run the publication sequence:
 
 ```bash
+lake update          # only when the project has no lake-manifest.json
 lake exe cache get   # skip only when the project has no Mathlib dependency
 lake build
 ```

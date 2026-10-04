@@ -113,7 +113,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         "target", nargs="?", help="new project directory; it must not exist"
     )
     project_new.add_argument("--package", help="UpperCamelCase Lean package name")
-    project_new.add_argument("--release", help="release id from 'project versions'")
+    project_new.add_argument(
+        "--release", help="release id from 'project versions' (default: the recommended release)"
+    )
+    project_new.add_argument(
+        "--lean-toolchain",
+        help=(
+            "Lean release tag for a version pair outside the catalog, such as v4.30.0; "
+            "no lake-manifest.json is written, so run 'lake update' in the project"
+        ),
+    )
+    project_new.add_argument(
+        "--mathlib-rev",
+        help=(
+            "Mathlib tag, branch, or commit to require with --lean-toolchain "
+            "(default: the same tag as the toolchain)"
+        ),
+    )
     project_new.add_argument(
         "--autoform-source",
         default="",
@@ -410,20 +426,24 @@ def _project(args: argparse.Namespace) -> int:
                 args.target,
                 package=args.package,
                 release_id=args.release,
+                lean_toolchain=args.lean_toolchain,
+                mathlib_rev=args.mathlib_rev,
                 autoform_source=args.autoform_source,
                 autoform_ref=args.autoform_ref,
             )
             if args.json:
                 print(result.to_json())
             else:
-                print(
-                    _human_text(
-                        f"Created {result.package} at {result.target} ({result.release})"
-                    )
-                )
+                label = result.release or f"unlisted: {result.lean_toolchain}, Mathlib {result.mathlib_rev}"
+                print(_human_text(f"Created {result.package} at {result.target} ({label})"))
+                # Flush first so the warnings never appear ahead of the line they qualify.
+                sys.stdout.flush()
+                for code, message in result.warnings:
+                    print(_human_text(f"warning[{code}]: {message}"), file=sys.stderr)
                 if not result.workflows_pinned:
                     print(
-                        "warning: workflows were omitted because no immutable Autoform pin was available"
+                        "warning: workflows were omitted because no immutable Autoform pin was available",
+                        file=sys.stderr,
                     )
             return 0
         catalog = load_release_catalog()

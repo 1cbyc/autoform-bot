@@ -26,8 +26,26 @@ from autoform_cli.project import (
 from autoform_cli.project import create as create_module
 from autoform_cli.scaffold import DEFAULT_AUTOFORM_SOURCE
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
 _RELEASE = "lean-v4.32.2-mathlib-v4.32.2"
 _SOURCE = "https://example.test/owner/autoform.git"
+_CORE_FILES = ("lean-toolchain", "lakefile.toml", "lake-manifest.json", "src/Project.lean")
+_UNLISTED_LAKEFILE = (
+    'name = "Project"\n'
+    'version = "0.1.0"\n'
+    'defaultTargets = ["Project"]\n\n'
+    "[[require]]\n"
+    'name = "mathlib"\n'
+    'git = "https://github.com/leanprover-community/mathlib4"\n'
+    'rev = "v4.30.0"\n\n'
+    "[[lean_lib]]\n"
+    'name = "Project"\n'
+    'srcDir = "src"\n'
+)
 
 
 @pytest.fixture(autouse=True)
@@ -161,7 +179,13 @@ def test_creation_rejects_an_invalid_workflow_pin_before_writing(
     assert not list(tmp_path.glob(".autoform-new-*"))
 
 
-def test_creation_with_an_explicit_pin_stays_offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "versions",
+    [{"release_id": _RELEASE}, {"release_id": None, "lean_toolchain": "v4.30.0"}],
+)
+def test_creation_with_an_explicit_pin_stays_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, versions: dict[str, str | None]
+) -> None:
     def forbidden(*args, **kwargs):
         raise AssertionError("project new crossed its offline boundary")
 
@@ -173,7 +197,7 @@ def test_creation_with_an_explicit_pin_stays_offline(tmp_path: Path, monkeypatch
     result = create_project(
         tmp_path / "Project",
         package="Project",
-        release_id=_RELEASE,
+        **versions,
         autoform_source="https://example.test/owner/autoform.git",
         autoform_ref="1" * 40,
     )
@@ -475,6 +499,235 @@ def test_rejects_unknown_release_before_writing(tmp_path: Path) -> None:
         create_project(target, package="Project", release_id="unknown")
     assert raised.value.code == "project-release-unknown"
     assert not target.exists()
+
+
+def test_omitted_release_uses_the_recommended_release(tmp_path: Path) -> None:
+    recommended = load_release_catalog().recommended
+
+    result = create_project(tmp_path / "Default", package="Project", release_id=None)
+    create_project(tmp_path / "Explicit", package="Project", release_id=recommended.id)
+
+    assert result.release == recommended.id
+    assert result.lean_toolchain == recommended.lean_toolchain
+    assert result.mathlib_rev == recommended.mathlib_rev
+    assert result.warnings == ()
+    for relative in _CORE_FILES:
+        assert (tmp_path / "Default" / relative).read_bytes() == (tmp_path / "Explicit" / relative).read_bytes()
+
+
+def test_unlisted_pair_is_written_without_a_lock(tmp_path: Path) -> None:
+    target = tmp_path / "Project"
+
+    result = create_project(target, package="Project", release_id=None, lean_toolchain="v4.30.0")
+
+    assert result.release is None
+    assert result.lean_toolchain == "leanprover/lean4:v4.30.0"
+    assert result.mathlib_rev == "v4.30.0"
+    assert [code for code, _message in result.warnings] == ["project-release-unlisted"]
+    assert (target / "lean-toolchain").read_text(encoding="utf-8") == "leanprover/lean4:v4.30.0\n"
+    assert (target / "lakefile.toml").read_text(encoding="utf-8") == _UNLISTED_LAKEFILE
+    assert not (target / "lake-manifest.json").exists()
+    assert "lake-manifest.json" not in result.written
+    inspection = inspect_project(target)
+    assert inspection.ok
+    assert inspection.compatibility.status == "indeterminate"
+    assert {diagnostic.code for diagnostic in inspection.diagnostics} == {
+        "missing-lake-manifest",
+        "release-indeterminate",
+    }
+
+
+@pytest.mark.parametrize(
+    ("toolchain", "revision"),
+    [
+        ("v4.30.0", "master"),
+        ("v4.30.0", "bump/v4.30.0"),
+        ("v4.30.0", "0123456789abcdef0123456789abcdef01234567"),
+        ("v4.30.0", "a" * 255),
+        ("v4.32.0-rc1", "v4.32.0-rc1-patch1"),
+    ],
+)
+def test_unlisted_pair_threads_the_mathlib_revision(tmp_path: Path, toolchain: str, revision: str) -> None:
+    target = tmp_path / "Project"
+
+    result = create_project(
+        target, package="Project", release_id=None, lean_toolchain=toolchain, mathlib_rev=revision
+    )
+
+    assert result.release is None
+    assert result.mathlib_rev == revision
+    with (target / "lakefile.toml").open("rb") as lakefile:
+        assert tomllib.load(lakefile)["require"] == [
+            {"name": "mathlib", "git": "https://github.com/leanprover-community/mathlib4", "rev": revision}
+        ]
+
+
+@pytest.mark.parametrize(
+    ("toolchain", "revision"),
+    [
+        ("v4.32.2", None),
+        ("leanprover/lean4:v4.32.2", "v4.32.2"),
+        ("v4.32.2", "905b95818eb32af7874a58b427f50c1711a5e96c"),
+        ("v4.32.2", "905B95818EB32AF7874A58B427F50C1711A5E96C"),
+    ],
+)
+def test_catalog_pair_given_as_versions_uses_the_bundled_lock(
+    tmp_path: Path, toolchain: str, revision: str | None
+) -> None:
+    result = create_project(
+        tmp_path / "Versions", package="Project", release_id=None, lean_toolchain=toolchain, mathlib_rev=revision
+    )
+    create_project(tmp_path / "Release", package="Project", release_id=_RELEASE)
+
+    assert result.release == _RELEASE
+    assert result.warnings == ()
+    for relative in _CORE_FILES:
+        assert (tmp_path / "Versions" / relative).read_bytes() == (tmp_path / "Release" / relative).read_bytes()
+
+
+@pytest.mark.parametrize(
+    "versions",
+    [
+        {"release_id": _RELEASE, "lean_toolchain": "v4.30.0"},
+        {"release_id": _RELEASE, "mathlib_rev": "v4.30.0"},
+        {"release_id": None, "mathlib_rev": "v4.30.0"},
+    ],
+)
+def test_rejects_conflicting_or_incomplete_version_options_before_writing(
+    tmp_path: Path, versions: dict[str, str | None]
+) -> None:
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(tmp_path / "Project", package="Project", **versions)
+
+    assert raised.value.code == "project-version-invalid"
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "toolchain",
+    [
+        "",
+        "4.30.0",
+        "v4",
+        "v4.30",
+        "v04.30.0",
+        "v4.030.0",
+        "v4.30.00",
+        "V4.30.0",
+        "v4.30.0\n",
+        "v4.30.0 ",
+        " v4.30.0",
+        "v4.30.0-rc",
+        "v4.30.0-rc0",
+        "v4.30.0-rc01",
+        "v4.30.0-patch1",
+        "v4.30.0.1",
+        "v\N{ARABIC-INDIC DIGIT FOUR}.30.0",
+        "nightly-2025-01-01",
+        "leanprover/lean4:nightly-2025-01-01",
+        "leanprover/lean4-nightly:nightly-2025-01-01",
+        "leanprover/lean4:stable",
+        "lean4:v4.30.0",
+        "leanprover/lean4:4.30.0",
+        7,
+        b"v4.30.0",
+    ],
+)
+def test_rejects_invalid_lean_toolchains_before_writing(tmp_path: Path, toolchain: object) -> None:
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(tmp_path / "Project", package="Project", release_id=None, lean_toolchain=toolchain)
+
+    assert raised.value.code == "project-version-invalid"
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "",
+        "-x",
+        "--upload-pack=x",
+        "a b",
+        "a\tb",
+        'a"b',
+        "a\\b",
+        "a\nb",
+        "a:b",
+        "a^",
+        "a~1",
+        "a@{1}",
+        "@",
+        ".a",
+        "/a",
+        "_a",
+        "caf\N{LATIN SMALL LETTER E WITH ACUTE}",
+        "a" * 256,
+        7,
+    ],
+)
+def test_rejects_invalid_mathlib_revisions_before_writing(tmp_path: Path, revision: object) -> None:
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(
+            tmp_path / "Project", package="Project", release_id=None, lean_toolchain="v4.30.0", mathlib_rev=revision
+        )
+
+    assert raised.value.code == "project-version-invalid"
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("toolchain", "codes"),
+    [
+        ("v4.26.0", ["project-lean-below-minimum", "project-release-unlisted"]),
+        ("v4.9.1", ["project-lean-below-minimum", "project-release-unlisted"]),
+        ("v4.27.0-rc1", ["project-release-unlisted"]),
+        ("v4.27.0", ["project-release-unlisted"]),
+        ("v5.0.0", ["project-release-unlisted"]),
+    ],
+)
+def test_warns_below_the_lean_floor(tmp_path: Path, toolchain: str, codes: list[str]) -> None:
+    result = create_project(tmp_path / "Project", package="Project", release_id=None, lean_toolchain=toolchain)
+
+    assert [code for code, _message in result.warnings] == codes
+
+
+@pytest.mark.parametrize("package", ["Docs", "DOCS", "Wanted", "LongestPole", "MATHLIB"])
+@pytest.mark.parametrize("toolchain", [None, "v4.30.0"])
+def test_reserved_mathlib_roots_are_refused(tmp_path: Path, package: str, toolchain: str | None) -> None:
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(tmp_path / "Project", package=package, release_id=None, lean_toolchain=toolchain)
+
+    assert raised.value.code == "project-name-invalid"
+    assert not list(tmp_path.iterdir())
+
+
+def test_catalog_releases_meet_the_lean_floor() -> None:
+    for release in load_release_catalog().releases:
+        version = create_module._resolve_version(None, release.lean_toolchain, release.mathlib_rev)
+        assert version.release == release
+        assert create_module._version_warnings(version) == ()
+
+
+def test_unlisted_plan_must_not_carry_a_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "Project"
+    original = create_module._build_project_plan
+    bundle = create_module._load_release_bundle(load_release_catalog().recommended)
+
+    def add_manifest(*args, **kwargs):
+        plan, pinned = original(*args, **kwargs)
+        manifest = type(plan[0])("lake-manifest.json", create_module._lake_manifest("Project", bundle), 0o644)
+        return tuple(sorted((*plan, manifest), key=lambda item: item.relative)), pinned
+
+    monkeypatch.setattr(create_module, "_build_project_plan", add_manifest)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=None, lean_toolchain="v4.30.0")
+
+    assert raised.value.code == "project-create-validation-failed"
+    assert not target.exists()
+    stages = list(tmp_path.glob(".autoform-new-*"))
+    assert len(stages) == 1
+    assert (stages[0] / "lake-manifest.json").is_file()
 
 
 def test_long_valid_target_name_does_not_expand_the_stage_name(tmp_path: Path) -> None:
@@ -1291,7 +1544,25 @@ def test_concurrent_creation_has_exactly_one_winner(tmp_path: Path) -> None:
     [
         (["project", "new", "--json"], "project-target-invalid"),
         (["project", "new", "project", "--release", _RELEASE, "--json"], "project-name-invalid"),
-        (["project", "new", "project", "--package", "Project", "--json"], "project-release-unknown"),
+        (
+            ["project", "new", "project", "--package", "Project", "--mathlib-rev", "v4.30.0", "--json"],
+            "project-version-invalid",
+        ),
+        (
+            [
+                "project",
+                "new",
+                "project",
+                "--package",
+                "Project",
+                "--release",
+                _RELEASE,
+                "--lean-toolchain",
+                "v4.30.0",
+                "--json",
+            ],
+            "project-version-invalid",
+        ),
     ],
 )
 def test_cli_missing_creation_options_are_json(arguments: list[str], code: str, capsys) -> None:
@@ -1299,6 +1570,49 @@ def test_cli_missing_creation_options_are_json(arguments: list[str], code: str, 
     captured = capsys.readouterr()
     assert json.loads(captured.out)["error"]["code"] == code
     assert captured.err == ""
+
+
+def test_cli_defaults_to_the_recommended_release(tmp_path: Path, capsys) -> None:
+    recommended = load_release_catalog().recommended
+
+    assert main(["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["release"] == recommended.id
+    assert payload["lean_toolchain"] == recommended.lean_toolchain
+    assert payload["mathlib_rev"] == recommended.mathlib_rev
+    assert payload["warnings"] == []
+    assert captured.err == ""
+
+
+def test_cli_unlisted_json_reports_warnings(tmp_path: Path, capsys) -> None:
+    arguments = ["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project"]
+
+    assert main([*arguments, "--lean-toolchain", "v4.30.0", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["release"] is None
+    assert payload["lean_toolchain"] == "leanprover/lean4:v4.30.0"
+    assert payload["mathlib_rev"] == "v4.30.0"
+    assert [warning["code"] for warning in payload["warnings"]] == ["project-release-unlisted"]
+    assert "lake update" in payload["warnings"][0]["message"]
+    assert "lake-manifest.json" not in payload["written"]
+    assert captured.err == ""
+
+
+def test_cli_unlisted_human_output_warns_on_stderr(tmp_path: Path, capsys) -> None:
+    arguments = ["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project"]
+
+    assert main([*arguments, "--lean-toolchain", "v4.30.0"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "Created Project at Project (unlisted: leanprover/lean4:v4.30.0, Mathlib v4.30.0)\n"
+    assert captured.err.startswith("warning[project-release-unlisted]: ")
+    assert captured.err.endswith(
+        "warning: workflows were omitted because no immutable Autoform pin was available\n"
+    )
 
 
 def test_cli_json_is_stable_and_path_free(tmp_path: Path, capsys) -> None:

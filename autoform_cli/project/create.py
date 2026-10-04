@@ -36,6 +36,17 @@ _RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _STAGE_ATTEMPTS = 32
 _TOOLCHAIN_MODULE_ROOTS = frozenset({"Init", "Lake", "Lean", "Std"})
 _MATHLIB_PRODUCTION_ROOTS = frozenset({"Archive", "Counterexamples", "Mathlib"})
+_LEAN_TOOLCHAIN = re.compile(
+    r"(?:leanprover/lean4:)?(?P<tag>v(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)"
+    r"\.(?P<patch>0|[1-9][0-9]*)(?:-rc[1-9][0-9]*)?)"
+)
+# Safe inside a TOML basic string, and never a Git option or revision expression.
+_MATHLIB_REV = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
+_MINIMUM_LEAN = (4, 27, 0)
+# Mathlib library roots that no creation descriptor lists: `docs` (every tag from
+# v4.27.0, and outside the descriptor root grammar), LongestPole (v4.27.0), and
+# Wanted (v4.34.1 on).
+_MATHLIB_EXTRA_ROOTS = frozenset({"docs", "LongestPole", "Wanted"})
 _MANIFEST_FIELDS = frozenset(
     {"version", "packagesDir", "packages", "name", "lakeDir", "fixedToolchain"}
 )
@@ -75,17 +86,23 @@ class ProjectCreateError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ProjectCreateResult:
     package: str
-    release: str
+    release: str | None
+    lean_toolchain: str
+    mathlib_rev: str
     target: str
     written: tuple[str, ...]
     workflows_pinned: bool
+    warnings: tuple[tuple[str, str], ...]
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "lean_toolchain": self.lean_toolchain,
+            "mathlib_rev": self.mathlib_rev,
             "ok": True,
             "package": self.package,
             "release": self.release,
             "target": self.target,
+            "warnings": [{"code": code, "message": message} for code, message in self.warnings],
             "workflows_pinned": self.workflows_pinned,
             "written": list(self.written),
         }
@@ -110,26 +127,46 @@ class _CreationReleaseDescriptor:
     module_roots: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _ProjectVersion:
+    """The versions a new project requires; *release* is None outside the catalog."""
+
+    lean_toolchain: str
+    mathlib_git: str
+    mathlib_rev: str
+    release: SupportedRelease | None
+
+
 def create_project(
     target: str | Path | None,
     *,
     package: str | None,
     release_id: str | None,
+    lean_toolchain: str | None = None,
+    mathlib_rev: str | None = None,
     autoform_source: str = "",
     autoform_ref: str = "",
 ) -> ProjectCreateResult:
-    """Create and atomically publish a new project at an absent *target*."""
+    """Create and atomically publish a new project at an absent *target*.
+
+    Without *release_id* or *lean_toolchain* the project uses the catalog's
+    recommended release. A version pair outside the catalog is written without
+    lake-manifest.json and reported in the result's warnings.
+    """
 
     requested = _validate_target(target)
     package_name = _validate_package(package, requested.parent)
-    release = _find_release(release_id)
-    release_bundle = _load_release_bundle(release)
-    _validate_package_for_release(package_name, release_bundle)
+    version = _resolve_version(release_id, lean_toolchain, mathlib_rev)
+    # Unlisted pairs still reserve the recommended release's module roots.
+    roots_bundle = _load_release_bundle(version.release or load_release_catalog().recommended)
+    _validate_package_for_release(package_name, roots_bundle)
+    release_bundle = roots_bundle if version.release is not None else None
+    warnings = _version_warnings(version)
     workflow_source, workflow_ref = _resolve_workflow_pin(autoform_source, autoform_ref)
     try:
         plan, workflows_pinned = _build_project_plan(
             package_name,
-            release,
+            version,
             release_bundle,
             autoform_source=workflow_source,
             autoform_ref=workflow_ref,
@@ -169,7 +206,7 @@ def create_project(
             stage_descriptor,
             plan,
             package_name,
-            release,
+            version,
             release_bundle,
         )
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
@@ -211,10 +248,13 @@ def create_project(
         _require_stage_identity(confirmed_parent_descriptor, requested.name, stage_descriptor)
         return ProjectCreateResult(
             package=package_name,
-            release=release.id,
+            release=None if version.release is None else version.release.id,
+            lean_toolchain=version.lean_toolchain,
+            mathlib_rev=version.mathlib_rev,
             target=requested.name,
             written=tuple(item.relative for item in plan),
             workflows_pinned=workflows_pinned,
+            warnings=warnings,
         )
     except ProjectCreateError as error:
         state = _publication_state(
@@ -412,11 +452,90 @@ def _find_release(release_id: str | None) -> SupportedRelease:
     return release
 
 
+def _resolve_version(
+    release_id: str | None,
+    lean_toolchain: str | None,
+    mathlib_rev: str | None,
+) -> _ProjectVersion:
+    """Choose the catalog release or the unlisted version pair the options name.
+
+    A toolchain and revision equal to a catalog entry resolve to that entry, so
+    they get its bundled manifest exactly as `release_id` would.
+    """
+
+    if release_id is not None and (lean_toolchain is not None or mathlib_rev is not None):
+        raise ProjectCreateError(
+            "project-version-invalid",
+            "Choose a catalog release or a Lean toolchain and Mathlib revision, not both.",
+        )
+    if lean_toolchain is None:
+        if mathlib_rev is not None:
+            raise ProjectCreateError(
+                "project-version-invalid",
+                "A Mathlib revision requires a Lean toolchain.",
+            )
+        release = (
+            load_release_catalog().recommended if release_id is None else _find_release(release_id)
+        )
+        return _ProjectVersion(release.lean_toolchain, release.mathlib_git, release.mathlib_rev, release)
+    match = _LEAN_TOOLCHAIN.fullmatch(lean_toolchain) if isinstance(lean_toolchain, str) else None
+    if match is None:
+        raise ProjectCreateError(
+            "project-version-invalid",
+            "The Lean toolchain must be a Lean release tag such as v4.30.0, v4.30.0-rc1, "
+            "or leanprover/lean4:v4.30.0.",
+        )
+    toolchain = f"leanprover/lean4:{match['tag']}"
+    revision = match["tag"] if mathlib_rev is None else mathlib_rev
+    if not isinstance(revision, str) or _MATHLIB_REV.fullmatch(revision) is None:
+        raise ProjectCreateError(
+            "project-version-invalid",
+            "The Mathlib revision must be a tag, branch, or commit: 1 to 255 ASCII letters, "
+            "digits, dots, underscores, hyphens, or slashes, starting with a letter or digit.",
+        )
+    catalog = load_release_catalog()
+    for release in catalog.releases:
+        # Git reads a commit in either case, as `ReleaseCatalog.match` does.
+        if release.lean_toolchain == toolchain and (
+            revision == release.mathlib_rev or revision.lower() == release.mathlib_commit
+        ):
+            return _ProjectVersion(release.lean_toolchain, release.mathlib_git, release.mathlib_rev, release)
+    return _ProjectVersion(toolchain, catalog.recommended.mathlib_git, revision, None)
+
+
+def _version_warnings(version: _ProjectVersion) -> tuple[tuple[str, str], ...]:
+    """Warnings as `(code, message)` pairs, sorted by code like inspect's diagnostics."""
+
+    warnings: list[tuple[str, str]] = []
+    match = _LEAN_TOOLCHAIN.fullmatch(version.lean_toolchain)
+    if match is not None and (int(match["major"]), int(match["minor"]), int(match["patch"])) < _MINIMUM_LEAN:
+        warnings.append(
+            (
+                "project-lean-below-minimum",
+                f"Autoform needs Lean v4.27.0 or newer; on {version.lean_toolchain} its skeleton "
+                "probe and the generated CI declaration audit will fail.",
+            )
+        )
+    if version.release is None:
+        warnings.append(
+            (
+                "project-release-unlisted",
+                f"{version.lean_toolchain} with Mathlib {version.mathlib_rev} is not a bundled "
+                "known-good release, so no lake-manifest.json was written. Run `lake update` in "
+                "the project to resolve and lock Mathlib; it needs network access and also "
+                "downloads the Mathlib build cache. The project's lean-toolchain must match the "
+                "lean-toolchain of that Mathlib revision.",
+            )
+        )
+    return tuple(sorted(warnings))
+
+
 def _validate_package_for_release(package: str, bundle: _ReleaseBundle) -> None:
-    if package.casefold() in {root.casefold() for root in bundle.module_roots}:
+    reserved = bundle.module_roots | _MATHLIB_EXTRA_ROOTS
+    if package.casefold() in {root.casefold() for root in reserved}:
         raise ProjectCreateError(
             "project-name-invalid",
-            "Project name must not shadow a Lean module root used by the selected release.",
+            "Project name must not shadow a module root used by Lean, Mathlib, or Mathlib's dependencies.",
         )
 
 
@@ -678,13 +797,13 @@ def _publication_state(
 
 def _build_project_plan(
     package: str,
-    release: SupportedRelease,
-    release_bundle: _ReleaseBundle,
+    version: _ProjectVersion,
+    release_bundle: _ReleaseBundle | None,
     *,
     autoform_source: str,
     autoform_ref: str,
 ) -> tuple[tuple[_ScaffoldFile, ...], bool]:
-    files = list(_core_project_plan(package, release, release_bundle))
+    files = list(_core_project_plan(package, version, release_bundle))
     templates = _read_templates(_TEMPLATES)
     _require_complete_templates(templates)
     scaffold_files, _ = _scaffold_plan(
@@ -705,11 +824,18 @@ def _build_project_plan(
 
 def _core_project_plan(
     package: str,
-    release: SupportedRelease,
-    release_bundle: _ReleaseBundle,
+    version: _ProjectVersion,
+    release_bundle: _ReleaseBundle | None,
 ) -> tuple[_ScaffoldFile, ...]:
+    # Only a catalog release has a resolved manifest; `lake update` writes one
+    # for any other pair.
+    manifest = (
+        ()
+        if release_bundle is None
+        else (_ScaffoldFile("lake-manifest.json", _lake_manifest(package, release_bundle), 0o644),)
+    )
     return (
-        _ScaffoldFile("lean-toolchain", f"{release.lean_toolchain}\n".encode(), 0o644),
+        _ScaffoldFile("lean-toolchain", f"{version.lean_toolchain}\n".encode(), 0o644),
         _ScaffoldFile(
             "lakefile.toml",
             (
@@ -718,19 +844,15 @@ def _core_project_plan(
                 f'defaultTargets = ["{package}"]\n\n'
                 "[[require]]\n"
                 'name = "mathlib"\n'
-                f'git = "{release.mathlib_git}"\n'
-                f'rev = "{release.mathlib_rev}"\n\n'
+                f'git = "{version.mathlib_git}"\n'
+                f'rev = "{version.mathlib_rev}"\n\n'
                 "[[lean_lib]]\n"
                 f'name = "{package}"\n'
                 'srcDir = "src"\n'
             ).encode(),
             0o644,
         ),
-        _ScaffoldFile(
-            "lake-manifest.json",
-            _lake_manifest(package, release_bundle),
-            0o644,
-        ),
+        *manifest,
         _ScaffoldFile(
             f"src/{package}.lean",
             (
@@ -1179,13 +1301,15 @@ def _validate_staged_project(
     stage_descriptor: int,
     plan: tuple[_ScaffoldFile, ...],
     package: str,
-    release: SupportedRelease,
-    release_bundle: _ReleaseBundle,
+    version: _ProjectVersion,
+    release_bundle: _ReleaseBundle | None,
 ) -> None:
     _verify_project_plan(stage_descriptor, plan)
     indexed = {item.relative: item for item in plan}
-    expected_core = _core_project_plan(package, release, release_bundle)
-    if any(indexed.get(expected.relative) != expected for expected in expected_core):
+    expected_core = _core_project_plan(package, version, release_bundle)
+    if ("lake-manifest.json" in indexed) != (release_bundle is not None) or any(
+        indexed.get(expected.relative) != expected for expected in expected_core
+    ):
         raise ProjectCreateError(
             "project-create-validation-failed",
             "The staged project did not satisfy Autoform's project contracts.",
