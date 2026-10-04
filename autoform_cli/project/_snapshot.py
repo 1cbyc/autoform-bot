@@ -223,14 +223,18 @@ def _list_directory_beneath(root: Path, relative: str) -> list[str]:
 
 
 def _node_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
+    identity = (
         metadata.st_dev,
         metadata.st_ino,
         stat.S_IFMT(metadata.st_mode),
         metadata.st_size,
         metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
     )
+    # Windows does not expose one consistent ``st_ctime`` meaning across all
+    # path and descriptor stat implementations.  The file id plus content,
+    # size, and mtime still detects replacement; POSIX keeps ctime to pin ABA
+    # renames and same-size rewrites that restore mtime.
+    return identity if os.name == "nt" else (*identity, metadata.st_ctime_ns)
 
 
 def _cross_interface_identity(identity: tuple[int, ...]) -> tuple[int, ...]:
