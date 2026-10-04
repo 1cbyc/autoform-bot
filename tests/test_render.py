@@ -1199,8 +1199,12 @@ def test_rewriting_a_page_links_only_the_nodes_it_names(tmp_path: Path, monkeypa
     source_dir = blueprint / "roadmap"
     source_dir.mkdir(parents=True)
     chapter, other, page = destination / "a.md", destination / "b.md", destination / "page.md"
-    targets = {"a/x": (chapter, "x"), "b/y": (other, "y")}
-    node_sources = {(source_dir / "x.md").resolve(): "a/x", (source_dir / "y.md").resolve(): "b/y"}
+    targets = {"a/x": (chapter, "x"), "a/z": (chapter, "z"), "b/y": (other, "y")}
+    node_sources = {
+        (source_dir / "x.md").resolve(): "a/x",
+        (source_dir / "z.md").resolve(): "a/z",
+        (source_dir / "y.md").resolve(): "b/y",
+    }
     calls = _count_relative_links(monkeypatch)
 
     def rewrite(text: str) -> str:
@@ -1217,6 +1221,10 @@ def test_rewriting_a_page_links_only_the_nodes_it_names(tmp_path: Path, monkeypa
     assert rewrite("Plain prose.\n") == "Plain prose.\n"
     assert calls == []
     assert rewrite("See [X](x.md).\n") == "See [X](a.md#x).\n"
+    assert calls == [chapter]
+    calls.clear()
+    # Two nodes on the same chapter page cost one link to it, not one each.
+    assert rewrite("[X](x.md), [Z](z.md)\n") == "[X](a.md#x), [Z](a.md#z)\n"
     assert calls == [chapter]
 
 
