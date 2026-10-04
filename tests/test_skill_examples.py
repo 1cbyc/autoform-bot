@@ -64,6 +64,24 @@ def test_development_guidance_requires_fail_closed_local_safety(repo_root: Path)
     assert "by source coordinates" in normalized
 
 
+def test_development_guidance_uses_progressive_command_reference(repo_root: Path) -> None:
+    development = (repo_root / "skills/develop-plugin/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    cli_reference = (repo_root / "autoform_cli/README.md").read_text(encoding="utf-8")
+    inspection_reference = (repo_root / "autoform_cli/project/README.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(development.split())
+
+    assert "plugin and formalization roots distinct" in normalized
+    assert "shared agent entrypoints concise" in normalized
+    assert "on-demand references" in normalized
+    assert "[project-inspection reference](project/README.md)" in cli_reference
+    assert "| `target-unreadable` |" not in cli_reference
+    assert "| `target-unreadable` |" in inspection_reference
+
+
 def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:
     review = (repo_root / "skills" / "agent-review" / "SKILL.md").read_text(
         encoding="utf-8"

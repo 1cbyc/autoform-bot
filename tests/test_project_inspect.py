@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import autoform_cli.project.inspect as project_inspect
+import autoform_cli.project._snapshot as project_snapshot
 from autoform_cli.__main__ import _human_text, main
 from autoform_cli.project import (
     PROJECT_INSPECTION_SCHEMA,
@@ -1140,14 +1141,14 @@ def test_stably_unreadable_decision_file_is_not_misreported_as_changing(
         (root / denied).write_text(
             json.dumps({"schemaVersion": "1.1.0", "packages": []}), encoding="utf-8"
         )
-    original = project_inspect._open_beneath
+    original = project_snapshot._open_beneath
 
     def deny_one(captured_root: Path, relative: str, flags: int):
         if relative == denied:
             raise PermissionError(relative)
         return original(captured_root, relative, flags)
 
-    monkeypatch.setattr(project_inspect, "_open_beneath", deny_one)
+    monkeypatch.setattr(project_snapshot, "_open_beneath", deny_one)
 
     result = inspect_project(root)
 
@@ -1197,7 +1198,7 @@ def test_decision_files_are_retried_as_one_generation(tmp_path: Path, monkeypatc
     # and B has the old Lean with the new lock. A sequential read could invent
     # a supported new-Lean/new-lock pair that never existed.
     root = _project(tmp_path, manifest=(_mathlib(rev=OTHER_COMMIT, input_rev="v4.31.0"),))
-    original = project_inspect._capture_file
+    original = project_snapshot._capture_file
     switched = False
 
     def capture_and_switch(captured_root: Path, relative: str):
@@ -1209,7 +1210,7 @@ def test_decision_files_are_retried_as_one_generation(tmp_path: Path, monkeypatc
             _write_manifest(root, _mathlib())
         return entry
 
-    monkeypatch.setattr(project_inspect, "_capture_file", capture_and_switch)
+    monkeypatch.setattr(project_snapshot, "_capture_file", capture_and_switch)
 
     result = inspect_project(root)
 
@@ -1230,7 +1231,7 @@ def test_rename_aba_cannot_repeat_a_synthetic_pair(tmp_path: Path, monkeypatch: 
         json.dumps({"version": "1.1.0", "packagesDir": ".lake/packages", "packages": [_mathlib()]}),
         encoding="utf-8",
     )
-    original = project_inspect._capture_file
+    original = project_snapshot._capture_file
     state = "a"
 
     def swap(first: Path, second: Path, saved: Path) -> None:
@@ -1250,7 +1251,7 @@ def test_rename_aba_cannot_repeat_a_synthetic_pair(tmp_path: Path, monkeypatch: 
             state = "a"
         return entry
 
-    monkeypatch.setattr(project_inspect, "_capture_file", capture_and_cycle)
+    monkeypatch.setattr(project_snapshot, "_capture_file", capture_and_cycle)
 
     result = inspect_project(root)
 
@@ -1266,7 +1267,7 @@ def test_override_parent_generation_is_part_of_the_snapshot(
     lake_dir.mkdir()
     override = lake_dir / "package-overrides.json"
     override.write_text(json.dumps({"schemaVersion": "1.1.0", "packages": []}), encoding="utf-8")
-    original = project_inspect._capture_file
+    original = project_snapshot._capture_file
 
     def capture_and_rename_aba(captured_root: Path, relative: str):
         entry = original(captured_root, relative)
@@ -1276,7 +1277,7 @@ def test_override_parent_generation_is_part_of_the_snapshot(
             temporary.replace(override)
         return entry
 
-    monkeypatch.setattr(project_inspect, "_capture_file", capture_and_rename_aba)
+    monkeypatch.setattr(project_snapshot, "_capture_file", capture_and_rename_aba)
 
     result = inspect_project(root)
 
@@ -1288,7 +1289,7 @@ def test_new_nearer_project_root_forces_a_retry(tmp_path: Path, monkeypatch: pyt
     outer = _project(tmp_path)
     inner = outer / "nested"
     inner.mkdir()
-    original = project_inspect._capture_decision_snapshot
+    original = project_snapshot._capture_decision_snapshot
     inserted = False
 
     def capture_after_inserting_root(root: Path):
@@ -1300,7 +1301,7 @@ def test_new_nearer_project_root_forces_a_retry(tmp_path: Path, monkeypatch: pyt
             _write_manifest(inner, _mathlib())
         return original(root)
 
-    monkeypatch.setattr(project_inspect, "_capture_decision_snapshot", capture_after_inserting_root)
+    monkeypatch.setattr(project_snapshot, "_capture_decision_snapshot", capture_after_inserting_root)
 
     result = inspect_project(inner)
 
@@ -1323,10 +1324,10 @@ def test_suppressed_path_predicate_errors_cannot_hide_a_nearer_root(
     original_is_symlink = Path.is_symlink
 
     def suppressed_exists(path: Path) -> bool:
-        return False if path.parent == inner and path.name in project_inspect._ROOT_MARKERS else original_exists(path)
+        return False if path.parent == inner and path.name in project_snapshot._ROOT_MARKERS else original_exists(path)
 
     def suppressed_is_symlink(path: Path) -> bool:
-        return False if path.parent == inner and path.name in project_inspect._ROOT_MARKERS else original_is_symlink(path)
+        return False if path.parent == inner and path.name in project_snapshot._ROOT_MARKERS else original_is_symlink(path)
 
     monkeypatch.setattr(Path, "exists", suppressed_exists)
     monkeypatch.setattr(Path, "is_symlink", suppressed_is_symlink)
@@ -1341,7 +1342,7 @@ def test_suppressed_path_predicate_errors_cannot_hide_a_nearer_root(
 def test_autoform_paths_are_revalidated_with_the_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = _project(tmp_path)
     (root / "blueprint").mkdir()
-    original = project_inspect._capture_decision_snapshot
+    original = project_snapshot._capture_decision_snapshot
     removed = False
 
     def capture_after_removing_blueprint(captured_root: Path):
@@ -1351,7 +1352,7 @@ def test_autoform_paths_are_revalidated_with_the_snapshot(tmp_path: Path, monkey
             (root / "blueprint").rmdir()
         return original(captured_root)
 
-    monkeypatch.setattr(project_inspect, "_capture_decision_snapshot", capture_after_removing_blueprint)
+    monkeypatch.setattr(project_snapshot, "_capture_decision_snapshot", capture_after_removing_blueprint)
 
     result = inspect_project(root)
 
@@ -1366,7 +1367,7 @@ def test_file_replaced_by_fifo_between_stat_and_open_never_blocks(
 ) -> None:
     root = _project(tmp_path)
     lakefile = root / "lakefile.toml"
-    original_open = project_inspect.os.open
+    original_open = project_snapshot.os.open
     switched = False
 
     def racing_open(path, flags, *args, **kwargs):
@@ -1377,7 +1378,7 @@ def test_file_replaced_by_fifo_between_stat_and_open_never_blocks(
             os.mkfifo(lakefile)
         return original_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(project_inspect.os, "open", racing_open)
+    monkeypatch.setattr(project_snapshot.os, "open", racing_open)
 
     result = inspect_project(root)
 
