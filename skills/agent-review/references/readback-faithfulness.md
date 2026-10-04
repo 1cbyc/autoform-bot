@@ -22,53 +22,14 @@ Keep the three roles separate.
    below. The judge must not receive a packet, Lean name, article path, or
    candidate checkout.
 
-The coordinator, not either reviewing agent, records the artifacts. Durable
-asynchronous review requires an `article_id`. Store one read-back card per
-declaration under `blueprint/readbacks/<article_id>/`, with a versioned
-`manifest.json` that maps each card to its Lean declaration. Store the returned
-verdict as `faithfulness.json` in the same directory. The recorder owns
-collision-safe card filenames; consumers use the manifest rather than guessing
-paths. The judge only returns its JSON and never writes into the reviewed
-repository. The coordinator maps the packet manifest's `node_id` to that
-blueprint node's `article_id`; an absent or duplicate identity stops dispatch.
+The coordinator, not either reviewing agent, supplies the evidence, taken from
+the verified review bundle and its read-back cards. The judge only returns its
+JSON and never writes into the reviewed repository. The coordinator maps the
+packet manifest's `node_id` to that blueprint node's `article_id`; an absent or
+duplicate identity stops dispatch. Hash the read-back bytes exactly as the
+auditor returned them; do not render or normalize them before hashing.
 
-The stored manifest is the full mapping. Store the read-back bytes exactly as
-the auditor returned them; do not render or normalize them before hashing.
-
-<!-- readback-manifest-template -->
-```json
-{
-  "schema": "autoform-readback-manifest/v1",
-  "article_id": "af_<24 lowercase hex digits>",
-  "node_id": "<current path-based node id>",
-  "declarations": [
-    {
-      "id": "d1",
-      "name": "<fully qualified Lean name>",
-      "card": "<collision-safe relative Markdown path>",
-      "auditor": "<model or reviewer label>",
-      "skeleton_hash": "sha256:<64 lowercase hex digits>",
-      "packet_hash": "sha256:<64 lowercase hex digits>",
-      "read_back_hash": "sha256:<64 lowercase hex digits>"
-    }
-  ],
-  "article_skeleton_hash": "sha256:<64 lowercase hex digits>",
-  "article_packet_hash": "sha256:<64 lowercase hex digits>",
-  "article_review_hash": "sha256:<64 lowercase hex digits>",
-  "passage": "<relative passage path>",
-  "passage_hash": "sha256:<64 lowercase hex digits>",
-  "passage_locator": "<source locator>",
-  "manifest_hash": "sha256:<64 lowercase hex digits>"
-}
-```
-
-This records the stable article identity and current node id as separate fields,
-so a rename is diagnosable rather than silently orphaning a review. The manifest
-is authoritative for card and passage paths. The manifest hash is SHA-256 over
-UTF-8 canonical JSON with sorted keys and compact separators, omitting only the
-`manifest_hash` field itself.
-
-Before dispatching the judge, project that manifest to one opaque item:
+Before dispatching the judge, build one opaque item:
 
 <!-- readback-faithfulness-item-template -->
 ```json
@@ -86,8 +47,7 @@ Before dispatching the judge, project that manifest to one opaque item:
   "article_skeleton_hash": "sha256:<64 lowercase hex digits>",
   "article_packet_hash": "sha256:<64 lowercase hex digits>",
   "article_review_hash": "sha256:<64 lowercase hex digits>",
-  "passage_hash": "sha256:<64 lowercase hex digits>",
-  "manifest_hash": "sha256:<64 lowercase hex digits>"
+  "passage_hash": "sha256:<64 lowercase hex digits>"
 }
 ```
 
@@ -115,10 +75,9 @@ The judge receives exactly three kinds of input:
 2. the cited source passage as raw text;
 3. each declaration's raw read-back text, labelled only `d1`, `d2`, and so on.
 
-Do not open other files, resolve a declaration name, inspect the stored mapping,
-or search the repository. Judge all read-backs for one item together: one source
-theorem may be split into existence and uniqueness declarations that are
-incomplete in isolation.
+Do not open other files, resolve a declaration name, or search the repository.
+Judge all read-backs for one item together: one source theorem may be split
+into existence and uniqueness declarations that are incomplete in isolation.
 
 Read both mathematical texts as raw text, not rendered output. A zero-width or
 bidirectional character, control code, or TeX construct such as `\phantom` can
@@ -197,7 +156,6 @@ the declaration order verbatim from the input item. Use `null` for
   "article_packet_hash": "sha256:<64 lowercase hex digits>",
   "article_review_hash": "sha256:<64 lowercase hex digits>",
   "passage_hash": "sha256:<64 lowercase hex digits>",
-  "manifest_hash": "sha256:<64 lowercase hex digits>",
   "passage_card": {
     "objects": ["<object and kind>"],
     "hypotheses": ["1. <hypothesis>"],
@@ -218,12 +176,6 @@ the declaration order verbatim from the input item. Use `null` for
   "verdict": "cards agree"
 }
 ```
-
-The recorder validates the copied provenance and the decision/category mapping
-before storing `faithfulness.json`. A changed skeleton, packet, passage, locator,
-or read-back invalidates the recorded verdict. A valid hash match establishes
-artifact identity only; it does not establish who wrote or approved the
-verdict.
 
 ## Review escalation
 

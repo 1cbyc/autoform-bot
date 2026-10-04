@@ -446,14 +446,10 @@ def test_readback_faithfulness_contract_is_hash_bound_and_machine_readable(
         "trusted coordinator",
         "blind auditor",
         "faithfulness judge",
-        "blueprint/readbacks/<article_id>/",
-        "manifest.json",
-        "faithfulness.json",
         "packet hash",
         "article packet hash",
         "article review hash",
         "read-back hash is required",
-        "manifest hash",
     ):
         assert required in normalized
 
@@ -461,7 +457,6 @@ def test_readback_faithfulness_contract_is_hash_bound_and_machine_readable(
         fenced = rubric.split(f"<!-- {marker} -->\n```json\n", 1)[1]
         return json.loads(fenced.split("\n```", 1)[0])
 
-    manifest = template("readback-manifest-template")
     item = template("readback-faithfulness-item-template")
     verdict = template("readback-faithfulness-verdict-template")
     provenance = {
@@ -471,19 +466,11 @@ def test_readback_faithfulness_contract_is_hash_bound_and_machine_readable(
         "article_packet_hash",
         "article_review_hash",
         "passage_hash",
-        "manifest_hash",
     }
-    assert manifest["schema"] == "autoform-readback-manifest/v1"
     assert item["schema"] == "autoform-readback-faithfulness-item/v1"
     assert verdict["schema"] == "autoform-readback-faithfulness-verdict/v1"
     assert provenance <= item.keys() and provenance <= verdict.keys()
-    assert provenance - {"item"} <= manifest.keys()
-    assert {"article_id", "node_id", "passage", "passage_locator"} <= manifest.keys()
     assert item["declarations"] == verdict["declarations"]
-    assert item["declarations"][0] == {
-        key: manifest["declarations"][0][key]
-        for key in ("id", "skeleton_hash", "packet_hash", "read_back_hash")
-    }
     declaration = item["declarations"][0]
     assert set(declaration) == {
         "id",
