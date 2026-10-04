@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from dataclasses import dataclass
@@ -22,6 +23,16 @@ _ROOT_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
     | getattr(os, "O_NONBLOCK", 0)
     | getattr(os, "O_NOFOLLOW", 0)
+)
+_RETRYABLE_OPEN_ERRNOS = frozenset(
+    value
+    for value in (
+        errno.ENOENT,
+        errno.ENOTDIR,
+        errno.ELOOP,
+        getattr(errno, "ESTALE", None),
+    )
+    if value is not None
 )
 
 
@@ -94,6 +105,15 @@ def open_directory(path: str | Path) -> RetainedDirectory:
     except ValueError as error:
         raise OSError("directory path is invalid") from error
     except OSError as error:
+        # Concurrent rename/type changes commonly present as one of these at
+        # the first bind.  A stable symlink at the root remains a lasting,
+        # specifically diagnosed refusal rather than a retryable race.
+        if error.errno in _RETRYABLE_OPEN_ERRNOS:
+            if _root_is_symlink(absolute):
+                raise OSError("directory root must not be a symbolic link") from error
+            raise DirectoryChangedError(
+                "directory root changed while it was opened"
+            ) from error
         raise _open_failure(absolute, error) from error
     binding: RetainedDirectory | None = None
     try:
@@ -128,11 +148,8 @@ def _same_directory(
 def _open_failure(path: Path, error: OSError) -> OSError:
     """Name why the root was refused without echoing the host path."""
 
-    try:
-        if stat.S_ISLNK(os.stat(path, follow_symlinks=False).st_mode):
-            return OSError("directory root must not be a symbolic link")
-    except (OSError, ValueError):
-        pass
+    if _root_is_symlink(path):
+        return OSError("directory root must not be a symbolic link")
     if isinstance(error, PermissionError):
         return OSError("permission denied while opening the directory root")
     if isinstance(error, FileNotFoundError):
@@ -140,6 +157,13 @@ def _open_failure(path: Path, error: OSError) -> OSError:
     if isinstance(error, NotADirectoryError):
         return OSError("directory root is not a directory")
     return OSError("directory root cannot be opened")
+
+
+def _root_is_symlink(path: Path) -> bool:
+    try:
+        return stat.S_ISLNK(os.stat(path, follow_symlinks=False).st_mode)
+    except (OSError, ValueError):
+        return False
 
 
 def _close_quietly(descriptor: int) -> None:

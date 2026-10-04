@@ -34,6 +34,18 @@ _FILE_FLAGS = (
     | getattr(os, "O_NONBLOCK", 0)
     | getattr(os, "O_BINARY", 0)
 )
+_WRITE_FILE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+_DESCRIPTOR_MATERIALIZATION_SUPPORTED = all(
+    operation in getattr(os, "supports_dir_fd", ())
+    for operation in (os.mkdir, os.open, os.rmdir, os.stat, os.unlink)
+)
 _READ_CHUNK_BYTES = 1024 * 1024
 _DESCRIPTOR_CAPTURE_SUPPORTED = (
     os.listdir in getattr(os, "supports_fd", ())
@@ -137,6 +149,280 @@ def _validate_materialization_layout(
                 raise TreeSnapshotError("materialization path has a non-directory parent")
 
 
+def _materialize_regular_files(
+    destination: Path,
+    directories: tuple[tuple[str, tuple[str, ...]], ...],
+    files: tuple[tuple[str, tuple[str, ...], bytes], ...],
+    placeholders: tuple[tuple[str, tuple[str, ...]], ...],
+) -> None:
+    """Create a snapshot using only retained directory descriptors."""
+
+    if not (
+        directory_binding.DIRECTORY_BINDING_SUPPORTED
+        and _DESCRIPTOR_MATERIALIZATION_SUPPORTED
+    ):
+        raise TreeSnapshotError(
+            "safe descriptor-relative materialization is unavailable on this platform"
+        )
+    absolute = lexical_absolute_path(destination)
+    name = absolute.name
+    if not _portable_materialization_component(name):
+        raise TreeSnapshotError("unsafe materialization destination")
+
+    parent: RetainedDirectory | None = None
+    descriptors: dict[tuple[str, ...], int] = {}
+    directory_identities: dict[tuple[str, ...], tuple[int, int, int]] = {}
+    created_directories: list[tuple[str, ...]] = []
+    created_files: list[tuple[tuple[str, ...], tuple[int, int, int]]] = []
+    root_created = False
+    succeeded = False
+    try:
+        parent = open_directory(absolute.parent)
+        os.mkdir(name, 0o700, dir_fd=parent.descriptor)
+        root_created = True
+        root_identity = _directory_entry_identity(
+            os.stat(name, dir_fd=parent.descriptor, follow_symlinks=False)
+        )
+        directory_identities[()] = root_identity
+        root_descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent.descriptor)
+        descriptors[()] = root_descriptor
+        if _directory_entry_identity(os.fstat(root_descriptor)) != root_identity:
+            raise TreeSnapshotError("materialization directory changed while it was opened")
+        _verify_named_directory(parent.descriptor, name, root_identity)
+        _tree_snapshot_checkpoint("after-materialization-directory-open", "")
+
+        for relative, parts in sorted(directories, key=lambda item: len(item[1])):
+            if not relative:
+                continue
+            parent_parts = parts[:-1]
+            parent_descriptor = descriptors.get(parent_parts)
+            if parent_descriptor is None:
+                raise TreeSnapshotError("materialization path has a missing parent")
+            _verify_materialization_parent(
+                parent_parts,
+                descriptors,
+                directory_identities,
+            )
+            os.mkdir(parts[-1], 0o700, dir_fd=parent_descriptor)
+            child_identity = _directory_entry_identity(
+                os.stat(
+                    parts[-1],
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+            directory_identities[parts] = child_identity
+            created_directories.append(parts)
+            child_descriptor = os.open(
+                parts[-1],
+                _DIRECTORY_FLAGS,
+                dir_fd=parent_descriptor,
+            )
+            descriptors[parts] = child_descriptor
+            if _directory_entry_identity(os.fstat(child_descriptor)) != child_identity:
+                raise TreeSnapshotError(
+                    "materialization directory changed while it was opened"
+                )
+            _verify_named_directory(parent_descriptor, parts[-1], child_identity)
+            _tree_snapshot_checkpoint(
+                "after-materialization-directory-open",
+                "/".join(parts),
+            )
+
+        for _relative, parts, data in files:
+            created_files.append(
+                (
+                    parts,
+                    _materialize_file(
+                        descriptors,
+                        directory_identities,
+                        parts,
+                        data,
+                    ),
+                )
+            )
+        for _relative, parts in placeholders:
+            created_files.append(
+                (
+                    parts,
+                    _materialize_file(
+                        descriptors,
+                        directory_identities,
+                        parts,
+                        b"",
+                    ),
+                )
+            )
+
+        for parts in sorted(descriptors, key=len):
+            _verify_materialization_parent(parts, descriptors, directory_identities)
+        parent.verify()
+        _verify_named_directory(parent.descriptor, name, root_identity)
+        succeeded = True
+    except TreeSnapshotError:
+        raise
+    except (OSError, ValueError) as error:
+        raise TreeSnapshotError("snapshot could not be materialized safely") from error
+    finally:
+        if not succeeded:
+            _cleanup_materialization(
+                parent,
+                name,
+                descriptors,
+                directory_identities,
+                created_directories,
+                created_files,
+                root_created,
+            )
+        for descriptor in reversed(tuple(descriptors.values())):
+            _close_descriptor(descriptor)
+        if parent is not None:
+            parent.close()
+
+
+def _directory_entry_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise TreeSnapshotError("materialization parent is not a directory")
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _file_entry_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise TreeSnapshotError("materialized entry is not a regular file")
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _verify_named_directory(
+    parent_descriptor: int,
+    name: str,
+    expected: tuple[int, int, int],
+) -> None:
+    observed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if _directory_entry_identity(observed) != expected:
+        raise TreeSnapshotError("materialization directory changed while it was used")
+
+
+def _verify_materialization_parent(
+    parts: tuple[str, ...],
+    descriptors: dict[tuple[str, ...], int],
+    identities: dict[tuple[str, ...], tuple[int, int, int]],
+) -> None:
+    descriptor = descriptors.get(parts)
+    expected = identities.get(parts)
+    if descriptor is None or expected is None:
+        raise TreeSnapshotError("materialization path has a missing parent")
+    if _directory_entry_identity(os.fstat(descriptor)) != expected:
+        raise TreeSnapshotError("materialization parent changed while it was used")
+    if parts:
+        parent_descriptor = descriptors.get(parts[:-1])
+        if parent_descriptor is None:
+            raise TreeSnapshotError("materialization path has a missing parent")
+        _verify_named_directory(parent_descriptor, parts[-1], expected)
+
+
+def _materialize_file(
+    descriptors: dict[tuple[str, ...], int],
+    identities: dict[tuple[str, ...], tuple[int, int, int]],
+    parts: tuple[str, ...],
+    data: bytes,
+) -> tuple[int, int, int]:
+    parent_parts = parts[:-1]
+    _tree_snapshot_checkpoint("before-materialization-file-open", "/".join(parts))
+    _verify_materialization_parent(parent_parts, descriptors, identities)
+    parent_descriptor = descriptors[parent_parts]
+    descriptor: int | None = None
+    identity: tuple[int, int, int] | None = None
+    completed = False
+    try:
+        descriptor = os.open(
+            parts[-1],
+            _WRITE_FILE_FLAGS,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        identity = _file_entry_identity(os.fstat(descriptor))
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            try:
+                count = os.write(descriptor, view[written:])
+            except InterruptedError:
+                continue
+            if count <= 0:
+                raise OSError(errno.EIO, "short materialization write")
+            written += count
+        final = _file_entry_identity(os.fstat(descriptor))
+        named = _file_entry_identity(
+            os.stat(parts[-1], dir_fd=parent_descriptor, follow_symlinks=False)
+        )
+        if final != identity or named != identity:
+            raise TreeSnapshotError("materialized file changed while it was written")
+        _verify_materialization_parent(parent_parts, descriptors, identities)
+        completed = True
+        return identity
+    finally:
+        if descriptor is not None:
+            _close_descriptor(descriptor)
+        if not completed and identity is not None:
+            try:
+                named = _file_entry_identity(
+                    os.stat(parts[-1], dir_fd=parent_descriptor, follow_symlinks=False)
+                )
+                if named == identity:
+                    os.unlink(parts[-1], dir_fd=parent_descriptor)
+            except (OSError, TreeSnapshotError, ValueError):
+                pass
+
+
+def _cleanup_materialization(
+    parent: RetainedDirectory | None,
+    root_name: str,
+    descriptors: dict[tuple[str, ...], int],
+    identities: dict[tuple[str, ...], tuple[int, int, int]],
+    directories: list[tuple[str, ...]],
+    files: list[tuple[tuple[str, ...], tuple[int, int, int]]],
+    root_created: bool,
+) -> None:
+    """Best-effort cleanup that never follows or removes a substituted entry."""
+
+    for parts, expected in reversed(files):
+        parent_descriptor = descriptors.get(parts[:-1])
+        if parent_descriptor is None:
+            continue
+        try:
+            observed = _file_entry_identity(
+                os.stat(parts[-1], dir_fd=parent_descriptor, follow_symlinks=False)
+            )
+            if observed == expected:
+                os.unlink(parts[-1], dir_fd=parent_descriptor)
+        except (OSError, TreeSnapshotError, ValueError):
+            pass
+    for parts in sorted(directories, key=len, reverse=True):
+        descriptor = descriptors.pop(parts, None)
+        if descriptor is not None:
+            _close_descriptor(descriptor)
+        parent_descriptor = descriptors.get(parts[:-1])
+        expected = identities.get(parts)
+        if parent_descriptor is None or expected is None:
+            continue
+        try:
+            _verify_named_directory(parent_descriptor, parts[-1], expected)
+            os.rmdir(parts[-1], dir_fd=parent_descriptor)
+        except (OSError, TreeSnapshotError, ValueError):
+            pass
+    root_descriptor = descriptors.pop((), None)
+    if root_descriptor is not None:
+        _close_descriptor(root_descriptor)
+    if parent is not None and root_created:
+        expected = identities.get(())
+        try:
+            if expected is not None:
+                _verify_named_directory(parent.descriptor, root_name, expected)
+                os.rmdir(root_name, dir_fd=parent.descriptor)
+        except (OSError, TreeSnapshotError, ValueError):
+            pass
+
+
 @dataclass(frozen=True, slots=True)
 class TreeCaptureLimits:
     """Optional bounds on observed entries and captured regular-file bytes.
@@ -174,6 +460,32 @@ class TreeSelection:
     byte_limit: Callable[[PurePosixPath], int | None] = lambda _path: None
     record_omitted: bool = True
     limits: TreeCaptureLimits = TreeCaptureLimits()
+    opaque_markers: tuple["OpaqueDirectoryMarker", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class OpaqueDirectoryMarker:
+    """A bounded marker that makes its containing directory opaque.
+
+    The capture engine reads this small, immutable surface before it visits any
+    descendants.  A recognized marker is then verified by identity, without
+    replaying ``recognizes`` or depending on churn elsewhere in that output
+    directory.
+    """
+
+    name: str
+    max_bytes: int
+    recognizes: Callable[[bytes], bool]
+
+    def __post_init__(self) -> None:
+        if not _valid_name(self.name):
+            raise ValueError("opaque marker name must be one portable path component")
+        if (
+            isinstance(self.max_bytes, bool)
+            or not isinstance(self.max_bytes, int)
+            or self.max_bytes < 0
+        ):
+            raise ValueError("opaque marker max_bytes must be a non-negative integer")
 
 
 ALL_ENTRIES = TreeSelection(
@@ -194,6 +506,7 @@ class TreeSnapshot:
     placeholders: tuple[str, ...]
     omitted: tuple[tuple[str, str], ...]
     identities: tuple[tuple[str, tuple[int, ...]], ...]
+    opaque_directories: tuple[str, ...] = ()
 
     @property
     def revision(self) -> str:
@@ -212,6 +525,8 @@ class TreeSnapshot:
             _update_digest(digest, b"placeholder", relative, b"")
         for relative, kind in self.omitted:
             _update_digest(digest, b"omitted", relative, kind.encode("ascii"))
+        for relative in self.opaque_directories:
+            _update_digest(digest, b"opaque-directory", relative, b"")
         return digest.hexdigest()
 
     @property
@@ -250,18 +565,15 @@ class TreeSnapshot:
             for relative in self.placeholders
         )
         _validate_materialization_layout(directory_parts, file_parts, placeholder_parts)
-        destination.mkdir(parents=True, exist_ok=False, mode=0o700)
-        for relative, parts in sorted(directory_parts, key=lambda item: len(item[1])):
-            if relative:
-                destination.joinpath(*parts).mkdir(mode=0o700)
-        for (_relative, data), (_validated, parts) in zip(self.files, file_parts):
-            target = destination.joinpath(*parts)
-            with target.open("xb") as stream:
-                stream.write(data)
-        for relative, parts in placeholder_parts:
-            target = destination.joinpath(*parts)
-            with target.open("xb"):
-                pass
+        _materialize_regular_files(
+            destination,
+            directory_parts,
+            tuple(
+                (relative, parts, data)
+                for (relative, data), (_validated, parts) in zip(self.files, file_parts)
+            ),
+            placeholder_parts,
+        )
 
     def unsupported_entries(self) -> tuple[tuple[str, str], ...]:
         """Return path-specific reasons for entries that cannot be copied safely."""
@@ -285,6 +597,15 @@ class _DirectoryRecord:
     relative: str
     identity: tuple[int, ...]
     names: tuple[str, ...]
+    marker: "_OpaqueMarkerRecord | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class _OpaqueMarkerRecord:
+    name: str
+    identity: tuple[int, ...]
+    data: bytes
+    max_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +767,7 @@ class BoundDirectoryTree:
         expected_identity: tuple[int, int] | None = None,
         expected_children: dict[str, tuple[int, int]] | None = None,
         selection: TreeSelection = ALL_ENTRIES,
+        require_descriptor: bool = False,
     ) -> None:
         self._lock = threading.RLock()
         self.root = lexical_absolute_path(root)
@@ -481,6 +803,10 @@ class BoundDirectoryTree:
                 self._binding = None
                 raise
             return
+        if require_descriptor:
+            raise TreeSnapshotError(
+                "safe directory traversal is unavailable on this platform"
+            )
         try:
             path_identities = _portable_directory_identities(self.root)
             metadata = os.lstat(self.root)
@@ -504,6 +830,19 @@ class BoundDirectoryTree:
                 return self._binding.identity
             assert self._portable_identity is not None
             return self._portable_identity
+
+    @property
+    def descriptor(self) -> int:
+        """Return the retained root descriptor or fail at the capability boundary."""
+
+        with self._lock:
+            if self._closed:
+                raise TreeSnapshotError("directory tree binding is closed")
+            if self._binding is None:
+                raise TreeSnapshotError(
+                    "safe directory traversal is unavailable on this platform"
+                )
+            return self._binding.descriptor
 
     def _verify_expected_children(
         self,
@@ -665,6 +1004,7 @@ def bind_directory_tree(
     expected_identity: tuple[int, int] | None = None,
     expected_children: dict[str, tuple[int, int]] | None = None,
     selection: TreeSelection = ALL_ENTRIES,
+    require_descriptor: bool = False,
 ) -> Iterator[BoundDirectoryTree]:
     """Retain *root* while callers capture and verify its content generation."""
 
@@ -673,6 +1013,7 @@ def bind_directory_tree(
         expected_identity=expected_identity,
         expected_children=expected_children,
         selection=selection,
+        require_descriptor=require_descriptor,
     )
     try:
         yield bound
@@ -705,6 +1046,7 @@ def capture_directory_descriptor(
     special: list[tuple[str, int]] = []
     placeholders: list[str] = []
     omitted: list[tuple[str, str]] = []
+    opaque_directories: list[str] = []
     budget = _CaptureBudget(selection.limits)
     try:
         _scan_directory(
@@ -719,6 +1061,7 @@ def capture_directory_descriptor(
             special=special,
             placeholders=placeholders,
             omitted=omitted,
+            opaque_directories=opaque_directories,
             selection=selection,
             budget=budget,
         )
@@ -741,6 +1084,7 @@ def capture_directory_descriptor(
         placeholders=tuple(sorted(placeholders)),
         omitted=tuple(sorted(omitted)),
         identities=_included_identities(directories, entries),
+        opaque_directories=tuple(sorted(opaque_directories)),
     )
 
 
@@ -854,6 +1198,60 @@ def _close_descriptor(descriptor: int) -> None:
         pass
 
 
+def _stable_entry_identity(signature: tuple[int, ...]) -> tuple[int, int, int]:
+    """Identity fields unaffected by writes below a directory."""
+
+    return signature[0], signature[1], stat.S_IFMT(signature[2])
+
+
+def _opaque_marker(
+    descriptor: int,
+    relative: str,
+    selection: TreeSelection,
+    *,
+    budget: _CaptureBudget,
+    depth: int,
+) -> tuple[_OpaqueMarkerRecord | None, bytes | None, tuple[str, ...]]:
+    """Recognize one bounded marker without reading any sibling descendants."""
+
+    names = _capture_directory_names(
+        descriptor,
+        budget=budget,
+        depth=depth + 1,
+    )
+    by_folded_name: dict[str, list[str]] = {}
+    for name in names:
+        by_folded_name.setdefault(_normalized_name(name), []).append(name)
+    for marker in selection.opaque_markers:
+        matches = by_folded_name.get(_normalized_name(marker.name), [])
+        if len(matches) != 1:
+            continue
+        name = matches[0]
+        metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            continue
+        identity = _stat_signature(metadata)
+        max_bytes = budget.file_read_limit(metadata.st_size, marker.max_bytes)
+        try:
+            data = _read_file(
+                descriptor,
+                name,
+                identity,
+                max_bytes=max_bytes,
+            )
+        except PermissionError as error:
+            marker_path = f"{relative}/{name}" if relative else name
+            raise _PermissionDenied(marker_path) from error
+        if len(data) <= marker.max_bytes and marker.recognizes(data):
+            budget.add_file_bytes(len(data))
+            return (
+                _OpaqueMarkerRecord(name, identity, data, marker.max_bytes),
+                data,
+                names,
+            )
+    return None, None, names
+
+
 def _scan_directory(
     descriptor: int,
     *,
@@ -867,14 +1265,37 @@ def _scan_directory(
     special: list[tuple[str, int]],
     placeholders: list[str],
     omitted: list[tuple[str, str]],
+    opaque_directories: list[str],
     selection: TreeSelection,
     budget: _CaptureBudget,
-) -> None:
-    names = _capture_directory_names(
-        descriptor,
-        budget=budget,
-        depth=depth + 1,
-    )
+) -> bool:
+    # The root is the directory the caller explicitly asked to inspect.  A
+    # marker name in that directory must not turn the entire requested input
+    # into generated output.
+    if relative and selection.opaque_markers:
+        marker, marker_data, names = _opaque_marker(
+            descriptor,
+            relative,
+            selection,
+            budget=budget,
+            depth=depth,
+        )
+    else:
+        marker = None
+        marker_data = None
+        names = _capture_directory_names(
+            descriptor,
+            budget=budget,
+            depth=depth + 1,
+        )
+    if marker is not None:
+        directories.append(_DirectoryRecord(relative, identity, (), marker))
+        assert marker_data is not None
+        marker_relative = f"{relative}/{marker.name}"
+        entries.append(_EntryRecord(marker_relative, marker.identity))
+        files.append((marker_relative, marker_data))
+        opaque_directories.append(relative)
+        return True
     directories.append(_DirectoryRecord(relative, identity, names))
     _tree_snapshot_checkpoint("after-directory-list", relative)
     for name in names:
@@ -895,13 +1316,16 @@ def _scan_directory(
                 except PermissionError as error:
                     raise _PermissionDenied(child_relative) from error
                 opened = os.fstat(child_descriptor)
-                if _stat_signature(opened) != child_identity:
+                opened_identity = _stat_signature(opened)
+                if _stable_entry_identity(opened_identity) != _stable_entry_identity(
+                    child_identity
+                ):
                     raise _TreeChanged
-                _scan_directory(
+                opaque = _scan_directory(
                     child_descriptor,
                     relative=child_relative,
                     depth=depth + 1,
-                    identity=child_identity,
+                    identity=opened_identity,
                     directories=directories,
                     entries=entries,
                     files=files,
@@ -909,12 +1333,22 @@ def _scan_directory(
                     special=special,
                     placeholders=placeholders,
                     omitted=omitted,
+                    opaque_directories=opaque_directories,
                     selection=selection,
                     budget=budget,
                 )
-                if _stat_signature(
+                final_identity = _stat_signature(
                     os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                ) != child_identity:
+                )
+                if (
+                    _stable_entry_identity(final_identity)
+                    if opaque
+                    else final_identity
+                ) != (
+                    _stable_entry_identity(opened_identity)
+                    if opaque
+                    else opened_identity
+                ):
                     raise _TreeChanged
             finally:
                 if child_descriptor is not None:
@@ -974,6 +1408,7 @@ def _scan_directory(
         )
     ):
         raise _TreeChanged
+    return False
 
 
 def _read_file(
@@ -1034,11 +1469,50 @@ def _verify_snapshot(
     visited_directories: set[str] = set()
     visited_entries: set[str] = set()
 
+    def verify_marker(
+        descriptor: int,
+        relative: str,
+        marker: _OpaqueMarkerRecord,
+    ) -> None:
+        matches = [
+            name
+            for name in os.listdir(descriptor)
+            if _valid_name(name)
+            and _normalized_name(name) == _normalized_name(marker.name)
+        ]
+        if len(matches) != 1:
+            raise _TreeChanged
+        metadata = os.stat(matches[0], dir_fd=descriptor, follow_symlinks=False)
+        if _stat_signature(metadata) != marker.identity:
+            raise _TreeChanged
+        if (
+            _read_file(
+                descriptor,
+                matches[0],
+                marker.identity,
+                max_bytes=marker.max_bytes,
+            )
+            != marker.data
+        ):
+            raise _TreeChanged
+        marker_relative = f"{relative}/{matches[0]}" if relative else matches[0]
+        expected_entry = expected_entries.get(marker_relative)
+        if expected_entry is None or expected_entry.identity != marker.identity:
+            raise _TreeChanged
+        visited_entries.add(marker_relative)
+
     def verify_directory(descriptor: int, relative: str) -> None:
         expected = expected_directories.get(relative)
         if expected is None:
             raise _TreeChanged
         visited_directories.add(relative)
+        if expected.marker is not None:
+            if _stable_entry_identity(
+                _stat_signature(os.fstat(descriptor))
+            ) != _stable_entry_identity(expected.identity):
+                raise _TreeChanged
+            verify_marker(descriptor, relative, expected.marker)
+            return
         names_match = _directory_names_match(
             descriptor,
             expected.names,
@@ -1063,17 +1537,45 @@ def _verify_snapshot(
                     raise _TreeChanged
                 visited_entries.add(child_relative)
                 continue
-            if not stat.S_ISDIR(metadata.st_mode) or _stat_signature(metadata) != directory.identity:
+            observed_identity = _stat_signature(metadata)
+            expected_identity = directory.identity
+            if not stat.S_ISDIR(metadata.st_mode) or (
+                _stable_entry_identity(observed_identity)
+                if directory.marker is not None
+                else observed_identity
+            ) != (
+                _stable_entry_identity(expected_identity)
+                if directory.marker is not None
+                else expected_identity
+            ):
                 raise _TreeChanged
             child_descriptor: int | None = None
             try:
                 child_descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
-                if _stat_signature(os.fstat(child_descriptor)) != directory.identity:
+                opened_identity = _stat_signature(os.fstat(child_descriptor))
+                if (
+                    _stable_entry_identity(opened_identity)
+                    if directory.marker is not None
+                    else opened_identity
+                ) != (
+                    _stable_entry_identity(directory.identity)
+                    if directory.marker is not None
+                    else directory.identity
+                ):
                     raise _TreeChanged
                 verify_directory(child_descriptor, child_relative)
-                if _stat_signature(
+                final_identity = _stat_signature(
                     os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                ) != directory.identity:
+                )
+                if (
+                    _stable_entry_identity(final_identity)
+                    if directory.marker is not None
+                    else final_identity
+                ) != (
+                    _stable_entry_identity(directory.identity)
+                    if directory.marker is not None
+                    else directory.identity
+                ):
                     raise _TreeChanged
             finally:
                 if child_descriptor is not None:
@@ -1223,7 +1725,13 @@ def _capture_portable(
                 identities.append((child_relative, before))
             elif stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
                 if selection.include(relative_path, metadata.st_mode):
-                    symlinks.append((child_relative, os.readlink(path)))
+                    try:
+                        target = os.readlink(path)
+                    except ValueError as error:
+                        raise TreeSnapshotError(
+                            "directory tree contains an unsupported reparse point"
+                        ) from error
+                    symlinks.append((child_relative, target))
                     identities.append((child_relative, _stat_signature(metadata)))
                 else:
                     if selection.record_omitted:

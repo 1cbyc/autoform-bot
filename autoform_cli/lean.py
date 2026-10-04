@@ -20,7 +20,7 @@ import stat
 import subprocess
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -28,6 +28,8 @@ from pathlib import Path, PurePosixPath
 from . import _directory_binding as directory_binding
 from ._tree_snapshot import (
     BoundDirectoryTree,
+    OpaqueDirectoryMarker,
+    TreeCaptureLimits,
     TreeChangedError,
     TreeSelection,
     TreeSnapshot,
@@ -55,21 +57,10 @@ _IGNORED_DIRECTORIES = frozenset(
 )
 # ``Build`` can be a Lean namespace directory, so only this spelling is ignored.
 _EXACT_IGNORED_DIRECTORIES = frozenset({"build"})
-_IGNORED_DIRECTORY_PREFIXES = (".autoform-publication-",)
-_PUBLICATION_MANIFEST = "publication.json"
-_PUBLICATION_SCHEMAS = frozenset({"autoform-publication/v1", "autoform-publication/v2"})
-_PUBLICATION_MANIFEST_BYTE_LIMIT = 1024 * 1024
 _MANAGED_OUTPUT_MANIFEST = "manifest.json"
 _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT = 16 * 1024 * 1024
 # Skeleton manifests grow with the declaration set, and their sorted schema key
 # follows the entries, so their classification bound is intentionally larger.
-_DIRECTORY_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_DIRECTORY", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-    | getattr(os, "O_CLOEXEC", 0)
-)
-_DESCRIPTOR_LISTING_SUPPORTED = os.listdir in getattr(os, "supports_fd", ())
 _SNAPSHOT_ATTEMPTS = 3
 _SNAPSHOT_RETRY_DELAY_SECONDS = 0.05
 #: Known schemas of the skeleton command's packet and passage manifests.
@@ -114,6 +105,7 @@ class IndexedSourceSnapshot:
     index: SourceIndex
     revision: str
     generation_revision: str = ""
+    source_files: tuple[tuple[Path, bytes], ...] = ()
 
 
 @dataclass(slots=True)
@@ -122,29 +114,11 @@ class BoundProjectSources:
 
     root: Path
     tree: BoundDirectoryTree
-    exclusion_roots: tuple[Path, ...]
+    excluded: tuple[PurePosixPath, ...]
 
     def capture(self) -> IndexedSourceSnapshot:
-        excluded = _project_exclusions(
-            self.root,
-            self.exclusion_roots,
-            root_identity=self.tree.identity,
-        )
-
-        def refresh_exclusions() -> tuple[PurePosixPath, ...]:
-            return _project_exclusions(
-                self.root,
-                self.exclusion_roots,
-                root_identity=self.tree.identity,
-            )
-
-        snapshot = self.tree.capture(
-            selection=_lean_tree_selection(
-                excluded,
-                refresh_exclusions=refresh_exclusions,
-            )
-        )
-        return _indexed_source_snapshot(self.root, snapshot, excluded)
+        snapshot = self.tree.capture()
+        return _indexed_source_snapshot(self.root, snapshot, self.excluded)
 
     def verify(self) -> None:
         self.tree.verify()
@@ -202,15 +176,64 @@ def _remap_resolved_root_exclusion(
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
         return candidate
+    relative = _relative_to_root_alias(candidate, requested_root)
+    return resolved_root / relative if relative is not None else candidate
+
+
+def _relative_to_root_alias(
+    candidate: Path,
+    root: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> Path | None:
+    """Return a lexical tail when *candidate* uses another spelling of *root*."""
+
     try:
-        relative = candidate.relative_to(requested_root)
+        return candidate.relative_to(root)
     except ValueError:
-        return candidate
-    return resolved_root / relative
+        pass
+    if not candidate.is_absolute() or not root.is_absolute():
+        return None
+    candidate_parts = candidate.parts
+    root_parts = root.parts
+    if len(candidate_parts) < len(root_parts):
+        return None
+    if tuple(
+        unicodedata.normalize("NFC", part).casefold()
+        for part in candidate_parts[: len(root_parts)]
+    ) != tuple(
+        unicodedata.normalize("NFC", part).casefold() for part in root_parts
+    ):
+        return None
+    prefix = Path(*candidate_parts[: len(root_parts)])
+    try:
+        metadata = prefix.stat()
+    except (OSError, ValueError) as error:
+        if expected_identity is not None:
+            raise TreeChangedError(
+                "directory tree changed while exclusions were selected"
+            ) from error
+        return None
+    observed = (metadata.st_dev, metadata.st_ino)
+    if expected_identity is not None:
+        if observed != expected_identity:
+            raise TreeChangedError(
+                "directory tree changed while exclusions were selected"
+            )
+    else:
+        try:
+            if not prefix.samefile(root):
+                return None
+        except (OSError, ValueError):
+            return None
+    return Path(*candidate_parts[len(root_parts) :])
 
 
 def snapshot_project_sources(
-    root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
+    root: str | Path,
+    *,
+    exclude_roots: Iterable[str | Path] = (),
+    limits: TreeCaptureLimits = TreeCaptureLimits(),
 ) -> IndexedSourceSnapshot:
     """Read each Lean source once and derive its index and revision together.
 
@@ -224,7 +247,11 @@ def snapshot_project_sources(
         if attempt:
             time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS * attempt)
         try:
-            with bind_project_sources(root, exclude_roots=exclusions) as bound:
+            with bind_project_sources(
+                root,
+                exclude_roots=exclusions,
+                limits=limits,
+            ) as bound:
                 return bound.capture()
         except TreeChangedError as error:
             changed = error
@@ -234,10 +261,17 @@ def snapshot_project_sources(
 
 
 def project_source_revision(
-    root: str | Path, *, exclude_roots: Iterable[str | Path] = ()
+    root: str | Path,
+    *,
+    exclude_roots: Iterable[str | Path] = (),
+    limits: TreeCaptureLimits = TreeCaptureLimits(),
 ) -> str:
     """Hash the exact Lean source set consumed by :func:`index_project`."""
-    return snapshot_project_sources(root, exclude_roots=exclude_roots).revision
+    return snapshot_project_sources(
+        root,
+        exclude_roots=exclude_roots,
+        limits=limits,
+    ).revision
 
 
 @contextmanager
@@ -245,10 +279,15 @@ def bind_project_sources(
     root: str | Path,
     *,
     exclude_roots: Iterable[str | Path] = (),
+    limits: TreeCaptureLimits = TreeCaptureLimits(),
 ) -> Iterator[BoundProjectSources]:
     """Retain a Lean root while one or more source snapshots are consumed."""
 
-    bound = open_project_sources(root, exclude_roots=exclude_roots)
+    bound = open_project_sources(
+        root,
+        exclude_roots=exclude_roots,
+        limits=limits,
+    )
     try:
         yield bound
     finally:
@@ -259,6 +298,7 @@ def open_project_sources(
     root: str | Path,
     *,
     exclude_roots: Iterable[str | Path] = (),
+    limits: TreeCaptureLimits = TreeCaptureLimits(),
 ) -> BoundProjectSources:
     """Open a retained Lean source root; the caller must close it.
 
@@ -267,9 +307,8 @@ def open_project_sources(
     """
 
     root_path = directory_binding.lexical_absolute_path(root)
-    exclusion_paths = tuple(Path(value).expanduser() for value in exclude_roots)
     try:
-        tree = BoundDirectoryTree(root_path)
+        tree = BoundDirectoryTree(root_path, require_descriptor=True)
     except TreeChangedError:
         raise
     except TreeSnapshotError as error:
@@ -277,14 +316,15 @@ def open_project_sources(
     try:
         excluded = _project_exclusions(
             root_path,
-            exclusion_paths,
+            exclude_roots,
             root_identity=tree.identity,
         )
-        tree.selection = _lean_tree_selection(excluded)
+        tree.selection = _lean_tree_selection(excluded, limits=limits)
+        tree.verify()
     except BaseException:
         tree.close()
         raise
-    return BoundProjectSources(root_path, tree, exclusion_paths)
+    return BoundProjectSources(root_path, tree, excluded)
 
 
 def _project_exclusions(
@@ -293,55 +333,57 @@ def _project_exclusions(
     *,
     root_identity: tuple[int, int],
 ) -> tuple[PurePosixPath, ...]:
-    return tuple(
-        candidate
-        for value in values
-        if (
-            candidate := _relative_exclusion(
+    excluded: list[PurePosixPath] = []
+    for value in values:
+        candidate = Path(value).expanduser()
+        if any("\0" in part for part in candidate.parts):
+            raise OSError("Lean exclusion path cannot be inspected safely")
+        if candidate.is_absolute():
+            relative = _relative_to_root_alias(
+                candidate,
                 root,
-                value,
-                root_identity=root_identity,
+                expected_identity=root_identity,
             )
-        )
-        is not None
-    )
+            if relative is None:
+                continue
+            candidate = relative
+        relative = PurePosixPath(candidate.as_posix())
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            continue
+        excluded.append(relative)
+    return tuple(excluded)
 
 
 def _lean_tree_selection(
     excluded: tuple[PurePosixPath, ...],
     *,
-    refresh_exclusions: Callable[[], tuple[PurePosixPath, ...]] | None = None,
+    limits: TreeCaptureLimits = TreeCaptureLimits(),
 ) -> TreeSelection:
-    def is_excluded(path: PurePosixPath) -> bool:
-        if _lean_path_is_excluded(path, excluded):
-            return True
-        if refresh_exclusions is None or not any(
-            path != prefix
-            and len(path.parts) == len(prefix.parts)
-            and _folded_path(path) == _folded_path(prefix)
-            for prefix in excluded
-        ):
-            return False
-        return _lean_path_is_excluded(path, refresh_exclusions())
-
     return TreeSelection(
         include=lambda path, mode: _lean_snapshot_includes(
             path,
             mode,
             excluded,
-            is_excluded=is_excluded,
         ),
-        descend=lambda path: not is_excluded(path),
+        descend=lambda path: not _lean_path_is_excluded(path, excluded),
         byte_limit=lambda path: (
-            _PUBLICATION_MANIFEST_BYTE_LIMIT
-            if _is_publication_manifest_name(path.name)
-            else (
-                _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT
-                if _is_managed_output_manifest_name(path.name)
-                else None
-            )
+            _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT
+            if _is_managed_output_manifest_name(path.name)
+            else None
         ),
         record_omitted=False,
+        limits=limits,
+        opaque_markers=(
+            OpaqueDirectoryMarker(
+                _MANAGED_OUTPUT_MANIFEST,
+                _MANAGED_OUTPUT_MANIFEST_BYTE_LIMIT,
+                _is_managed_output_manifest_bytes,
+            ),
+        ),
     )
 
 
@@ -349,20 +391,13 @@ def _lean_snapshot_includes(
     relative: PurePosixPath,
     mode: int,
     excluded: tuple[PurePosixPath, ...],
-    *,
-    is_excluded: Callable[[PurePosixPath], bool] | None = None,
 ) -> bool:
-    if (
-        is_excluded(relative)
-        if is_excluded is not None
-        else _lean_path_is_excluded(relative, excluded)
-    ):
+    if _lean_path_is_excluded(relative, excluded):
         return False
     return (
         stat.S_ISDIR(mode)
         or stat.S_ISLNK(mode)
         or relative.suffix.casefold() == ".lean"
-        or _is_publication_manifest_name(relative.name)
         or _is_managed_output_manifest_name(relative.name)
     )
 
@@ -376,9 +411,11 @@ def _lean_path_is_excluded(
         bool(_IGNORED_DIRECTORIES.intersection(folded_parts))
         or bool(_EXACT_IGNORED_DIRECTORIES.intersection(relative.parts))
         or any(
-            part.startswith(_IGNORED_DIRECTORY_PREFIXES) for part in folded_parts
+            len(folded_parts) >= len(prefix_parts)
+            and folded_parts[: len(prefix_parts)] == prefix_parts
+            for prefix in excluded
+            if (prefix_parts := _folded_path(prefix))
         )
-        or any(relative == prefix or relative.is_relative_to(prefix) for prefix in excluded)
     )
 
 
@@ -391,10 +428,6 @@ def _indexed_source_snapshot(
     snapshot: TreeSnapshot,
     excluded: tuple[PurePosixPath, ...],
 ) -> IndexedSourceSnapshot:
-    publication_manifests: dict[
-        PurePosixPath,
-        list[tuple[str, bytes | None]],
-    ] = {}
     managed_output_manifests: dict[
         PurePosixPath,
         list[tuple[str, bytes | None]],
@@ -402,9 +435,7 @@ def _indexed_source_snapshot(
 
     def add_manifest(relative: str, kind: str, data: bytes | None = None) -> None:
         path = PurePosixPath(relative)
-        if _is_publication_manifest_name(path.name):
-            publication_manifests.setdefault(path.parent, []).append((kind, data))
-        if _is_managed_output_manifest_name(path.name):
+        if len(path.parts) > 1 and _is_managed_output_manifest_name(path.name):
             managed_output_manifests.setdefault(path.parent, []).append((kind, data))
 
     for relative, data in snapshot.files:
@@ -419,28 +450,25 @@ def _indexed_source_snapshot(
         add_manifest(relative, "directory")
 
     # An unrecognized manifest marks nothing; its directory stays Lean source.
-    manifest_groups = (
-        (publication_manifests, _is_publication_manifest_bytes),
-        (managed_output_manifests, _is_managed_output_manifest_bytes),
-    )
-    ignored_roots: set[PurePosixPath] = set()
+    ignored_roots: set[PurePosixPath] = {
+        PurePosixPath(relative)
+        for relative in snapshot.opaque_directories
+        if relative
+    }
     for parent in sorted(
-        publication_manifests.keys() | managed_output_manifests.keys(),
+        managed_output_manifests,
         key=lambda path: (len(path.parts), path.as_posix()),
     ):
         if _path_is_within_roots(parent, ignored_roots):
             continue
-        for groups, recognizes in manifest_groups:
-            manifests = groups.get(parent)
-            if (
-                manifests is not None
-                and len(manifests) == 1
-                and manifests[0][0] == "file"
-                and manifests[0][1] is not None
-                and recognizes(manifests[0][1])
-            ):
-                ignored_roots.add(parent)
-                break
+        manifests = managed_output_manifests[parent]
+        if (
+            len(manifests) == 1
+            and manifests[0][0] == "file"
+            and manifests[0][1] is not None
+            and _is_managed_output_manifest_bytes(manifests[0][1])
+        ):
+            ignored_roots.add(parent)
 
     def in_ignored_root(relative_text: str) -> bool:
         return _path_is_within_roots(PurePosixPath(relative_text), ignored_roots)
@@ -467,6 +495,7 @@ def _indexed_source_snapshot(
 
     declarations: dict[str, Declaration] = {}
     line_counts: dict[Path, int] = {}
+    source_files: list[tuple[Path, bytes]] = []
     digest = hashlib.sha256(b"autoform-lean-source-index/v1\0")
     for relative_text, data in snapshot.files:
         relative = PurePosixPath(relative_text)
@@ -479,6 +508,7 @@ def _indexed_source_snapshot(
             continue
         relative_path = Path(relative.as_posix())
         _update_source_digest(digest, relative_path, data)
+        source_files.append((relative_path, data))
         try:
             text = data.decode("utf-8")
         except UnicodeError:
@@ -496,6 +526,7 @@ def _indexed_source_snapshot(
         ),
         source_digest,
         _lean_generation_revision(snapshot, ignored_roots, tolerated_links),
+        tuple(source_files),
     )
 
 
@@ -549,25 +580,9 @@ def _lean_generation_revision(
         identities=tuple(
             entry for entry in snapshot.identities if entry[0] in retained_identity_paths
         ),
+        opaque_directories=(),
     )
     return filtered.generation_revision
-
-
-def _is_publication_manifest_bytes(data: bytes) -> bool:
-    if len(data) > _PUBLICATION_MANIFEST_BYTE_LIMIT:
-        return False
-    try:
-        value = json.loads(data.decode("utf-8"))
-    except (UnicodeError, ValueError, RecursionError):
-        return False
-    if not isinstance(value, dict):
-        return False
-    schema = value.get("schema")
-    return isinstance(schema, str) and schema in _PUBLICATION_SCHEMAS
-
-
-def _is_publication_manifest_name(name: str) -> bool:
-    return unicodedata.normalize("NFC", name).casefold() == _PUBLICATION_MANIFEST
 
 
 def _is_managed_output_manifest_bytes(data: bytes) -> bool:
@@ -585,6 +600,7 @@ def _is_managed_output_manifest_bytes(data: bytes) -> bool:
         isinstance(kind, str)
         and isinstance(schema, str)
         and (kind, schema) in MANAGED_OUTPUT_SCHEMAS
+        and isinstance(value.get(kind), list)
     )
 
 
@@ -605,190 +621,6 @@ def _update_source_digest(digest, relative: Path, data: bytes) -> None:
     digest.update(encoded)
     digest.update(len(data).to_bytes(8, "big"))
     digest.update(data)
-
-
-def _relative_exclusion(
-    root: Path,
-    value: str | Path,
-    *,
-    root_identity: tuple[int, int],
-) -> PurePosixPath | None:
-    candidate = Path(value).expanduser()
-    if not candidate.is_absolute():
-        candidate = root / candidate
-    cursor = directory_binding.lexical_absolute_path(candidate)
-    tail: list[str] = []
-    while True:
-        try:
-            metadata = os.lstat(cursor)
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError) as error:
-            raise OSError("Lean exclusion path cannot be inspected safely") from error
-        else:
-            if stat.S_ISDIR(metadata.st_mode) and (
-                metadata.st_dev,
-                metadata.st_ino,
-            ) == root_identity:
-                break
-        parent = cursor.parent
-        if parent == cursor:
-            return None
-        tail.append(cursor.name)
-        cursor = parent
-    try:
-        result = _canonical_exclusion_tail(root, tuple(reversed(tail)), root_identity)
-    except (OSError, ValueError) as error:
-        raise OSError("Lean exclusion path cannot be inspected safely") from error
-    if any(part in {"", ".", ".."} for part in result.parts):
-        return None
-    return result
-
-
-def _canonical_exclusion_tail(
-    root: Path,
-    parts: tuple[str, ...],
-    root_identity: tuple[int, int],
-) -> PurePosixPath:
-    """Use physical names for existing exclusion components on aliasing filesystems."""
-
-    if not parts:
-        return PurePosixPath(".")
-    if not (
-        directory_binding.DIRECTORY_BINDING_SUPPORTED
-        and _DESCRIPTOR_LISTING_SUPPORTED
-    ):
-        first = _canonical_exclusion_tail_portably(root, parts, root_identity)
-        second = _canonical_exclusion_tail_portably(root, parts, root_identity)
-        if first != second:
-            raise OSError("Lean exclusion path changed while it was selected")
-        return first[0]
-    descriptors: list[int] = []
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(root, _DIRECTORY_FLAGS)
-        descriptors.append(descriptor)
-        opened_root = os.fstat(descriptor)
-        if (opened_root.st_dev, opened_root.st_ino) != root_identity:
-            raise OSError("Lean source root changed while exclusions were selected")
-        selected: list[str] = []
-        for index, requested in enumerate(parts):
-            try:
-                requested_metadata = os.stat(
-                    requested,
-                    dir_fd=descriptor,
-                    follow_symlinks=False,
-                )
-            except (FileNotFoundError, NotADirectoryError):
-                selected.extend(parts[index:])
-                break
-            signature = (
-                requested_metadata.st_dev,
-                requested_metadata.st_ino,
-                requested_metadata.st_mode,
-            )
-            names = tuple(sorted(os.listdir(descriptor)))
-            folded = unicodedata.normalize("NFC", requested).casefold()
-            matches = []
-            for name in names:
-                if unicodedata.normalize("NFC", name).casefold() != folded:
-                    continue
-                metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-                if (metadata.st_dev, metadata.st_ino, metadata.st_mode) == signature:
-                    matches.append(name)
-            if len(matches) != 1:
-                raise OSError("Lean exclusion path has no stable directory entry")
-            actual = matches[0]
-            selected.append(actual)
-            if tuple(sorted(os.listdir(descriptor))) != names:
-                raise OSError("Lean exclusion path changed while it was selected")
-            current = os.stat(actual, dir_fd=descriptor, follow_symlinks=False)
-            if (current.st_dev, current.st_ino, current.st_mode) != signature:
-                raise OSError("Lean exclusion path changed while it was selected")
-            if index == len(parts) - 1:
-                continue
-            if not stat.S_ISDIR(current.st_mode):
-                selected.extend(parts[index + 1 :])
-                break
-            child = os.open(actual, _DIRECTORY_FLAGS, dir_fd=descriptor)
-            descriptors.append(child)
-            child_metadata = os.fstat(child)
-            if (
-                child_metadata.st_dev,
-                child_metadata.st_ino,
-                child_metadata.st_mode,
-            ) != signature:
-                raise OSError("Lean exclusion path changed while it was selected")
-            descriptor = child
-        return PurePosixPath(*selected)
-    finally:
-        for opened in reversed(descriptors):
-            try:
-                os.close(opened)
-            except OSError:
-                pass
-
-
-def _canonical_exclusion_tail_portably(
-    root: Path,
-    parts: tuple[str, ...],
-    root_identity: tuple[int, int],
-) -> tuple[PurePosixPath, tuple[tuple[str, tuple[int, int, int]], ...]]:
-    root_metadata = os.lstat(root)
-    if (root_metadata.st_dev, root_metadata.st_ino) != root_identity:
-        raise OSError("Lean source root changed while exclusions were selected")
-    current = root
-    selected: list[str] = []
-    observed: list[tuple[str, tuple[int, int, int]]] = []
-    for index, requested in enumerate(parts):
-        requested_path = current / requested
-        try:
-            requested_metadata = os.lstat(requested_path)
-        except (FileNotFoundError, NotADirectoryError):
-            selected.extend(parts[index:])
-            break
-        signature = (
-            requested_metadata.st_dev,
-            requested_metadata.st_ino,
-            requested_metadata.st_mode,
-        )
-        names = tuple(sorted(entry.name for entry in os.scandir(current)))
-        folded = unicodedata.normalize("NFC", requested).casefold()
-        matches = []
-        for name in names:
-            if unicodedata.normalize("NFC", name).casefold() != folded:
-                continue
-            metadata = os.lstat(current / name)
-            if (metadata.st_dev, metadata.st_ino, metadata.st_mode) == signature:
-                matches.append(name)
-        if len(matches) != 1:
-            raise OSError("Lean exclusion path has no stable directory entry")
-        actual = matches[0]
-        selected.append(actual)
-        actual_path = current / actual
-        final = os.lstat(actual_path)
-        if (
-            tuple(sorted(entry.name for entry in os.scandir(current))) != names
-            or (final.st_dev, final.st_ino, final.st_mode) != signature
-        ):
-            raise OSError("Lean exclusion path changed while it was selected")
-        observed.append(("/".join(selected), signature))
-        if index == len(parts) - 1:
-            continue
-        if not stat.S_ISDIR(final.st_mode) or _is_reparse_point(final):
-            selected.extend(parts[index + 1 :])
-            break
-        current = actual_path
-    final_root = os.lstat(root)
-    if (final_root.st_dev, final_root.st_ino) != root_identity:
-        raise OSError("Lean source root changed while exclusions were selected")
-    return PurePosixPath(*selected), tuple(observed)
-
-
-def _is_reparse_point(metadata: os.stat_result) -> bool:
-    attributes = getattr(metadata, "st_file_attributes", 0)
-    marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    return bool(attributes & marker)
 
 
 def _scan(text: str, relative: Path) -> list[Declaration]:
@@ -940,6 +772,7 @@ class SourceLinker:
     index: SourceIndex
     repository_url: str | None = None
     ref: str | None = None
+    linkable_paths: frozenset[Path] | None = None
 
     def location(self, name: str) -> Declaration | None:
         return self.index.find(name)
@@ -947,7 +780,15 @@ class SourceLinker:
     def url(self, name: str) -> str | None:
         """Return a permanent link to *name*, or ``None`` if it cannot be built."""
         declaration = self.index.find(name)
-        if declaration is None or not self.repository_url or not self.ref:
+        if (
+            declaration is None
+            or not self.repository_url
+            or not self.ref
+            or (
+                self.linkable_paths is not None
+                and declaration.path not in self.linkable_paths
+            )
+        ):
             return None
         path = declaration.path.as_posix()
         return f"{self.repository_url}/blob/{self.ref}/{path}#L{declaration.line}"
@@ -967,24 +808,148 @@ def build_linker(
     A supplied source snapshot never inherits a live Git ref; callers must bind
     that ref explicitly if they want permalinks.
     """
-    root = Path(lean_root).expanduser().resolve()
-    if source_index is not None and source_index.root != root:
+    requested_root = directory_binding.lexical_absolute_path(lean_root)
+    resolved_root = requested_root.resolve()
+    if source_index is not None and source_index.root != resolved_root:
         raise ValueError("captured source index belongs to a different Lean root")
     resolved_repository_url = repository_url
     resolved_ref = ref
-    if detect_missing:
-        resolved_repository_url = repository_url or detect_repository_url(root)
-        if source_index is None:
-            resolved_ref = ref or detect_ref(root)
+    linkable_paths: frozenset[Path] | None = None
+    index = source_index
+    if source_index is None:
+        if detect_missing and ref is None:
+            snapshot, detected_url, detected_ref, linkable_paths = _capture_link_state(
+                requested_root,
+                exclude_roots,
+            )
+            index = snapshot.index
+            resolved_repository_url = repository_url or detected_url
+            resolved_ref = detected_ref
+        else:
+            index = index_project(requested_root, exclude_roots=exclude_roots)
+    if detect_missing and resolved_repository_url is None:
+        resolved_repository_url = detect_repository_url(requested_root)
+    assert index is not None
     return SourceLinker(
-        index=(
-            source_index
-            if source_index is not None
-            else index_project(root, exclude_roots=exclude_roots)
-        ),
+        index=index,
         repository_url=resolved_repository_url,
         ref=resolved_ref,
+        linkable_paths=linkable_paths,
     )
+
+
+def _capture_link_state(
+    root: Path,
+    exclude_roots: Iterable[str | Path],
+) -> tuple[
+    IndexedSourceSnapshot,
+    str | None,
+    str | None,
+    frozenset[Path] | None,
+]:
+    """Capture source bytes and prove which ones belong to one stable commit."""
+
+    exclusions = tuple(exclude_roots)
+    last_snapshot: IndexedSourceSnapshot | None = None
+    last_url: str | None = None
+    for attempt in range(_SNAPSHOT_ATTEMPTS):
+        if attempt:
+            time.sleep(_SNAPSHOT_RETRY_DELAY_SECONDS * attempt)
+        before_url = detect_repository_url(root)
+        before_ref = detect_ref(root)
+        snapshot = snapshot_project_sources(root, exclude_roots=exclusions)
+        last_snapshot = snapshot
+        last_url = before_url
+        after_url = detect_repository_url(root)
+        after_ref = detect_ref(root)
+        if before_url != after_url or before_ref != after_ref:
+            continue
+        if before_ref is None:
+            return snapshot, before_url, None, frozenset()
+        commit = _git(root, "rev-parse", "--verify", f"{before_ref}^{{commit}}")
+        if commit is None:
+            return snapshot, before_url, None, frozenset()
+        linkable = _committed_source_paths(root, snapshot, commit)
+        if linkable is None:
+            return snapshot, before_url, None, frozenset()
+        if (
+            detect_repository_url(root) == before_url
+            and detect_ref(root) == before_ref
+        ):
+            return snapshot, before_url, commit, linkable
+    assert last_snapshot is not None
+    return last_snapshot, last_url, None, frozenset()
+
+
+def _committed_source_paths(
+    root: Path,
+    snapshot: IndexedSourceSnapshot,
+    commit: str,
+) -> frozenset[Path] | None:
+    """Return captured files whose Git blob is exactly the commit's blob."""
+
+    top_level_text = _git(root, "rev-parse", "--show-toplevel")
+    algorithm = _git(root, "rev-parse", "--show-object-format")
+    if top_level_text is None or algorithm not in {"sha1", "sha256"}:
+        return None
+    top_level = Path(top_level_text).resolve()
+    try:
+        prefix = root.resolve().relative_to(top_level)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if prefix.parts:
+        # SourceLinker URLs are rooted at ``lean_root`` today.  Until that API
+        # carries a repository-relative prefix, refusing links is safer than
+        # emitting a valid commit with the wrong path.
+        return frozenset()
+    repo_paths = {
+        path: (prefix / path).as_posix()
+        for path, _data in snapshot.source_files
+    }
+    tree_oids = _git_tree_oids(root, commit, tuple(repo_paths.values()))
+    if tree_oids is None:
+        return None
+    linkable: set[Path] = set()
+    for path, data in snapshot.source_files:
+        framed = b"blob " + str(len(data)).encode("ascii") + b"\0" + data
+        if hashlib.new(algorithm, framed).hexdigest() == tree_oids.get(repo_paths[path]):
+            linkable.add(path)
+    return frozenset(linkable)
+
+
+def _git_tree_oids(
+    root: Path,
+    commit: str,
+    paths: tuple[str, ...],
+) -> dict[str, str] | None:
+    """Read raw tree object IDs for exact paths without Git's quoting layer."""
+
+    result: dict[str, str] = {}
+    for start in range(0, len(paths), 128):
+        batch = paths[start : start + 128]
+        if not batch:
+            continue
+        try:
+            completed = subprocess.run(
+                ["git", "ls-tree", "-rz", "--full-tree", commit, "--", *batch],
+                cwd=str(root),
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        for record in completed.stdout.split(b"\0"):
+            if not record:
+                continue
+            header, separator, encoded_path = record.partition(b"\t")
+            fields = header.split()
+            if not separator or len(fields) != 3 or fields[1] != b"blob":
+                continue
+            result[os.fsdecode(encoded_path)] = fields[2].decode("ascii")
+    return result
 
 
 def detect_repository_url(root: str | Path) -> str | None:

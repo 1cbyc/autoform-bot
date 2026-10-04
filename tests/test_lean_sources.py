@@ -5,6 +5,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,8 @@ from autoform_cli import _tree_snapshot as tree_snapshot_module
 from autoform_cli import lean as lean_module
 from autoform_cli._tree_snapshot import (
     BoundDirectoryTree,
+    TreeCaptureLimits,
+    TreeChangedError,
     TreeSelection,
     TreeSnapshot,
     TreeSnapshotError,
@@ -190,33 +193,11 @@ def test_case_aliases_of_tooling_directories_are_not_scanned(
     assert index.find("leaked") is None
 
 
-def test_case_alias_of_publication_staging_prefix_is_not_scanned(
-    tmp_path: Path,
-) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n")
-    ignored = tmp_path / ".AUTOFORM-PUBLICATION-probe"
-    ignored.mkdir()
-    (ignored / "Leak.lean").write_text("def leaked : Nat := 0\n")
-
-    index = index_project(tmp_path)
-
-    assert index.find("canonical") is not None
-    assert index.find("leaked") is None
-
-
-@pytest.mark.parametrize("portable", [False, True])
 def test_changes_inside_an_excluded_build_directory_do_not_invalidate_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    portable: bool,
 ) -> None:
-    if portable:
-        monkeypatch.setattr(
-            directory_binding_module,
-            "DIRECTORY_BINDING_SUPPORTED",
-            False,
-        )
-    elif not (
+    if not (
         directory_binding_module.DIRECTORY_BINDING_SUPPORTED
         and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
     ):
@@ -250,17 +231,10 @@ def test_changes_inside_an_excluded_build_directory_do_not_invalidate_capture(
     assert snapshot.index.find("canonical") is not None
 
 
-@pytest.mark.parametrize("portable", [False, True])
 def test_closed_source_binding_rejects_later_capture(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    portable: bool,
 ) -> None:
     _index(tmp_path, "def canonical : Nat := 0\n")
-    if portable:
-        monkeypatch.setattr(
-            directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-        )
     sources = open_project_sources(tmp_path)
 
     sources.close()
@@ -334,19 +308,11 @@ def test_source_binding_rejects_root_replacement(tmp_path: Path) -> None:
         sources.close()
 
 
-@pytest.mark.parametrize("portable", [False, True])
 def test_source_capture_rejects_mid_capture_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    portable: bool,
 ) -> None:
-    if portable:
-        monkeypatch.setattr(
-            directory_binding_module,
-            "DIRECTORY_BINDING_SUPPORTED",
-            False,
-        )
-    elif not (
+    if not (
         directory_binding_module.DIRECTORY_BINDING_SUPPORTED
         and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
     ):
@@ -379,14 +345,10 @@ def test_source_capture_rejects_mid_capture_change(
     assert changed
 
 
-@pytest.mark.parametrize("portable", [False, True])
 def test_snapshot_retries_a_capture_that_races_one_edit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    portable: bool,
 ) -> None:
-    if portable:
-        monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
     source = tmp_path / "Project" / "Basic.lean"
     _index(tmp_path, "def before : Nat := 0\n")
     original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
@@ -477,17 +439,49 @@ def test_snapshot_retries_a_root_replaced_while_it_is_bound(
     assert snapshot.index.find("canonical") is not None
 
 
+@pytest.mark.parametrize(
+    "transient_errno",
+    [
+        errno.ENOENT,
+        errno.ENOTDIR,
+        errno.ELOOP,
+        *([errno.ESTALE] if hasattr(errno, "ESTALE") else []),
+    ],
+)
+def test_snapshot_retries_a_one_shot_initial_bind_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transient_errno: int,
+) -> None:
+    root = tmp_path / "project"
+    _index(root, "def recoveredAfterRename : Nat := 0\n")
+    original_open = directory_binding_module.os.open
+    root_opens = 0
+
+    def missing_once(path, flags, *args, **kwargs):
+        nonlocal root_opens
+        if kwargs.get("dir_fd") is None and Path(path) == root:
+            root_opens += 1
+            if root_opens == 1:
+                raise OSError(transient_errno, os.strerror(transient_errno))
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(directory_binding_module.os, "open", missing_once)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+
+    snapshot = snapshot_project_sources(root)
+
+    assert root_opens == 2
+    assert snapshot.index.find("recoveredAfterRename") is not None
+
+
 @pytest.mark.parametrize("failure", ["io-error", "recursion"])
-@pytest.mark.parametrize("portable", [False, True])
 def test_lasting_capture_failure_is_reported_without_retrying(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    portable: bool,
     failure: str,
 ) -> None:
-    if portable:
-        monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
-    elif not (
+    if not (
         directory_binding_module.DIRECTORY_BINDING_SUPPORTED
         and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
     ):
@@ -501,7 +495,7 @@ def test_lasting_capture_failure_is_reported_without_retrying(
 
     monkeypatch.setattr(
         tree_snapshot_module,
-        "_read_portable_file" if portable else "_read_file",
+        "_read_file",
         fail_read,
     )
     original_bind = lean_module.bind_project_sources
@@ -529,18 +523,14 @@ def test_lasting_capture_failure_is_reported_without_retrying(
     ("relative", "directory"),
     [("Project/Secret.lean", False), ("Project/Private", True)],
 )
-@pytest.mark.parametrize("portable", [False, True])
 def test_unreadable_lean_source_is_named_by_its_relative_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    portable: bool,
     relative: str,
     directory: bool,
 ) -> None:
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         pytest.skip("root bypasses file permissions")
-    if portable:
-        monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
     _index(tmp_path, "def canonical : Nat := 0\n")
     secret = tmp_path / relative
     if directory:
@@ -753,9 +743,10 @@ def test_portable_capture_does_not_require_path_stat_no_follow(
     )
     monkeypatch.setattr(Path, "stat", stat_without_no_follow)
 
-    snapshot = snapshot_project_sources(root)
+    with bind_directory_tree(root) as bound:
+        snapshot = bound.capture()
 
-    assert snapshot.index.find("portable") is not None
+    assert snapshot.files == (("Project/Basic.lean", b"def portable : Nat := 0\n"),)
 
 
 def test_portable_capture_rejects_an_unrestored_nested_directory_redirection(
@@ -944,17 +935,10 @@ def test_portable_binding_normalizes_an_invalid_root_path(
         BoundDirectoryTree(tmp_path / "bad\0name")
 
 
-@pytest.mark.parametrize("portable", [False, True])
 def test_source_binding_normalizes_an_invalid_exclusion_path(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    portable: bool,
 ) -> None:
     _index(tmp_path, "def canonical : Nat := 0\n")
-    if portable:
-        monkeypatch.setattr(
-            directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-        )
 
     with pytest.raises(OSError, match="Lean exclusion path cannot be inspected safely"):
         snapshot_project_sources(tmp_path, exclude_roots=("bad\0name",))
@@ -1124,20 +1108,15 @@ def test_directory_binding_closes_its_descriptor_when_the_root_changes_while_ope
     assert leaked == []
 
 
-def test_explicit_and_publication_staging_roots_are_skipped(tmp_path: Path) -> None:
+def test_explicit_roots_are_skipped(tmp_path: Path) -> None:
     _index(tmp_path, "def canonical : Nat := 0\n", "Project/Basic.lean")
     excluded = tmp_path / "site"
     excluded.mkdir()
     (excluded / "Copied.lean").write_text("def copied : Nat := 0\n", encoding="utf-8")
-    staging = tmp_path / ".autoform-publication-site-random/source"
-    staging.mkdir(parents=True)
-    (staging / "Staged.lean").write_text("def staged : Nat := 0\n", encoding="utf-8")
-
     index = index_project(tmp_path, exclude_roots=(excluded,))
 
     assert index.find("canonical") is not None
     assert index.find("copied") is None
-    assert index.find("staged") is None
 
 
 @pytest.mark.parametrize("alias_exclusion", [False, True])
@@ -1161,43 +1140,15 @@ def test_exclusion_survives_case_aliases(
     assert index.find("leaked") is None
 
 
-def test_portable_exclusion_survives_case_aliases(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project = tmp_path / "ProjectCase"
-    _index(project, "def kept : Nat := 0\n", "Project/Keep.lean")
-    excluded = project / "Excluded"
-    excluded.mkdir()
-    (excluded / "Leaked.lean").write_text("def leaked : Nat := 0\n", encoding="utf-8")
-    alias = tmp_path / "projectcase"
-    if not alias.exists():
-        pytest.skip("filesystem is case-sensitive")
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
-
-    index = index_project(alias, exclude_roots=(alias / "excluded",))
-
-    assert index.find("kept") is not None
-    assert index.find("leaked") is None
-
-
-@pytest.mark.parametrize("portable", [False, True])
 def test_future_exclusion_is_recanonicalized_after_case_alias_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    portable: bool,
 ) -> None:
     project = tmp_path / "ProjectCase"
     _index(project, "def kept : Nat := 0\n", "Project/Keep.lean")
     alias = tmp_path / "projectcase"
     if not alias.exists():
         pytest.skip("filesystem is case-sensitive")
-    if portable:
-        monkeypatch.setattr(
-            directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-        )
     sources = open_project_sources(alias, exclude_roots=(alias / "excluded",))
     original_verify = sources.tree.verify
     created = False
@@ -1222,92 +1173,56 @@ def test_future_exclusion_is_recanonicalized_after_case_alias_creation(
     assert snapshot.index.find("leaked") is None
 
 
-def test_exclusion_closes_child_descriptor_when_identity_check_fails(
+def test_exclusion_plan_survives_root_rename_restore_aba(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and lean_module._DESCRIPTOR_LISTING_SUPPORTED
-    ):
-        pytest.skip("directory descriptor traversal is unavailable")
     root = tmp_path / "project"
-    (root / "excluded").mkdir(parents=True)
-    root_metadata = root.stat(follow_symlinks=False)
-    root_identity = (root_metadata.st_dev, root_metadata.st_ino)
-    original_open = os.open
-    original_fstat = os.fstat
-    original_close = os.close
-    opened: list[int] = []
-    closed: list[int] = []
+    _index(root, "def kept : Nat := 0\n", "Keep.lean")
+    excluded = root / "generated"
+    excluded.mkdir()
+    (excluded / "Leak.lean").write_text("def leaked : Nat := 0\n")
+    replacement = tmp_path / "replacement"
+    _index(replacement, "def replacementOnly : Nat := 0\n", "Other.lean")
+    displaced = tmp_path / "displaced"
+    sources = open_project_sources(root, exclude_roots=(excluded,))
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    swapped = False
 
-    def tracked_open(path, flags, *, dir_fd=None):
-        descriptor = original_open(path, flags, dir_fd=dir_fd)
-        opened.append(descriptor)
-        return descriptor
+    def swap_and_restore(event: str, relative: str) -> None:
+        nonlocal swapped
+        original_checkpoint(event, relative)
+        if event == "after-directory-list" and relative == "" and not swapped:
+            root.rename(displaced)
+            replacement.rename(root)
+            swapped = True
+        elif event == "before-final-verification" and relative == "" and swapped:
+            root.rename(replacement)
+            displaced.rename(root)
 
-    def fail_child_fstat(descriptor):
-        if len(opened) == 2 and descriptor == opened[1]:
-            raise OSError("injected child identity failure")
-        return original_fstat(descriptor)
-
-    def tracked_close(descriptor):
-        closed.append(descriptor)
-        return original_close(descriptor)
-
-    leaked: list[int] = []
+    monkeypatch.setattr(
+        tree_snapshot_module,
+        "_tree_snapshot_checkpoint",
+        swap_and_restore,
+    )
+    snapshot = None
     try:
-        with monkeypatch.context() as context:
-            context.setattr(lean_module.os, "open", tracked_open)
-            context.setattr(lean_module.os, "fstat", fail_child_fstat)
-            context.setattr(lean_module.os, "close", tracked_close)
-            with pytest.raises(OSError, match="injected child identity failure"):
-                lean_module._canonical_exclusion_tail(
-                    root,
-                    ("excluded", "future"),
-                    root_identity,
-                )
-        leaked = [descriptor for descriptor in opened if descriptor not in closed]
+        try:
+            snapshot = sources.capture()
+        except TreeChangedError:
+            pass
     finally:
-        for descriptor in leaked:
-            original_close(descriptor)
+        sources.close()
+        if displaced.exists():
+            if root.exists():
+                root.rename(replacement)
+            displaced.rename(root)
 
-    assert len(opened) == 2
-    assert leaked == []
-
-
-def test_exclusion_attempts_every_close_after_one_close_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and lean_module._DESCRIPTOR_LISTING_SUPPORTED
-    ):
-        pytest.skip("directory descriptor traversal is unavailable")
-    root = tmp_path / "project"
-    (root / "excluded").mkdir(parents=True)
-    root_metadata = root.stat(follow_symlinks=False)
-    root_identity = (root_metadata.st_dev, root_metadata.st_ino)
-    original_close = os.close
-    close_attempts: list[int] = []
-
-    def fail_first_close(descriptor: int) -> None:
-        close_attempts.append(descriptor)
-        original_close(descriptor)
-        if len(close_attempts) == 1:
-            raise OSError("injected close failure")
-
-    with monkeypatch.context() as context:
-        context.setattr(lean_module.os, "close", fail_first_close)
-        result = lean_module._canonical_exclusion_tail(
-            root,
-            ("excluded", "future"),
-            root_identity,
-        )
-
-    assert result.as_posix() == "excluded/future"
-    assert len(close_attempts) == 2
+    assert swapped
+    if snapshot is not None:
+        assert snapshot.index.find("kept") is not None
+        assert snapshot.index.find("leaked") is None
+        assert snapshot.index.find("replacementOnly") is None
 
 
 def test_visible_symlinked_source_directory_is_not_followed(tmp_path: Path) -> None:
@@ -1387,38 +1302,6 @@ def test_lean_symlink_is_refused_whether_or_not_its_target_exists(tmp_path: Path
     assert str(tmp_path) not in str(caught.value)
 
 
-def test_portable_source_scanner_does_not_descend_into_a_directory_reparse_point(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n")
-    source = tmp_path / "Src"
-    source.mkdir()
-    (source / "Hidden.lean").write_text("def hidden : Nat := 0\n", encoding="utf-8")
-    source_identity = (source.stat().st_dev, source.stat().st_ino)
-    original = tree_snapshot_module._is_reparse_point
-    original_readlink = os.readlink
-
-    def mark_source(metadata) -> bool:
-        return (metadata.st_dev, metadata.st_ino) == source_identity or original(metadata)
-
-    def read_junction(path, *args, **kwargs):
-        if Path(path).name == "Src":
-            return "elsewhere"
-        return original_readlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
-    monkeypatch.setattr(tree_snapshot_module, "_is_reparse_point", mark_source)
-    monkeypatch.setattr(tree_snapshot_module.os, "readlink", read_junction)
-
-    index = index_project(tmp_path)
-
-    assert index.find("canonical") is not None
-    assert index.find("hidden") is None
-
-
 def test_source_digest_preserves_surrogate_escaped_filename_bytes(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("surrogate-escaped POSIX filenames are unavailable")
@@ -1435,51 +1318,6 @@ def test_source_digest_preserves_surrogate_escaped_filename_bytes(tmp_path: Path
     assert os.fsencode(declaration.path.name) == b"Bad_\xff.lean"
 
 
-def test_generated_publication_roots_are_never_indexed(tmp_path: Path) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n", "blueprint/Proofs.lean")
-    generated = tmp_path / "aaa-output"
-    generated.mkdir()
-    (generated / "publication.json").write_text(
-        '{"schema":"autoform-publication/v2"}\n', encoding="utf-8"
-    )
-    (generated / "Copied.lean").write_text(
-        "def generatedOnly : Nat := 0\n", encoding="utf-8"
-    )
-
-    index = index_project(tmp_path)
-
-    assert index.find("canonical") is not None
-    assert index.find("generatedOnly") is None
-
-
-def test_oversized_publication_manifest_read_is_bounded(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n")
-    generated = tmp_path / "generated"
-    generated.mkdir()
-    (generated / "publication.json").write_bytes(
-        b"x" * (lean_module._PUBLICATION_MANIFEST_BYTE_LIMIT + 4096)
-    )
-    (generated / "Kept.lean").write_text("def keptBesideOversized : Nat := 0\n", encoding="utf-8")
-    observed_lengths: list[int] = []
-    original = lean_module._is_publication_manifest_bytes
-
-    def record_length(data: bytes) -> bool:
-        observed_lengths.append(len(data))
-        return original(data)
-
-    monkeypatch.setattr(lean_module, "_is_publication_manifest_bytes", record_length)
-
-    index = index_project(tmp_path)
-
-    assert observed_lengths == [lean_module._PUBLICATION_MANIFEST_BYTE_LIMIT + 1]
-    assert index.find("canonical") is not None
-    assert index.find("keptBesideOversized") is not None
-
-
-@pytest.mark.parametrize("manifest_name", ["publication.json", "manifest.json"])
 @pytest.mark.parametrize(
     "invalid_value",
     ["1" * 5000, "[" * 2000 + "0" + "]" * 2000],
@@ -1487,12 +1325,11 @@ def test_oversized_publication_manifest_read_is_bounded(
 )
 def test_malformed_manifest_value_does_not_escape_source_indexing(
     tmp_path: Path,
-    manifest_name: str,
     invalid_value: str,
 ) -> None:
     generated = tmp_path / "generated"
     generated.mkdir()
-    (generated / manifest_name).write_text(
+    (generated / "manifest.json").write_text(
         '{"kind":"packets","schema":' + invalid_value + "}\n",
         encoding="utf-8",
     )
@@ -1501,107 +1338,6 @@ def test_malformed_manifest_value_does_not_escape_source_indexing(
     index = index_project(tmp_path)
 
     assert index.find("visible") is not None
-
-
-def test_bounded_publication_manifest_capture_fills_short_reads(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n")
-    generated = tmp_path / "generated"
-    generated.mkdir()
-    (generated / "publication.json").write_text(
-        '{"schema":"autoform-publication/v2"}\n', encoding="utf-8"
-    )
-    (generated / "Copied.lean").write_text(
-        "def copiedAfterShortRead : Nat := 0\n", encoding="utf-8"
-    )
-    original_fdopen = tree_snapshot_module.os.fdopen
-
-    class ShortReadStream:
-        def __init__(self, stream) -> None:
-            self._stream = stream
-
-        def read(self, size: int = -1) -> bytes:
-            return self._stream.read(min(size, 3) if size >= 0 else size)
-
-        def close(self) -> None:
-            self._stream.close()
-
-    def short_fdopen(*args, **kwargs):
-        return ShortReadStream(original_fdopen(*args, **kwargs))
-
-    monkeypatch.setattr(tree_snapshot_module.os, "fdopen", short_fdopen)
-
-    index = index_project(tmp_path)
-
-    assert index.find("canonical") is not None
-    assert index.find("copiedAfterShortRead") is None
-
-
-def test_publication_marker_survives_case_alias(tmp_path: Path) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n")
-    generated = tmp_path / "generated"
-    generated.mkdir()
-    marker = generated / "publication.json"
-    marker.write_text('{"schema":"autoform-publication/v2"}\n', encoding="utf-8")
-    physical_marker = generated / "PUBLICATION.JSON"
-    marker.rename(physical_marker)
-    if not marker.exists():
-        pytest.skip("filesystem is case-sensitive")
-    (generated / "Copied.lean").write_text(
-        "def copiedThroughMarkerAlias : Nat := 0\n", encoding="utf-8"
-    )
-
-    index = index_project(tmp_path)
-
-    assert index.find("canonical") is not None
-    assert index.find("copiedThroughMarkerAlias") is None
-
-
-def test_portably_ambiguous_publication_markers_leave_the_directory_indexed(
-    tmp_path: Path,
-) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n")
-    generated = tmp_path / "generated"
-    generated.mkdir()
-    lower = generated / "publication.json"
-    upper = generated / "PUBLICATION.JSON"
-    lower.write_text('{"schema":"autoform-publication/v2"}\n', encoding="utf-8")
-    upper.write_text("{}\n", encoding="utf-8")
-    if lower.samefile(upper):
-        pytest.skip("filesystem does not permit case-colliding marker names")
-    (generated / "Copied.lean").write_text("def besideAmbiguity : Nat := 0\n", encoding="utf-8")
-
-    index = index_project(tmp_path)
-
-    assert index.find("canonical") is not None
-    assert index.find("besideAmbiguity") is not None
-
-
-def test_publication_marker_file_and_symlink_alias_leave_the_directory_indexed(
-    tmp_path: Path,
-) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("", "generated"),
-        files=(
-            ("generated/Copied.lean", b"def hiddenByAmbiguity : Nat := 0\n"),
-            (
-                "generated/publication.json",
-                b'{"schema":"autoform-publication/v2"}\n',
-            ),
-        ),
-        symlinks=(("generated/PUBLICATION.JSON", "elsewhere"),),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
-
-    indexed = lean_module._indexed_source_snapshot(tmp_path, snapshot, ())
-
-    assert indexed.index.find("hiddenByAmbiguity") is not None
 
 
 @pytest.mark.parametrize(
@@ -1692,50 +1428,172 @@ def test_snapshot_materialization_orders_valid_directory_records(tmp_path: Path)
     assert (destination / "a/b/result.txt").read_bytes() == b"result\n"
 
 
-def test_outer_publication_marker_ignores_ambiguous_descendant_markers(
+def test_snapshot_materialization_root_swap_never_redirects_bytes(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     snapshot = TreeSnapshot(
         root_identity=(1, 1),
-        directories=("", "generated", "generated/nested"),
-        files=(
-            ("generated/nested/Copied.lean", b"def hiddenByOuterMarker : Nat := 0\n"),
-            (
-                "generated/nested/publication.json",
-                b'{"schema":"autoform-publication/v2"}\n',
-            ),
-            (
-                "generated/publication.json",
-                b'{"schema":"autoform-publication/v2"}\n',
-            ),
-        ),
-        symlinks=(("generated/nested/PUBLICATION.JSON", "elsewhere"),),
+        directories=("",),
+        files=(("result.txt", b"captured\n"),),
+        symlinks=(),
         special=(),
         placeholders=(),
         omitted=(),
         identities=(),
     )
+    destination = tmp_path / "destination"
+    displaced = tmp_path / "displaced"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    swapped = False
 
-    index = lean_module._indexed_source_snapshot(tmp_path, snapshot, ())
+    def swap_root(event: str, relative: str) -> None:
+        nonlocal swapped
+        original_checkpoint(event, relative)
+        if event == "after-materialization-directory-open" and relative == "":
+            destination.rename(displaced)
+            destination.symlink_to(outside, target_is_directory=True)
+            swapped = True
 
-    assert index.index.find("hiddenByOuterMarker") is None
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", swap_root)
+    try:
+        with pytest.raises(TreeSnapshotError, match="materialization"):
+            snapshot.materialize_regular_files(destination)
+        assert swapped
+        assert not (outside / "result.txt").exists()
+    finally:
+        if destination.is_symlink():
+            destination.unlink()
+        if displaced.exists():
+            for child in displaced.iterdir():
+                child.unlink()
+            displaced.rmdir()
 
 
-@pytest.mark.parametrize("outer_kind", ["publication", "managed"])
-def test_outer_output_marker_ignores_other_manifest_type_below_it(
+def test_snapshot_materialization_nested_swap_never_redirects_bytes(
     tmp_path: Path,
-    outer_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if outer_kind == "publication":
-        outer_name = "publication.json"
-        outer_data = b'{"schema":"autoform-publication/v2"}\n'
-        nested_name = "manifest.json"
-    else:
-        outer_name = "manifest.json"
-        outer_data = (
-            b'{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
-        )
-        nested_name = "publication.json"
+    snapshot = TreeSnapshot(
+        root_identity=(1, 1),
+        directories=("", "nested"),
+        files=(("nested/result.txt", b"captured\n"),),
+        symlinks=(),
+        special=(),
+        placeholders=(),
+        omitted=(),
+        identities=(),
+    )
+    destination = tmp_path / "destination"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    displaced = destination / "nested-displaced"
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+
+    def swap_nested(event: str, relative: str) -> None:
+        original_checkpoint(event, relative)
+        if event == "after-materialization-directory-open" and relative == "nested":
+            (destination / "nested").rename(displaced)
+            (destination / "nested").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", swap_nested)
+    try:
+        with pytest.raises(TreeSnapshotError, match="materialization"):
+            snapshot.materialize_regular_files(destination)
+        assert not (outside / "result.txt").exists()
+    finally:
+        linked = destination / "nested"
+        if linked.is_symlink():
+            linked.unlink()
+        if displaced.exists():
+            displaced.rmdir()
+        if destination.exists():
+            destination.rmdir()
+
+
+def test_snapshot_materialization_retries_short_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = TreeSnapshot(
+        root_identity=(1, 1),
+        directories=("",),
+        files=(("result.txt", b"captured bytes\n"),),
+        symlinks=(),
+        special=(),
+        placeholders=(),
+        omitted=(),
+        identities=(),
+    )
+    destination = tmp_path / "destination"
+    original_write = tree_snapshot_module.os.write
+
+    def short_write(descriptor: int, data) -> int:
+        return original_write(descriptor, bytes(data[:1]))
+
+    monkeypatch.setattr(tree_snapshot_module.os, "write", short_write)
+
+    snapshot.materialize_regular_files(destination)
+
+    assert (destination / "result.txt").read_bytes() == b"captured bytes\n"
+
+
+def test_snapshot_materialization_closes_descriptors_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = TreeSnapshot(
+        root_identity=(1, 1),
+        directories=("", "nested"),
+        files=(("nested/result.txt", b"captured\n"),),
+        symlinks=(),
+        special=(),
+        placeholders=(),
+        omitted=(),
+        identities=(),
+    )
+    destination = tmp_path / "destination"
+    original_open = tree_snapshot_module.os.open
+    original_write = tree_snapshot_module.os.write
+    opened: list[int] = []
+    writes = 0
+
+    def tracked_open(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_second_write(descriptor: int, data) -> int:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            return original_write(descriptor, bytes(data[:1]))
+        raise OSError(errno.EIO, "injected materialization failure")
+
+    monkeypatch.setattr(tree_snapshot_module.os, "open", tracked_open)
+    monkeypatch.setattr(tree_snapshot_module.os, "write", fail_second_write)
+
+    with pytest.raises(TreeSnapshotError, match="materialized safely"):
+        snapshot.materialize_regular_files(destination)
+
+    assert opened
+    assert writes == 2
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert not destination.exists()
+
+
+def test_outer_managed_marker_ignores_unrelated_files_below_it(
+    tmp_path: Path,
+) -> None:
+    outer_name = "manifest.json"
+    outer_data = (
+        b'{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+    nested_name = "other.json"
     snapshot = TreeSnapshot(
         root_identity=(1, 1),
         directories=("", "generated", "generated/nested"),
@@ -1754,26 +1612,6 @@ def test_outer_output_marker_ignores_other_manifest_type_below_it(
     index = lean_module._indexed_source_snapshot(tmp_path, snapshot, ())
 
     assert index.index.find("hiddenByOuterMarker") is None
-
-
-def test_generated_publication_descendants_do_not_change_lean_generation(
-    tmp_path: Path,
-) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n", "A.lean")
-    generated = tmp_path / "generated"
-    generated.mkdir()
-    (generated / "publication.json").write_text(
-        '{"schema":"autoform-publication/v2"}\n', encoding="utf-8"
-    )
-    copied = generated / "Copied.lean"
-    copied.write_text("def copied : Nat := 0\n", encoding="utf-8")
-    before = snapshot_project_sources(tmp_path)
-
-    copied.write_text("def copied : Nat := 1\n", encoding="utf-8")
-    after = snapshot_project_sources(tmp_path)
-
-    assert after.revision == before.revision
-    assert after.generation_revision == before.generation_revision
 
 
 def test_empty_non_source_directory_does_not_change_lean_generation(tmp_path: Path) -> None:
@@ -1804,29 +1642,6 @@ def test_replaced_source_changes_only_the_generation_revision(tmp_path: Path) ->
     assert after.index.line_counts == {Path("A.lean"): 1}
 
 
-def test_outer_publication_marker_deterministically_excludes_nested_markers(
-    tmp_path: Path,
-) -> None:
-    _index(tmp_path, "def canonical : Nat := 0\n", "A.lean")
-    outer = tmp_path / "generated"
-    nested = outer / "nested"
-    nested.mkdir(parents=True)
-    for directory in (outer, nested):
-        (directory / "publication.json").write_text(
-            '{"schema":"autoform-publication/v2"}\n', encoding="utf-8"
-        )
-    copied = nested / "Copied.lean"
-    copied.write_text("def copied : Nat := 0\n", encoding="utf-8")
-    before = snapshot_project_sources(tmp_path)
-
-    (nested / "publication.json").write_text("{}\n", encoding="utf-8")
-    copied.write_text("def copied : Nat := 1\n", encoding="utf-8")
-    after = snapshot_project_sources(tmp_path)
-
-    assert after.revision == before.revision
-    assert after.generation_revision == before.generation_revision
-
-
 @pytest.mark.parametrize(
     ("kind", "schema"),
     [
@@ -1844,7 +1659,7 @@ def test_managed_skeleton_output_is_not_indexed_as_project_source(
     packet.parent.mkdir(parents=True)
     packet.write_text("def target : Nat := 2\n", encoding="utf-8")
     (packets / "manifest.json").write_text(
-        json.dumps({"kind": kind, "packets": [], "schema": schema}) + "\n",
+        json.dumps({"kind": kind, kind: [], "schema": schema}) + "\n",
         encoding="utf-8",
     )
 
@@ -1880,6 +1695,204 @@ def test_managed_skeleton_output_does_not_change_source_revisions(
     assert after.generation_revision == before.generation_revision
 
 
+def test_managed_output_marker_prunes_before_any_descendant_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _index(tmp_path, "def authored : Nat := 0\n", "Authored.lean")
+    generated = tmp_path / "review-packets"
+    (generated / "nested").mkdir(parents=True)
+    (generated / "nested" / "Packet.lean").write_text("def generated : Nat := 0\n")
+    (generated / "manifest.json").write_text(
+        json.dumps(
+            {
+                "kind": "packets",
+                "packets": [],
+                "schema": "autoform-skeleton-packets/v2",
+            }
+        )
+    )
+    original_read = tree_snapshot_module._read_file
+
+    def refuse_descendant(parent_descriptor, name, expected, *, max_bytes=None):
+        if name == "Packet.lean":
+            raise AssertionError("managed descendants must not be opened")
+        return original_read(
+            parent_descriptor,
+            name,
+            expected,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(tree_snapshot_module, "_read_file", refuse_descendant)
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert snapshot.index.find("authored") is not None
+    assert snapshot.index.find("generated") is None
+
+
+def test_managed_output_descendant_churn_does_not_retry_source_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _index(tmp_path, "def authored : Nat := 0\n", "Authored.lean")
+    generated = tmp_path / "review-packets"
+    generated.mkdir()
+    packet = generated / "Packet.lean"
+    packet.write_text("def generated : Nat := 0\n")
+    (generated / "manifest.json").write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    edits = 0
+
+    def churn_output(event: str, relative: str) -> None:
+        nonlocal edits
+        original_checkpoint(event, relative)
+        if event == "before-final-verification" and relative == "":
+            edits += 1
+            packet.write_text(f"def generated : Nat := {edits}\n")
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", churn_output)
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert edits == 1
+    assert snapshot.index.find("authored") is not None
+    assert snapshot.index.find("generated") is None
+
+
+def test_managed_output_marker_change_retries_the_whole_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _index(tmp_path, "def authored : Nat := 0\n", "Authored.lean")
+    generated = tmp_path / "review-packets"
+    generated.mkdir()
+    (generated / "Packet.lean").write_text("def generated : Nat := 0\n")
+    marker = generated / "manifest.json"
+    marker.write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+    original_checkpoint = tree_snapshot_module._tree_snapshot_checkpoint
+    changed = False
+    attempts = 0
+    original_bind = lean_module.bind_project_sources
+
+    def change_marker_once(event: str, relative: str) -> None:
+        nonlocal changed
+        original_checkpoint(event, relative)
+        if event == "before-final-verification" and relative == "" and not changed:
+            changed = True
+            marker.write_text(
+                '{"kind": "packets", "packets": [], '
+                '"schema": "autoform-skeleton-packets/v2"}\n'
+            )
+
+    def counted_bind(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", change_marker_once)
+    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+
+    snapshot = snapshot_project_sources(tmp_path)
+
+    assert changed
+    assert attempts == 2
+    assert snapshot.index.find("authored") is not None
+    assert snapshot.index.find("generated") is None
+
+
+def test_managed_marker_at_requested_root_never_prunes_the_root(tmp_path: Path) -> None:
+    (tmp_path / "Root.lean").write_text("def rootSource : Nat := 0\n")
+    (tmp_path / "manifest.json").write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+
+    index = index_project(tmp_path)
+
+    assert index.find("rootSource") is not None
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        TreeCaptureLimits(max_entries=2),
+        TreeCaptureLimits(max_total_bytes=1),
+    ],
+)
+def test_managed_marker_surface_obeys_capture_limits(
+    tmp_path: Path,
+    limits: TreeCaptureLimits,
+) -> None:
+    generated = tmp_path / "review-packets"
+    generated.mkdir()
+    (generated / "Packet.lean").write_text("def generated : Nat := 0\n")
+    (generated / "manifest.json").write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+
+    with pytest.raises(lean_module.LeanSourceError, match="directory tree exceeds"):
+        snapshot_project_sources(tmp_path, limits=limits)
+
+
+def test_ambiguous_managed_markers_do_not_prune_source(
+    tmp_path: Path,
+) -> None:
+    generated = tmp_path / "review-packets"
+    generated.mkdir()
+    lower = generated / "manifest.json"
+    upper = generated / "MANIFEST.JSON"
+    lower.write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+    upper.write_text("{}\n")
+    if lower.samefile(upper):
+        pytest.skip("filesystem does not permit case-colliding marker names")
+    (generated / "Visible.lean").write_text("def visibleBesideAmbiguity : Nat := 0\n")
+
+    index = index_project(tmp_path)
+
+    assert index.find("visibleBesideAmbiguity") is not None
+
+
+def test_managed_marker_case_alias_still_prunes_generated_source(
+    tmp_path: Path,
+) -> None:
+    generated = tmp_path / "review-packets"
+    generated.mkdir()
+    (generated / "MANIFEST.JSON").write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+    (generated / "Hidden.lean").write_text("def hiddenByAlias : Nat := 0\n")
+
+    index = index_project(tmp_path)
+
+    assert index.find("hiddenByAlias") is None
+
+
+def test_nonregular_managed_marker_does_not_prune_source(tmp_path: Path) -> None:
+    generated = tmp_path / "review-packets"
+    generated.mkdir()
+    outside = tmp_path / "outside-manifest.json"
+    outside.write_text(
+        '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
+    )
+    try:
+        (generated / "manifest.json").symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    (generated / "Visible.lean").write_text("def visibleBesideLink : Nat := 0\n")
+
+    index = index_project(tmp_path)
+
+    assert index.find("visibleBesideLink") is not None
+
+
 def test_large_managed_skeleton_manifest_still_excludes_generated_sources(
     tmp_path: Path,
 ) -> None:
@@ -1891,7 +1904,7 @@ def test_large_managed_skeleton_manifest_still_excludes_generated_sources(
     payload = json.dumps(
         {
             "kind": "packets",
-            "packets": ["x" * (lean_module._PUBLICATION_MANIFEST_BYTE_LIMIT + 1)],
+            "packets": ["x" * (1024 * 1024 + 1)],
             "schema": "autoform-skeleton-packets/v2",
         },
         sort_keys=True,
@@ -2057,3 +2070,149 @@ def test_build_linker_rejects_a_captured_index_from_another_root(tmp_path: Path)
 
     with pytest.raises(ValueError, match="different Lean root"):
         build_linker(second, source_index=index, detect_missing=False)
+
+
+def _init_git_repository(root: Path, *, object_format: str = "sha1") -> str:
+    initialized = subprocess.run(
+        ["git", "init", f"--object-format={object_format}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if initialized.returncode != 0:
+        pytest.skip(f"Git does not support {object_format} repositories")
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/owner/repo.git"],
+        cwd=root,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Autoform Tests",
+            "-c",
+            "user.email=autoform@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_auto_linker_only_links_bytes_present_in_the_commit(
+    tmp_path: Path,
+    object_format: str,
+) -> None:
+    root = tmp_path / object_format
+    root.mkdir()
+    _index(root, "def committed : Nat := 0\n", "Committed.lean")
+    _index(root, "def dirty : Nat := 0\n", "Dirty.lean")
+    commit = _init_git_repository(root, object_format=object_format)
+    (root / "Dirty.lean").write_text("def dirty : Nat := 1\n")
+    (root / "Untracked.lean").write_text("def untracked : Nat := 0\n")
+
+    linker = build_linker(root)
+
+    assert linker.ref == commit
+    assert linker.url("committed") == (
+        f"https://github.com/owner/repo/blob/{commit}/Committed.lean#L1"
+    )
+    assert linker.location("dirty") is not None
+    assert linker.location("untracked") is not None
+    assert linker.url("dirty") is None
+    assert linker.url("untracked") is None
+
+
+def test_auto_linker_retries_ref_and_source_as_one_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "A.lean"
+    source.write_text("def first : Nat := 0\n")
+    first_commit = _init_git_repository(root)
+    original_snapshot = lean_module.snapshot_project_sources
+    captures = 0
+    second_commit = ""
+
+    def capture_then_commit(*args, **kwargs):
+        nonlocal captures, second_commit
+        snapshot = original_snapshot(*args, **kwargs)
+        captures += 1
+        if captures == 1:
+            source.write_text("def second : Nat := 0\n")
+            subprocess.run(["git", "add", "A.lean"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Autoform Tests",
+                    "-c",
+                    "user.email=autoform@example.invalid",
+                    "commit",
+                    "-m",
+                    "second",
+                ],
+                cwd=root,
+                capture_output=True,
+                check=True,
+            )
+            second_commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        return snapshot
+
+    monkeypatch.setattr(lean_module, "snapshot_project_sources", capture_then_commit)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+
+    linker = build_linker(root)
+
+    assert captures == 2
+    assert first_commit != second_commit
+    assert linker.ref == second_commit
+    assert linker.location("first") is None
+    assert linker.url("second") == (
+        f"https://github.com/owner/repo/blob/{second_commit}/A.lean#L1"
+    )
+
+
+def test_build_linker_preserves_alias_spelled_exclusions(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    _index(root, "def keptByLinker : Nat := 0\n", "Keep.lean")
+    excluded = root / "Generated"
+    excluded.mkdir()
+    (excluded / "Leak.lean").write_text("def leakedByLinker : Nat := 0\n")
+    alias = tmp_path / "alias"
+    try:
+        alias.symlink_to(root, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    linker = build_linker(
+        alias,
+        exclude_roots=(alias / "generated",),
+        repository_url="https://github.com/owner/repo",
+        ref="attested",
+    )
+
+    assert linker.location("keptByLinker") is not None
+    assert linker.location("leakedByLinker") is None

@@ -656,3 +656,40 @@ def test_descriptor_and_portable_limits_capture_the_same_snapshot(
         )
 
     assert descriptor_snapshot == portable_snapshot
+
+
+def test_portable_capture_sanitizes_unsupported_reparse_points(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    payload = root / "opaque-entry"
+    payload.write_bytes(b"payload")
+    identity = (payload.stat().st_dev, payload.stat().st_ino)
+    original_reparse = tree_snapshot_module._is_reparse_point
+
+    def is_reparse(metadata) -> bool:
+        return (metadata.st_dev, metadata.st_ino) == identity or original_reparse(
+            metadata
+        )
+
+    def unsupported_readlink(_path) -> str:
+        raise ValueError("private unsupported reparse tag")
+
+    monkeypatch.setattr(
+        directory_binding_module,
+        "DIRECTORY_BINDING_SUPPORTED",
+        False,
+    )
+    monkeypatch.setattr(tree_snapshot_module, "_is_reparse_point", is_reparse)
+    monkeypatch.setattr(tree_snapshot_module.os, "readlink", unsupported_readlink)
+
+    with pytest.raises(
+        TreeSnapshotError,
+        match="directory tree contains an unsupported reparse point",
+    ) as caught:
+        with bind_directory_tree(root) as bound:
+            bound.capture()
+
+    assert "private" not in str(caught.value)
