@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -17,9 +18,12 @@ from .article_identity import plan_article_ids
 from .audit import audit_blueprint
 from .claims import CLAIM_TTL_S, ClaimBoard, ClaimTransportError, author_claim_key
 from .doctor import diagnose_project
+from .dashboard import publication_bound_live_state, serve_dashboard
 from .graph import GraphValidationError, load_graph
 from .lean import build_linker, declaration_names
+from .project import ProjectCatalogError, inspect_project, load_release_catalog
 from .render import PublicationError, render_site
+from .runtime import RuntimeProjectionError, load_runtime_graph, resolve_runtime_paths
 from .scaffold import ScaffoldError, scaffold_project
 from .skeleton import (
     DEFAULT_PROBE_TIMEOUT,
@@ -71,6 +75,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     doctor.add_argument("--lean-root", type=Path, help="Lean project to resolve local targets against")
     doctor.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
+    dashboard = subparsers.add_parser(
+        "dashboard",
+        help="serve the built publication with a loopback-only live claim overlay",
+    )
+    dashboard.add_argument(
+        "target",
+        nargs="?",
+        default=".",
+        help="project root or blueprint directory (default: current directory)",
+    )
+    dashboard.add_argument("--site-dir", default="site", help="built MkDocs site directory")
+    dashboard.add_argument("--repo", help="claim-board Git repository; defaults to project origin")
+    dashboard.add_argument("--scratch", type=Path, help="local bare Git object cache")
+    dashboard.add_argument("--host", default="127.0.0.1", help="loopback host")
+    dashboard.add_argument(
+        "--port",
+        type=_port,
+        default=0,
+        help="local port (default: choose an available port)",
+    )
+
+    project = subparsers.add_parser("project", help="inspect local project configuration and releases")
+    project_subparsers = project.add_subparsers(dest="project_command", required=True)
+    project_inspect = project_subparsers.add_parser(
+        "inspect", help="inspect a project without running Lake, Git, or network operations"
+    )
+    project_inspect.add_argument(
+        "target", nargs="?", default=".", help="a path inside the project (default: current directory)"
+    )
+    project_inspect.add_argument("--json", action="store_true", help="write stable machine-readable output")
+    project_versions = project_subparsers.add_parser(
+        "versions", help="list bundled known-good Lean and Mathlib releases"
+    )
+    project_versions.add_argument("--json", action="store_true", help="write stable machine-readable output")
     claim = subparsers.add_parser("claim", help="coordinate temporary node ownership through Git refs")
     claim_subparsers = claim.add_subparsers(dest="claim_command", required=True)
     for operation in ("acquire", "renew", "release"):
@@ -167,6 +205,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _audit(args)
     if args.command == "doctor":
         return _doctor(args)
+    if args.command == "dashboard":
+        return _dashboard(args)
+    if args.command == "project":
+        return _project(args)
     if args.command == "claim":
         return _claim(args)
     if args.command == "migrate":
@@ -296,6 +338,103 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if result.clean else 1
 
 
+def _dashboard(args: argparse.Namespace) -> int:
+    try:
+        paths = resolve_runtime_paths(args.target)
+        site = Path(args.site_dir).expanduser()
+        if not site.is_absolute():
+            site = paths.project_root / site
+        repo = args.repo or _origin_url(paths.project_root)
+
+        def run(scratch: Path) -> None:
+            claims = ClaimBoard(repo, "dashboard-readonly", scratch)
+            state = publication_bound_live_state(
+                lambda: load_runtime_graph(paths.project_root),
+                claims,
+                blueprint_dir=paths.blueprint_dir,
+                site_dir=site,
+            )
+            def ready(host: str, port: int) -> None:
+                print(f"Dashboard: http://{host}:{port}/", flush=True)
+                print(
+                    "Static content comes from the built site; live claims remain local-only.",
+                    flush=True,
+                )
+
+            serve_dashboard(site, state, host=args.host, port=args.port, on_ready=ready)
+
+        if args.scratch is not None:
+            run(args.scratch)
+        else:
+            with tempfile.TemporaryDirectory(prefix="autoform-dashboard-") as temporary:
+                run(Path(temporary) / "claims.git")
+    except (OSError, RuntimeProjectionError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+def _project(args: argparse.Namespace) -> int:
+    try:
+        catalog = load_release_catalog()
+    except ProjectCatalogError as error:
+        if args.json:
+            print(json.dumps({"error": {"code": "project-catalog-invalid", "message": str(error)}, "ok": False}))
+        else:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+    if args.project_command == "versions":
+        if args.json:
+            print(catalog.to_json())
+            return 0
+        print("Known-good Lean/Mathlib releases:")
+        for release in catalog.releases:
+            print(f"  {release.id}{' [recommended]' if release.recommended else ''}")
+            print(f"    Lean: {release.lean_toolchain}")
+            print(f"    Mathlib: {release.mathlib_rev} @ {release.mathlib_commit} ({release.mathlib_git})")
+        return 0
+    result = inspect_project(args.target, catalog=catalog)
+    if args.json:
+        print(result.to_json())
+    else:
+        _print_project_inspection(result)
+    return 0 if result.ok else 1
+
+
+def _print_project_inspection(result) -> None:
+    if result.project_root is not None:
+        print(f"Project root: {_human_text(result.project_root)}")
+    if result.lake is not None:
+        version = f" {result.lake.version}" if result.lake.version else ""
+        print(f"Lake: {_human_text((result.lake.name or 'unknown package') + version)} ({result.lake.config})")
+        for target in result.lake.targets:
+            print(f"  {target.kind} {_human_text(target.name)}")
+    if result.lean_toolchain is not None:
+        print(f"Lean: {_human_text(result.lean_toolchain)}")
+    if result.mathlib is not None:
+        mathlib = result.mathlib
+        where = mathlib.dir if mathlib.type == "path" else f"{mathlib.input_rev} @ {mathlib.rev} ({mathlib.url})"
+        print(f"Mathlib: {_human_text(where)} [{mathlib.source}]")
+    if result.autoform_paths:
+        print(f"Autoform: {', '.join(result.autoform_paths)}")
+    release = f" ({result.compatibility.release})" if result.compatibility.release else ""
+    print(f"Compatibility: {result.compatibility.status}{release}")
+    for diagnostic in result.diagnostics:
+        location = f" {diagnostic.path}" if diagnostic.path else ""
+        print(f"{diagnostic.severity}[{diagnostic.code}]{location}: {diagnostic.message}", file=sys.stderr)
+
+
+def _human_text(value: object) -> str:
+    """Escape nonprintable characters so project files cannot forge report lines."""
+
+    return "".join(
+        character if character.isprintable() else character.encode("unicode_escape").decode("ascii")
+        for character in str(value)
+    )
+
+
 def _claim(args: argparse.Namespace) -> int:
     try:
         board = _claim_board(args)
@@ -415,7 +554,7 @@ def _claim_board(args: argparse.Namespace) -> ClaimBoard:
     return ClaimBoard(repo, worker_id, scratch)
 
 
-def _origin_url() -> str:
+def _origin_url(root: Path | None = None) -> str:
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -423,10 +562,21 @@ def _origin_url() -> str:
             text=True,
             check=True,
             timeout=10,
+            cwd=root,
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise ValueError("--repo is required outside a Git checkout with an origin remote") from exc
     return result.stdout.strip()
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be an integer") from error
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 0 and 65535")
+    return port
 
 
 def _default_claim_scratch(repo: str, worker_id: str) -> Path:

@@ -4,6 +4,10 @@ The Autoform CLI validates, visualizes, and publishes the multilevel dependency
 graph embedded in `blueprint/roadmap/`. The Markdown book is the graph: no
 separate authored or generated graph file exists.
 
+This is an agent-facing interface. Normal project work starts from Autoform's
+skills in the user's preferred agent window; those agents invoke these commands
+as needed.
+
 ## Articles and containment
 
 Every Markdown file below `blueprint/roadmap/` is an article node. A
@@ -127,6 +131,29 @@ autoform init . --title "Finite Flat Group Schemes" \
 Pass `--autoform-ref <sha>` to pin the generated workflows at an immutable
 commit, `--force` to overwrite, and `--json` for machine-readable output.
 
+Inspect a Lean project and list Autoform's bundled known-good release pairs:
+
+```bash
+autoform project inspect .
+autoform project inspect path/inside/project --json
+autoform project versions --json
+```
+
+`project inspect` reads the nearest enclosing project's `lean-toolchain`,
+`lake-manifest.json`, and `lakefile.toml` without running Lake, Lean, Git, or
+the network. Compatibility is decided by the toolchain and the Mathlib commit
+the manifest locks, which is what `lake build` uses: `supported` when that pair
+is in the bundled catalog, `unlisted` when it is not, and `indeterminate` when
+either is unknown (no manifest, no Mathlib, a path-based Mathlib, or any file
+error). A `.lake/package-overrides.json` entry for Mathlib replaces the
+manifest's, and a `lakefile.toml` that requests a different Mathlib than the
+lock gets a `lake-manifest-stale` warning. `lakefile.lean` takes precedence, as
+in Lake, but is never evaluated, so its projects stay `indeterminate`. As in
+elan, only the trimmed first line of `lean-toolchain` counts.
+
+`project versions` lists the bundled catalog of known-good Lean and Mathlib
+pairs. It is an allowlist, not a resolver.
+
 Publishing a project runs four steps in order: validate, write the Mermaid
 graph into the vault, render the site source, then strict-build the site.
 
@@ -137,10 +164,20 @@ uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform render blueprint \
   --output site-src --lean-root . --require-declarations
 uv run --with mkdocs --with mkdocs-material --with mkdocs-literate-nav \
   --with pymdown-extensions mkdocs build --strict
+uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform dashboard . --site-dir site
 ```
 
 Drop `--require-declarations` when reviewing work in progress, where a
 statement may name a Lean declaration that does not exist yet.
+
+`dashboard` serves the exact built MkDocs site on `127.0.0.1`, choosing an
+available port unless `--port` is supplied, and adds a read-only live overlay
+from current author claims. Static content remains the
+same artifact deployed to GitHub Pages; only the loopback server exposes
+`/__autoform/live.json`. The overlay is ephemeral, uses the runtime's temporary
+path-derived node IDs, and is never written into the vault, publication
+manifest, or public site. Re-run render and the MkDocs build to refresh durable
+content; claim badges update while the local server is running.
 
 Validate structure, and optionally check that every `lean:` name really exists
 in the project's Lean sources:
