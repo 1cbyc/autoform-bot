@@ -258,7 +258,27 @@ def snapshot_project_sources(
             changed = error
         except TreeSnapshotError as error:
             raise LeanSourceError(str(error)) from error
+    lasting = _lasting_root_failure(root)
+    if lasting is not None:
+        raise LeanSourceError(lasting) from changed
     raise LeanSourceError("Lean sources kept changing while they were indexed") from changed
+
+
+def _lasting_root_failure(root: str | Path) -> str | None:
+    """Name a stable root-kind failure after retryable bind errors are exhausted."""
+
+    path = directory_binding.lexical_absolute_path(root)
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return "directory tree cannot be inspected safely: directory root does not exist"
+    except NotADirectoryError:
+        return "directory tree cannot be inspected safely: directory root is not a directory"
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISDIR(metadata.st_mode):
+        return "directory tree cannot be inspected safely: directory root is not a directory"
+    return None
 
 
 def project_source_revision(
@@ -839,7 +859,7 @@ def build_linker(
                 exclude_roots=remapped_exclusions,
             )
     if detect_missing and resolved_repository_url is None:
-        resolved_repository_url = detect_repository_url(requested_root)
+        resolved_repository_url = detect_repository_url(resolved_root)
     assert index is not None
     return SourceLinker(
         index=index,
