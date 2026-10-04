@@ -156,7 +156,7 @@ class MathlibLock:
 
         return (
             self.type == "git"
-            and self.sub_dir in (None, "", ".")
+            and self.sub_dir in (None, "", ".", "./")
             # Extensionless `lakefile` is Lake's default and resolves by
             # preferring lakefile.lean before lakefile.toml.
             and self.config_file in ("lakefile", "lakefile.lean")
