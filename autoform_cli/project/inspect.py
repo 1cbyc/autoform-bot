@@ -376,7 +376,7 @@ def _locked_mathlib(root: Path, relative: str, diagnostics: list[ProjectDiagnost
 
 
 def _manifest_layout(version: object) -> str | None:
-    """Lake reads manifest versions 5 (0.5.0) up to 2.0.0; those before 7 (0.7.0) use a legacy layout."""
+    """Lake reads manifest versions from 5 (0.5.0) to any 1.x, not 2.0.0; those before 7 (0.7.0) use a legacy layout."""
 
     if isinstance(version, int) and not isinstance(version, bool):
         parts = (0, version, 0)
