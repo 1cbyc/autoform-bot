@@ -15,14 +15,16 @@ def main() -> int:
     mode, raw_root = sys.argv[1:]
     root = Path(raw_root)
     switched = False
+    beneath = False
     if mode == "swap":
         lakefile = root / "lakefile.toml"
         original_open = project_inspect.os.open
 
         def racing_open(path, flags, *args, **kwargs):
-            nonlocal switched
+            nonlocal switched, beneath
             if (Path(path) == lakefile or str(path) == "lakefile.toml") and not switched:
                 switched = True
+                beneath = kwargs.get("dir_fd") is not None
                 lakefile.unlink()
                 os.mkfifo(lakefile)
             return original_open(path, flags, *args, **kwargs)
@@ -34,7 +36,7 @@ def main() -> int:
         raise ValueError(f"unknown FIFO probe mode: {mode}")
 
     result = inspect_project(root)
-    print(json.dumps({"result": result.as_dict(), "switched": switched}, sort_keys=True))
+    print(json.dumps({"result": result.as_dict(), "switched": switched, "dir_fd": beneath}, sort_keys=True))
     return 0
 
 

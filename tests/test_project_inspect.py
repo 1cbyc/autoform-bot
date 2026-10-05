@@ -1435,6 +1435,8 @@ def test_file_replaced_by_fifo_between_stat_and_open_never_blocks(
     result = probe["result"]
 
     assert probe["switched"]
+    # The swap lands in the descriptor-relative open wherever real runs use one.
+    assert probe["dir_fd"] == (os.open in os.supports_dir_fd)
     assert not result["ok"]
     assert result["compatibility"]["status"] == "indeterminate"
     assert "unreadable-file" in {item["code"] for item in result["diagnostics"]}
@@ -1888,6 +1890,8 @@ def test_decision_file_linked_into_a_search_only_directory_is_read_like_lake(tmp
     target = _move_behind_symlink(root, "lean-toolchain")
     target.parent.chmod(0o311)
     try:
+        with pytest.raises(PermissionError):
+            os.listdir(target.parent)
         result = inspect_project(root)
     finally:
         target.parent.chmod(0o755)
@@ -1915,6 +1919,35 @@ def test_link_target_that_must_be_a_directory_never_reads_a_file(tmp_path: Path,
         "lean-toolchain"
     ]
     assert "project-changed-during-inspection" not in _codes(result)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+@pytest.mark.parametrize(("suffix", "absolute"), [("/", True), ("/.", False)])
+def test_directory_link_target_ending_in_a_slash_is_followed(tmp_path: Path, suffix: str, absolute: bool) -> None:
+    # Shell completion writes directory links as "../shared/.lake/", and the
+    # kernel follows them like links without the slash.
+    root = _project(tmp_path)
+    (root / ".lake").mkdir()
+    (root / ".lake/package-overrides.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": "1.1.0",
+                "packages": [{"name": "mathlib", "type": "path", "dir": "../mathlib4", "inherited": False}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    target = _move_behind_symlink(root, ".lake")
+    link = root / ".lake"
+    link.unlink()
+    os.symlink(f"{target if absolute else os.path.relpath(target, root)}{suffix}", link)
+    assert (link / "package-overrides.json").is_file()
+
+    result = inspect_project(root)
+
+    assert "unreadable-file" not in _codes(result)
+    assert result.mathlib.source == ".lake/package-overrides.json"
+    assert "mathlib-overridden" in _codes(result)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
