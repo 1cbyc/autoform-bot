@@ -541,7 +541,9 @@ Markdown statement rests on the revised article, directly or through other
 statement dependencies, that are not statement-impacted: the probe follows
 names, so a dependent whose Lean inlines a revised definition's body shows no
 use although its statement changes meaning. They join `claim_targets` too. A
-revision is contained exactly when the selected article's target is its only
+`mathlib: true` article is left out: its statement is a Mathlib declaration,
+which cannot use the revised one, and it cannot record `statement: retracted`.
+A revision is contained exactly when the selected article's target is its only
 claim target. Project locality is an exact inventory of regular repository
 source modules, never a namespace-prefix guess.
 
