@@ -57,40 +57,55 @@ def _no_checkout_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scaffold_module, "plugin_pin", lambda _templates=None: ("", ""))
 
 
-def test_creation_without_a_pin_omits_the_workflows(tmp_path: Path) -> None:
-    target = tmp_path / "Project"
-    result = create_project(target, package="Project", release_id=_RELEASE)
+def _refused(target: Path, code: str, **options: object) -> ProjectCreateError:
+    """Expect *code* from creating *target*, leaving its parent exactly as it was: no target, no stage."""
 
-    assert not result.workflows_pinned
-    assert not (target / ".github/workflows/autoform-verify.yml").exists()
-    assert not (target / ".github/workflows/blueprint-pages.yml").exists()
+    before = sorted(target.parent.iterdir())
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, **{"package": "Project", "release_id": _RELEASE, **options})
+    assert raised.value.code == code
+    assert sorted(target.parent.iterdir()) == before
+    return raised.value
 
 
-def test_creation_pins_workflows_to_the_running_checkout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("pin", "options", "expected"),
+    [
+        ((_SOURCE, "b" * 40), {}, (_SOURCE, "b" * 40)),
+        ((_SOURCE, "b" * 40), {"autoform_ref": "1" * 40}, (_SOURCE, "1" * 40)),
+        (("", ""), {"autoform_ref": "1" * 40}, (DEFAULT_AUTOFORM_SOURCE, "1" * 40)),
+        (("", ""), {"autoform_source": _SOURCE, "autoform_ref": "A" * 40}, (_SOURCE, "a" * 40)),
+    ],
+    ids=["checkout-pin", "ref-keeps-checkout-source", "ref-uses-default-source", "explicit-pin"],
+)
+def test_workflow_pin_resolution(
+    pin: tuple[str, str],
+    options: dict[str, str],
+    expected: tuple[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        scaffold_module, "plugin_pin", lambda _templates=None: (_SOURCE, "b" * 40)
-    )
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda _templates=None: pin)
     target = tmp_path / "Project"
 
-    result = create_project(target, package="Project", release_id=_RELEASE)
+    result = create_project(target, package="Project", release_id=_RELEASE, **options)
 
     assert result.workflows_pinned
     workflow = (target / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
-    assert f'AUTOFORM_SOURCE: "{_SOURCE}"' in workflow
-    assert f'AUTOFORM_REF: "{"b" * 40}"' in workflow
+    assert f'AUTOFORM_SOURCE: "{expected[0]}"' in workflow
+    assert f'AUTOFORM_REF: "{expected[1]}"' in workflow
 
 
 @pytest.mark.parametrize(
     ("source", "revision"),
     [
+        ("", ""),
         ("https://user:secret@example.test/owner/autoform.git", "b" * 40),
         (_SOURCE, "main"),
         ("", "b" * 40),
     ],
 )
-def test_creation_ignores_an_unusable_checkout_pin(
+def test_creation_omits_workflows_without_a_usable_checkout_pin(
     source: str, revision: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -102,24 +117,6 @@ def test_creation_ignores_an_unusable_checkout_pin(
 
     assert not result.workflows_pinned
     assert not (target / ".github").exists()
-
-
-@pytest.mark.parametrize(
-    ("pin", "expected_source"),
-    [((_SOURCE, "b" * 40), _SOURCE), (("", ""), DEFAULT_AUTOFORM_SOURCE)],
-)
-def test_an_explicit_ref_alone_keeps_the_checkout_or_default_source(
-    pin: tuple[str, str], expected_source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda _templates=None: pin)
-    target = tmp_path / "Project"
-
-    result = create_project(target, package="Project", release_id=_RELEASE, autoform_ref="1" * 40)
-
-    assert result.workflows_pinned
-    workflow = (target / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
-    assert f'AUTOFORM_SOURCE: "{expected_source}"' in workflow
-    assert f'AUTOFORM_REF: "{"1" * 40}"' in workflow
 
 
 def test_an_explicit_source_never_inherits_the_checkout_commit(
@@ -137,25 +134,6 @@ def test_an_explicit_source_never_inherits_the_checkout_commit(
     assert not (target / ".github").exists()
 
 
-def test_creation_accepts_an_explicit_workflow_pin(tmp_path: Path) -> None:
-    target = tmp_path / "Project"
-    source = "https://example.test/owner/autoform.git"
-    revision = "A" * 40
-
-    result = create_project(
-        target,
-        package="Project",
-        release_id=_RELEASE,
-        autoform_source=source,
-        autoform_ref=revision,
-    )
-
-    assert result.workflows_pinned
-    workflow = (target / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
-    assert f'AUTOFORM_SOURCE: "{source}"' in workflow
-    assert f'AUTOFORM_REF: "{revision.lower()}"' in workflow
-
-
 @pytest.mark.parametrize(
     ("source", "revision"),
     [
@@ -170,20 +148,12 @@ def test_creation_accepts_an_explicit_workflow_pin(tmp_path: Path) -> None:
 def test_creation_rejects_an_invalid_workflow_pin_before_writing(
     source: str, revision: str, tmp_path: Path
 ) -> None:
-    target = tmp_path / "Project"
-
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(
-            target,
-            package="Project",
-            release_id=_RELEASE,
-            autoform_source=source,
-            autoform_ref=revision,
-        )
-
-    assert raised.value.code == "project-workflow-pin-invalid"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
+    _refused(
+        tmp_path / "Project",
+        "project-workflow-pin-invalid",
+        autoform_source=source,
+        autoform_ref=revision,
+    )
 
 
 @pytest.mark.parametrize(
@@ -234,15 +204,9 @@ def test_unsafe_local_templates_use_the_project_error_contract(
     templates = tmp_path / "templates"
     templates.mkdir()
     (templates / "escape").symlink_to(tmp_path / "missing")
-    target = tmp_path / "Project"
     monkeypatch.setattr(create_module, "_TEMPLATES", templates)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
+    _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
 def test_incomplete_local_templates_are_not_published(
@@ -251,15 +215,9 @@ def test_incomplete_local_templates_are_not_published(
     templates = tmp_path / "templates"
     shutil.copytree(create_module._TEMPLATES, templates)
     (templates / "theme/main.html").unlink()
-    target = tmp_path / "Project"
     monkeypatch.setattr(create_module, "_TEMPLATES", templates)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
+    _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
 def test_group_writable_installed_templates_publish_canonical_modes(
@@ -290,7 +248,6 @@ def test_group_writable_installed_templates_publish_canonical_modes(
 def test_missing_release_manifest_is_not_published(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    target = tmp_path / "Project"
     release = load_release_catalog().recommended
     descriptor = create_module._load_creation_release_descriptor(release)
     monkeypatch.setattr(
@@ -301,12 +258,7 @@ def test_missing_release_manifest_is_not_published(
         ),
     )
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
+    _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
 def test_creates_complete_supported_project(tmp_path: Path) -> None:
@@ -408,15 +360,11 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
         "MathLib",
         "LEAN",
         "STD",
+        123,
     ],
 )
-def test_rejects_invalid_package_before_writing(tmp_path: Path, package: str) -> None:
-    target = tmp_path / "project"
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package=package, release_id=_RELEASE)
-    assert raised.value.code == "project-name-invalid"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
+def test_rejects_invalid_package_before_writing(tmp_path: Path, package: object) -> None:
+    _refused(tmp_path / "project", "project-name-invalid", package=package)
 
 
 def test_every_release_has_creation_contracts() -> None:
@@ -463,11 +411,7 @@ def test_release_metadata_must_cover_manifest_and_mathlib_production_roots(
         create_module, "_load_creation_release_descriptor", lambda _release: changed
     )
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "Project", package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not list(tmp_path.iterdir())
+    _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
 @pytest.mark.parametrize(
@@ -498,17 +442,6 @@ def test_release_bundle_rejects_non_generated_manifest_shapes(corruption: str) -
     assert raised.value.code == "project-create-validation-failed"
 
 
-def test_rejects_non_string_package_before_writing(tmp_path: Path) -> None:
-    target = tmp_path / "project"
-
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package=123, release_id=_RELEASE)  # type: ignore[arg-type]
-
-    assert raised.value.code == "project-name-invalid"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
-
-
 def test_package_name_reserves_the_longest_lake_artifact_filename(tmp_path: Path) -> None:
     name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
     suffix_bytes = len(create_module._LONGEST_LAKE_ARTIFACT_SUFFIX.encode("ascii"))
@@ -535,11 +468,7 @@ def test_open_parent_descriptor_rechecks_the_generated_module_filename_limit(
         create_module, "_validate_package", lambda _package, _parent: package
     )
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "project", package=package, release_id=_RELEASE)
-
-    assert raised.value.code == "project-name-invalid"
-    assert not list(tmp_path.iterdir())
+    _refused(tmp_path / "project", "project-name-invalid", package=package)
 
 
 def test_rejects_unknown_release_before_writing(tmp_path: Path) -> None:
@@ -647,11 +576,7 @@ def test_catalog_pair_given_as_versions_uses_the_bundled_lock(
 def test_rejects_conflicting_or_incomplete_version_options_before_writing(
     tmp_path: Path, versions: dict[str, str | None]
 ) -> None:
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "Project", package="Project", **versions)
-
-    assert raised.value.code == "project-version-invalid"
-    assert not list(tmp_path.iterdir())
+    _refused(tmp_path / "Project", "project-version-invalid", **versions)
 
 
 @pytest.mark.parametrize(
@@ -685,11 +610,7 @@ def test_rejects_conflicting_or_incomplete_version_options_before_writing(
     ],
 )
 def test_rejects_invalid_lean_toolchains_before_writing(tmp_path: Path, toolchain: object) -> None:
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "Project", package="Project", release_id=None, lean_toolchain=toolchain)
-
-    assert raised.value.code == "project-version-invalid"
-    assert not list(tmp_path.iterdir())
+    _refused(tmp_path / "Project", "project-version-invalid", release_id=None, lean_toolchain=toolchain)
 
 
 @pytest.mark.parametrize(
@@ -723,13 +644,9 @@ def test_rejects_invalid_lean_toolchains_before_writing(tmp_path: Path, toolchai
     ],
 )
 def test_rejects_invalid_mathlib_revisions_before_writing(tmp_path: Path, revision: object) -> None:
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(
-            tmp_path / "Project", package="Project", release_id=None, lean_toolchain="v4.30.0", mathlib_rev=revision
-        )
-
-    assert raised.value.code == "project-version-invalid"
-    assert not list(tmp_path.iterdir())
+    _refused(
+        tmp_path / "Project", "project-version-invalid", release_id=None, lean_toolchain="v4.30.0", mathlib_rev=revision
+    )
 
 
 @pytest.mark.parametrize(
@@ -751,11 +668,7 @@ def test_warns_below_the_lean_floor(tmp_path: Path, toolchain: str, codes: list[
 @pytest.mark.parametrize("package", ["Docs", "DOCS", "Wanted", "LongestPole", "MATHLIB"])
 @pytest.mark.parametrize("toolchain", [None, "v4.30.0"])
 def test_reserved_mathlib_roots_are_refused(tmp_path: Path, package: str, toolchain: str | None) -> None:
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "Project", package=package, release_id=None, lean_toolchain=toolchain)
-
-    assert raised.value.code == "project-name-invalid"
-    assert not list(tmp_path.iterdir())
+    _refused(tmp_path / "Project", "project-name-invalid", package=package, release_id=None, lean_toolchain=toolchain)
 
 
 def test_catalog_releases_meet_the_lean_floor() -> None:
@@ -903,13 +816,7 @@ def test_rechecks_parent_mode_on_the_open_descriptor(
     target = parent / "Project"
     monkeypatch.setattr(create_module, "_validate_target", lambda _target: target)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-parent-unsafe"
-    assert "chmod g-w,o-w" in raised.value.message
-    assert not target.exists()
-    assert not list(parent.glob(".autoform-new-*"))
+    assert "chmod g-w,o-w" in _refused(target, "project-parent-unsafe").message
 
 
 def test_sticky_shared_parent_requires_a_trusted_descriptor_owner(
@@ -950,12 +857,7 @@ def test_missing_directory_capability_uses_stable_error(tmp_path: Path, monkeypa
         create_module.os.supports_dir_fd - {create_module.os.mkdir},
     )
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-safety-unavailable"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
+    _refused(target, "project-create-safety-unavailable")
 
 
 def test_injected_build_failure_preserves_the_empty_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1038,11 +940,7 @@ def test_plan_requires_exact_types_and_safe_file_modes_before_writing(
 
     monkeypatch.setattr(create_module, "_build_project_plan", corrupt)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "Project", package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not list(tmp_path.iterdir())
+    _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
 def test_close_failure_after_publish_reports_that_the_target_exists(
@@ -1920,11 +1818,7 @@ def test_pair_matching_the_catalog_in_one_component_stays_unlisted(
 def test_empty_version_options_are_not_defaults(
     tmp_path: Path, versions: dict[str, str | None], code: str
 ) -> None:
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(tmp_path / "Project", package="Project", **versions)
-
-    assert raised.value.code == code
-    assert not list(tmp_path.iterdir())
+    _refused(tmp_path / "Project", code, **versions)
 
 
 def test_version_conflict_and_floor_messages_name_the_problem(tmp_path: Path) -> None:
@@ -1943,18 +1837,10 @@ def test_version_conflict_and_floor_messages_name_the_problem(tmp_path: Path) ->
     ["v4." + "1" * 4301 + ".0", "v4.1234567890.0", "v4.30.0-rc1234567890"],
 )
 def test_oversized_version_components_are_invalid_not_a_crash(tmp_path: Path, toolchain: str) -> None:
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(
-            tmp_path / "Project",
-            package="Project",
-            release_id=None,
-            lean_toolchain=toolchain,
-            mathlib_rev="master",
-        )
-
-    assert raised.value.code == "project-version-invalid"
-    assert "Lean toolchain" in raised.value.message
-    assert not list(tmp_path.iterdir())
+    error = _refused(
+        tmp_path / "Project", "project-version-invalid", release_id=None, lean_toolchain=toolchain, mathlib_rev="master"
+    )
+    assert "Lean toolchain" in error.message
 
 
 def test_version_components_accept_nine_digits() -> None:
@@ -2203,13 +2089,9 @@ def test_parent_lock_held_elsewhere_fails_as_busy(tmp_path: Path, monkeypatch: p
     holder = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(holder, fcntl.LOCK_EX)
-        with pytest.raises(ProjectCreateError) as raised:
-            create_project(tmp_path / "Project", package="Project", release_id=_RELEASE)
+        _refused(tmp_path / "Project", "project-parent-busy")
     finally:
         os.close(holder)
-
-    assert raised.value.code == "project-parent-busy"
-    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("json_mode", [False, True])
