@@ -65,7 +65,7 @@ def test_presence_marker_makes_a_nested_directory_opaque(
     worker = root / "worker"
     payload = worker / "payload"
     payload.mkdir(parents=True)
-    (root / "kept").write_text("kept\n", encoding="utf-8")
+    (root / "kept").write_bytes(b"kept\n")
     (payload / "hidden").write_text("before\n", encoding="utf-8")
     marker = worker / ".git"
     if marker_kind == "file":
