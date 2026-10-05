@@ -541,7 +541,7 @@ partial def autoformOpenAuditOpenHits (env : Environment) (isRoot : Name → Boo
 
 /-- Whether a node rests on a root declaration that failed the audit, through the
 same edges as `autoformOpenAuditOpenHits`: a declaration whose `where` clause or
-other auxiliary failed gets no line that reads as a clean result. -/
+other auxiliary failed gets no status line. -/
 partial def autoformOpenAuditReachesFailed (env : Environment) (isRoot : Name → Bool)
     (openSet : Std.HashSet Name) (failed : Std.HashSet Name) (node : Name) :
     StateM (Std.HashMap Name Bool) Bool := do
@@ -671,12 +671,13 @@ run_cmd do
           let ownSorry := match info with
             | .thmInfo val => val.value.getUsedConstants.contains ``sorryAx
             | _ => false
-          if ownSorry then
-            logInfo m!"open statement (proof is sorry): {{declName}} [{{article}}]"
-          else if (← Lean.collectAxioms declName).contains ``sorryAx then
-            logInfo m!"open statement (proof depends on sorry elsewhere): {{declName}} [{{article}}]"
-          else if errors.size == reported && !broken then
-            logInfo m!"open statement (proof is sorry-free; restate it if retracted, then record proof: formalized): {{declName}} [{{article}}]"
+          if errors.size == reported && !broken then
+            if ownSorry then
+              logInfo m!"open statement (proof is sorry): {{declName}} [{{article}}]"
+            else if (← Lean.collectAxioms declName).contains ``sorryAx then
+              logInfo m!"open statement (proof depends on sorry elsewhere): {{declName}} [{{article}}]"
+            else
+              logInfo m!"open statement (proof is sorry-free; restate it if retracted, then record proof: formalized): {{declName}} [{{article}}]"
         else if !hits.isEmpty then
           conditionalCount := conditionalCount + 1
           if errors.size == reported && !broken then

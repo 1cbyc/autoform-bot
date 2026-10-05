@@ -17,7 +17,7 @@ from .graph import Graph, load_graph
 from .lean import declaration_names, index_project
 from .status import derive, is_definition
 
-RUNTIME_SCHEMA = "autoform-runtime/v2"
+RUNTIME_SCHEMA = "autoform-runtime/v3"
 RUNTIME_AUTHORITY = "markdown-articles"
 
 

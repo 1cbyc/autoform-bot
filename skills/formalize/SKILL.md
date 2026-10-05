@@ -30,9 +30,10 @@ worktree, so nothing reaches that branch before its default build passes.
 Before dispatching, commit the roadmap state the frontier was read from and base
 each worktree on that commit, not on the remote's default branch (Claude Code's
 agent isolation does so only with `worktree.baseRef: head`). Give each subagent
-the `claim_target`, `phase`, and `article_revision` it is dispatched for. A new
-worktree has no `.lake`: in a Mathlib project, run `lake exe cache get` there
-under the `lake-build` claim before its first build or Lean tool call.
+the `claim_target`, `phase`, `article_revision`, `open_statements`, `assumes`,
+and `revision` it is dispatched for. A new worktree has no `.lake`: in a Mathlib
+project, run `lake exe cache get` there under the `lake-build` claim before its
+first build or Lean tool call.
 
 Give every concurrent agent and subagent its own worker ID, such as its host and
 worktree name, and pass it as `--worker-id` on every claim command. Never reuse
@@ -53,9 +54,10 @@ it during a long build, and release it as soon as the build ends.
 
 After acquiring the claim, bring the worktree up to date with the shared branch
 and reload `work context`. Before editing, require the same `phase`, `blockers`,
-`dependencies`, and `article_revision` as the first read and, for a subagent,
-the `phase` and `article_revision` it was dispatched with. Unrelated parallel
-articles may legitimately change the graph-wide source revision.
+`dependencies`, `article_revision`, `open_statements`, `assumes`, and `revision`
+as the first read and, for a subagent, the same `phase`, `article_revision`,
+`open_statements`, `assumes`, and `revision` it was dispatched with. Unrelated
+parallel articles may legitimately change the graph-wide source revision.
 
 Read the complete article, cited sources, dependency articles, and existing Lean
 target. Preserve the exact mathematical statement. Work only on the selected

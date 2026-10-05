@@ -549,11 +549,13 @@ Markdown.
 Under the open policy the text output of `work list` starts with an `Open
 statements: allowed` line and adds an `assumes:` line under each item that rests
 on open statements; `work context` prints `Open statements:` and `Assumes:`
-lines. In JSON, the frontier and every item carry `open_statements`, and every
-item carries `assumes`, the open statements its proof rests on (empty under the
-strict policy). The runtime projection carries the same `open_statements` flag,
-and each node's runtime status adds `assumes` and `waiting_on`, the
-prerequisites that keep an unproved node from its next phase.
+lines. In JSON, `work list` and `work context` use `autoform-work/v2`: the
+frontier and every item carry `open_statements`, and every item carries
+`assumes`, the open statements its proof rests on (empty under the strict
+policy), plus `revision` for an explicit retraction. The runtime projection
+carries the same `open_statements` flag, and each node's runtime status adds
+`assumes` and `waiting_on`, the prerequisites that keep an unproved node from
+its next phase.
 
 List the open statements and the articles that rest on them:
 
@@ -610,7 +612,7 @@ autoform migrate article-ids blueprint --check
 `article_id` accepts opaque values in the form `af_` plus 24 lowercase hex
 digits. The planner validates uniqueness, proposes deterministic IDs for
 missing articles, includes exact source hashes, and is strictly read-only.
-Runtime v2 and `autoform work` expose assigned IDs immediately; applying plans
+Runtime v3 and `autoform work` expose assigned IDs immediately; applying plans
 and preserving publication routes across path moves remain follow-up changes.
 
 Coordinate temporary cross-machine ownership without modifying the book:
@@ -794,8 +796,8 @@ its Markdown dependencies do not reach (so a fully proved article, which
 assumes nothing, may reach none), a `lean:` name missing from the build,
 and an open statement that its article records as proved. Each article
 declaration gets at most one of these status lines, with `NAME` the
-declaration and `ID` the article's node ID, and one with an error gets none
-of the last three, which read as passing:
+declaration and `ID` the article's node ID. A declaration with an error, or one
+that reaches a failed declaration, gets none of them:
 
 ```text
 open statement (proof is sorry): NAME [ID]
@@ -981,7 +983,7 @@ doctor, separate from any future Deicyde fleet or machine-capability preflight.
 ## Runtime contract
 
 `autoform_cli.runtime` projects the canonical Markdown graph into the versioned,
-deeply immutable in-memory schema `autoform-runtime/v2`. Its declared authority
+deeply immutable in-memory schema `autoform-runtime/v3`. Its declared authority
 is `markdown-articles`: the adapter copies hierarchy, typed statement and proof
 dependencies, authored assertions, derived progress, provenance, and optional
 local Lean source locations, but it provides no persistence or write API.
@@ -997,11 +999,13 @@ and bytes, excluding timestamps, absolute paths, Git state, and operational
 state. Optional Lean locations come from a local lexical scan and do not by
 themselves establish compilation or proof correctness.
 
-Schema v2 exposes optional durable `article_id` metadata beside the graph's
-path-derived `id`. Temporary claims and local dashboard hooks may fall back to
-the path ID, but durable execution records and routes must require `article_id`
-until the path-move migration is complete. Operational state remains private and
-excluded from runtime snapshots and publication.
+Schema v3 retains optional durable `article_id` metadata beside the graph's
+path-derived `id` and adds the project `open_statements` policy,
+`statement_retracted` assertions, and each status's `assumes` and `waiting_on`
+fields. Temporary claims and local dashboard hooks may fall back to the path ID,
+but durable execution records and routes must require `article_id` until the
+path-move migration is complete. Operational state remains private and excluded
+from runtime snapshots and publication.
 
 ## Publication contract
 

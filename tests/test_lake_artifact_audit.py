@@ -673,6 +673,10 @@ namespace Fixture
 
 theorem helper_sorry : True := sorry
 
+def failed_open_type : Prop := sorry
+
+theorem open_reaches_failed : failed_open_type := sorry
+
 theorem where_sorry : True := aux
 where aux : True := sorry
 
@@ -877,6 +881,10 @@ def test_open_probe_rejects_sorry_outside_an_open_statement_body(
         "root-package declarations failed the open-statement audit",
     ):
         assert message in output
+    assert not any(
+        line.startswith("open statement (") and "Fixture.type_sorry [type]" in line
+        for line in output.splitlines()
+    )
 
 
 def test_open_probe_logs_no_clean_result_for_a_failing_declaration(
@@ -891,6 +899,12 @@ def test_open_probe_logs_no_clean_result_for_a_failing_declaration(
             _article("uses-native", ["Fixture.uses_native"]),
             _article("native-reduction", ["Fixture.native_reduction"], allowed=["Fixture.open_stmt"]),
             _article("native-open", ["Fixture.native_open"], is_open=True, allowed=["Fixture.native_open"]),
+            _article(
+                "open-reaches-failed",
+                ["Fixture.open_reaches_failed"],
+                is_open=True,
+                allowed=["Fixture.open_reaches_failed"],
+            ),
             _article("where-conditional", ["Fixture.where_conditional"], allowed=["Fixture.open_stmt"]),
             _article("helper-conditional", ["Fixture.helper_conditional"], allowed=["Fixture.open_stmt"]),
             _article("clean", ["Fixture.clean"]),
@@ -904,13 +918,22 @@ def test_open_probe_logs_no_clean_result_for_a_failing_declaration(
         "Fixture.uses_native depends on unexpected axiom",
         "Fixture.native_reduction depends on unexpected axiom",
         "Fixture.native_open depends on unexpected axiom",
+        "Fixture.failed_open_type contains sorry but is not an open statement",
         "Fixture.where_conditional.aux contains sorry but is not an open statement",
         "Fixture.helper_sorry contains sorry but is not an open statement",
         "open statement (proof is sorry): Fixture.open_stmt [open]",
         "sorry-free: Fixture.clean [clean]",
     ):
         assert message in output
-    names = ("reduction", "uses_native", "native_reduction", "native_open", "where_conditional", "helper_conditional")
+    names = (
+        "reduction",
+        "uses_native",
+        "native_reduction",
+        "native_open",
+        "open_reaches_failed",
+        "where_conditional",
+        "helper_conditional",
+    )
     for name in names:
         for line in output.splitlines():
             if f"Fixture.{name} [" in line:

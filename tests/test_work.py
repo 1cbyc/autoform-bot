@@ -93,6 +93,7 @@ def _project(tmp_path: Path) -> Path:
 def test_lists_only_the_markdown_derived_ready_frontier(tmp_path: Path) -> None:
     frontier = list_ready_work(_project(tmp_path))
 
+    assert WORK_SCHEMA == "autoform-work/v2"
     assert frontier.as_dict()["schema"] == WORK_SCHEMA
     assert [(item.node_id, item.phase, item.claim_target) for item in frontier.items] == [
         ("chapter/prove", "proof", "af_000000000000000000000003"),

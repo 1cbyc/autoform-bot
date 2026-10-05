@@ -10,7 +10,7 @@ from .runtime import RuntimeNode, load_runtime_graph
 from .status import is_definition
 
 
-WORK_SCHEMA = "autoform-work/v1"
+WORK_SCHEMA = "autoform-work/v2"
 ASSUMPTIONS_SCHEMA = "autoform-assumptions/v1"
 
 
