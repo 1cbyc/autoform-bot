@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -1203,14 +1204,14 @@ def test_stably_unreadable_decision_file_is_not_misreported_as_changing(
         (root / denied).write_text(
             json.dumps({"schemaVersion": "1.1.0", "packages": []}), encoding="utf-8"
         )
-    original = project_snapshot.os.open
+    original = project_snapshot._open_resolved
 
-    def deny_one(path, flags, *args, **kwargs):
-        if Path(path) == root / denied:
+    def deny_one(path: Path, *args):
+        if path == root / denied:
             raise PermissionError(denied)
-        return original(path, flags, *args, **kwargs)
+        return original(path, *args)
 
-    monkeypatch.setattr(project_snapshot.os, "open", deny_one)
+    monkeypatch.setattr(project_snapshot, "_open_resolved", deny_one)
 
     result = inspect_project(root)
 
@@ -1760,6 +1761,119 @@ def test_unusable_symlink_is_identified_by_the_link_not_its_target(
     assert touches >= 2
     assert [diagnostic.path for diagnostic in result.diagnostics if diagnostic.code == "unreadable-file"] == [relative]
     assert "project-changed-during-inspection" not in _codes(result)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+@pytest.mark.parametrize("swap", ["relink", "rename"])
+@pytest.mark.parametrize("where", ["subdirectory", "outside"])
+def test_lockstep_swaps_behind_a_linked_path_cannot_repeat_a_synthetic_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str, swap: str
+) -> None:
+    # Both decision files are links into "current", which holds state A for
+    # every lean-toolchain read and state B for every other read.  Neither
+    # decision file nor the root changes; the swaps show only on the way to
+    # the files.  The holder's times are set explicitly so the result does
+    # not depend on timestamp granularity.
+    root = _project(tmp_path)
+    holder = root / "sub" if where == "subdirectory" else tmp_path / "outside"
+    holder.mkdir()
+    for name, toolchain, mathlib in (
+        ("a", "leanprover/lean4:v4.32.2\n", _mathlib(rev=OTHER_COMMIT, input_rev="v4.31.0")),
+        ("b", "leanprover/lean4:v4.31.0\n", _mathlib()),
+    ):
+        (holder / name).mkdir()
+        (holder / name / "lean-toolchain").write_text(toolchain, encoding="utf-8")
+        _write_manifest(holder / name, mathlib)
+    current = holder / "current"
+    if swap == "relink":
+        current.symlink_to(holder / "a", target_is_directory=True)
+    else:
+        (holder / "a").rename(current)
+    for relative in ("lean-toolchain", "lake-manifest.json"):
+        (root / relative).unlink()
+        (root / relative).symlink_to(current / relative)
+    state = "a"
+    swaps = 0
+
+    def switch(to: str) -> None:
+        nonlocal state, swaps
+        if to == state:
+            return
+        if swap == "relink":
+            (holder / "next").symlink_to(holder / to, target_is_directory=True)
+            (holder / "next").replace(current)
+        else:
+            current.rename(holder / state)
+            (holder / to).rename(current)
+        state = to
+        swaps += 1
+        os.utime(holder, ns=(swaps * 10**9, swaps * 10**9))
+
+    original = project_snapshot._capture_file
+
+    def capture_in_lockstep(captured_root: Path, relative: str):
+        if relative == "lean-toolchain":
+            switch("a")
+        entry = original(captured_root, relative)
+        if relative == "lean-toolchain":
+            switch("b")
+        return entry
+
+    monkeypatch.setattr(project_snapshot, "_capture_file", capture_in_lockstep)
+
+    result = inspect_project(root)
+
+    assert result.compatibility.status == "indeterminate"
+    assert "project-changed-during-inspection" in _codes(result)
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.open not in os.supports_dir_fd or not os.path.exists("/dev/zero"),
+    reason="needs POSIX directory descriptors, symlinks and /dev/zero",
+)
+def test_parent_swapped_for_a_link_before_the_open_never_opens_a_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # lakefile.toml resolves to the regular file elsewhere/dev/zero.  Just
+    # before the open, "elsewhere" becomes a link to "/", so the same path
+    # names the /dev/zero device.
+    root = _project(tmp_path)
+    elsewhere = tmp_path.resolve() / "elsewhere"
+    (elsewhere / "dev").mkdir(parents=True)
+    (elsewhere / "dev" / "zero").write_text(LAKEFILE, encoding="utf-8")
+    (root / "lakefile.toml").unlink()
+    (root / "lakefile.toml").symlink_to(elsewhere / "dev" / "zero")
+    original_open = os.open
+    triggers = {str(root.resolve() / "lakefile.toml"), str(elsewhere / "dev")}
+    swapped = False
+    opened: list[int] = []
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and str(path) in triggers:
+            swapped = True
+            elsewhere.rename(tmp_path / "moved")
+            elsewhere.symlink_to("/", target_is_directory=True)
+        descriptor = original_open(path, flags, *args, **kwargs)
+        opened.append(stat.S_IFMT(os.fstat(descriptor).st_mode))
+        return descriptor
+
+    monkeypatch.setattr(project_snapshot.os, "open", swap_then_open)
+    # A wrapped os.open is not in os.supports_dir_fd; keep the descriptor-relative opens.
+    monkeypatch.setattr(project_snapshot.os, "supports_dir_fd", {*os.supports_dir_fd, swap_then_open})
+    try:
+        result = inspect_project(root)
+    finally:
+        if elsewhere.is_symlink():
+            elsewhere.unlink()
+
+    assert swapped
+    assert stat.S_IFCHR not in opened
+    assert not result.ok
+    assert any(
+        diagnostic.code == "unreadable-file" and diagnostic.path == "lakefile.toml"
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_autoform_paths_need_their_exact_spelling(tmp_path: Path) -> None:

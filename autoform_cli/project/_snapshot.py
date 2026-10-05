@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
 _MAX_FILE_BYTES = 1024 * 1024
+_MAX_SYMLINKS = 40
 _ROOT_MARKERS = ("lakefile.lean", "lakefile.toml", "lean-toolchain")
 _MANIFEST = "lake-manifest.json"
 _OVERRIDES = ".lake/package-overrides.json"
@@ -22,6 +24,8 @@ class _FileSnapshot:
     state: str
     identity: tuple[int, ...] | None = None
     content: bytes | None = None
+    # Every directory searched and every link followed to reach a regular file.
+    route: tuple[tuple[int, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,11 +54,15 @@ def _capture_decision_snapshot(root: Path) -> _DecisionSnapshot:
     """Read all decision files once; callers re-read and compare the full value.
 
     Decision files and ``.lake`` are read through symlinks, as Lake and elan
-    read them.  POSIX opens use ``O_NONBLOCK``.  The file a path resolves to
-    must be regular before it is opened, the descriptor is verified as a
-    regular file before any read, the read is bounded, and both descriptor
-    and pathname identities are checked afterwards.  Platforms without that
-    flag still get the same pre/open/post identity checks.
+    read them.  Links are followed one at a time, and a regular file's capture
+    records every directory searched and every link followed, so a change on
+    the way is a change to the snapshot, as it is for the root and ``.lake``
+    (the root's own ancestors count only if they are replaced).  POSIX opens
+    use ``O_NONBLOCK`` and ``O_NOFOLLOW`` beneath the
+    directory that walk found.  The file must be regular before it is opened,
+    the descriptor is verified as a regular file before any read, the read is
+    bounded, and the descriptor identity and the walk are checked afterwards.
+    Platforms without those flags still get the same pre/open/post checks.
     """
 
     try:
@@ -87,23 +95,14 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
     dangling parent link is missing.
     """
 
-    path = root / relative
-    parent_tokens: list[tuple[Path, tuple[int, ...]]] = []
     try:
-        parent = root
-        for part in Path(relative).parts[:-1]:
-            parent = parent / part
-            metadata = os.stat(parent)
-            if not stat.S_ISDIR(metadata.st_mode):
-                return _FileSnapshot("unreadable", _node_identity(os.stat(parent, follow_symlinks=False)))
-            parent_tokens.append((parent, _node_identity(metadata)))
-        entry = os.stat(path, follow_symlinks=False)
+        entry = os.stat(root / relative, follow_symlinks=False)
     except FileNotFoundError:
         return _FileSnapshot("missing")
     except (OSError, TypeError, ValueError):
         return _FileSnapshot("unreadable")
     try:
-        before = os.stat(path)
+        path, before, route = _resolve(root, relative)
     except (OSError, TypeError, ValueError):
         return _FileSnapshot("unreadable", _node_identity(entry))
     if not stat.S_ISREG(before.st_mode):
@@ -111,9 +110,12 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
     before_token = _node_identity(before)
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
     descriptor: int | None = None
     try:
-        descriptor = os.open(path, flags)
+        descriptor = _open_resolved(path, flags, route[-1])
+        if descriptor is None:
+            return _FileSnapshot("changed")
         opened = os.fstat(descriptor)
         opened_token = _node_identity(opened)
         if (
@@ -132,32 +134,107 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
             remaining -= len(chunk)
         data = b"".join(chunks)
         after_token = _node_identity(os.fstat(descriptor))
-        try:
-            path_token = _node_identity(os.stat(path))
-            parents_unchanged = all(_node_identity(os.stat(parent)) == token for parent, token in parent_tokens)
-        except (OSError, TypeError, ValueError):
-            return _FileSnapshot("changed", after_token)
-        if (
-            opened_token != after_token
-            or before_token != path_token
-            or not parents_unchanged
-        ):
+        if opened_token != after_token or not _walk_unchanged(root, relative, path, before_token, route):
             return _FileSnapshot("changed", after_token)
         if len(data) > _MAX_FILE_BYTES:
-            return _FileSnapshot("unreadable", after_token)
-        return _FileSnapshot("regular", after_token, data)
+            return _FileSnapshot("unreadable", after_token, route=route)
+        return _FileSnapshot("regular", after_token, data, route)
     except (OSError, TypeError, ValueError):
         # A stable permission failure remains comparable across snapshots.  A
-        # replacement is caught by the pathname identity in the second pass.
-        try:
-            current = os.stat(path)
-            current_token = _node_identity(current)
-        except (OSError, TypeError, ValueError):
-            return _FileSnapshot("changed")
-        return _FileSnapshot("unreadable", current_token) if current_token == before_token else _FileSnapshot("changed")
+        # replacement is caught by repeating the walk, and again in the second pass.
+        if _walk_unchanged(root, relative, path, before_token, route):
+            return _FileSnapshot("unreadable", before_token, route=route)
+        return _FileSnapshot("changed")
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tuple[int, ...], ...]]:
+    """Follow ``relative`` below the resolved ``root`` one component and one link at a time.
+
+    Returns the link-free path of the entry it names, that entry's own
+    metadata, and the identities of every directory searched and every link
+    followed, ending with the directory that holds the entry.  Lookups follow
+    the kernel's rules: a relative target continues from the link's directory,
+    an absolute one from ``/``, and ``..`` is the parent of the directory
+    reached so far.  Ancestors of ``root`` are identified by device and inode
+    alone: inspection already trusts them to lead to the same root, and
+    entries coming and going in a home or temporary directory are not a
+    project change.
+    """
+
+    ancestors = set(root.parents)
+    route: list[tuple[int, ...]] = []
+    directory = root
+    pending = list(Path(relative).parts)
+    links = 0
+    while pending:
+        holder = os.stat(directory, follow_symlinks=False)
+        if not stat.S_ISDIR(holder.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(directory))
+        identity = _node_identity(holder)
+        route.append(identity[:3] if directory in ancestors else identity)
+        name = pending.pop(0)
+        if name == "..":
+            directory = directory.parent
+            continue
+        candidate = directory / name
+        metadata = os.stat(candidate, follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode):
+            links += 1
+            if links > _MAX_SYMLINKS:
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(root / relative))
+            route.append(_node_identity(metadata))
+            target = Path(os.readlink(candidate))
+            if target.is_absolute():
+                directory = Path(target.anchor)
+                pending[:0] = target.parts[1:]
+            else:
+                pending[:0] = target.parts
+            continue
+        if not pending:
+            return candidate, metadata, tuple(route)
+        directory = candidate
+    # Only ``..`` or a link to ``/`` ends on the directory reached so far.
+    raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(directory))
+
+
+def _walk_unchanged(
+    root: Path, relative: str, path: Path, token: tuple[int, ...], route: tuple[tuple[int, ...], ...]
+) -> bool:
+    try:
+        again, metadata, again_route = _resolve(root, relative)
+    except (OSError, TypeError, ValueError):
+        return False
+    return again == path and _node_identity(metadata) == token and again_route == route
+
+
+def _open_resolved(path: Path, flags: int, holder: tuple[int, ...]) -> int | None:
+    """Open a link-free path from ``_resolve`` without following anything swapped in since.
+
+    With POSIX ``dir_fd`` support the directory is opened first and must be
+    the one the walk searched (the same device and inode), so a parent
+    replaced by a link cannot lead the open anywhere else, and ``O_NOFOLLOW``
+    refuses a final link.  Returns ``None`` when the directory changed.
+    """
+
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_DIRECTORY"):
+        return os.open(path, flags)
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory = os.open(path.parent, directory_flags)
+    try:
+        if _node_identity(os.fstat(directory))[:3] != holder[:3]:
+            return None
+        return os.open(path.name, flags, dir_fd=directory)
+    finally:
+        os.close(directory)
 
 
 def _decision_aliases(root: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
