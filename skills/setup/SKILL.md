@@ -93,10 +93,13 @@ also the repair path; it reports what it left alone. See the
 
 `init` pins the generated workflows to the Autoform commit that ran it: the
 origin and HEAD commit of the Autoform checkout it runs from, or of the
-marketplace checkout an installed plugin was copied from. When neither can be
-read, `init` writes no CI rather than guess a ref: guessing produced projects
-whose first push failed with nothing in the workflow to explain why. When it reports that,
-find the commit the plugin was installed from and pass
+marketplace checkout an installed plugin was copied from. It infers that pin
+only when the checkout is clean and the retained bounded, regular, link-free
+required template snapshot and scaffold renderer match the pinned commit; an
+installed copy must also match its marketplace checkout. On any mismatch or
+when neither checkout can be read, `init` writes no CI rather than guess a ref:
+guessing produced projects whose first push failed with nothing in the workflow
+to explain why. When it reports that, find the commit the plugin was installed from and pass
 `--autoform-ref <40-char-sha>`, or say plainly that CI was not configured.
 Never invent a ref. It must be a full 40-character commit sha: `init` refuses a
 branch, a tag, or an abbreviated sha, because CI would silently reinstall a

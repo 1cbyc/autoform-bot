@@ -477,7 +477,10 @@ def _project(args: argparse.Namespace) -> int:
                 for code, message in result.warnings:
                     print(_ascii_text(f"warning[{code}]: {message}"), file=sys.stderr)
                 if not result.workflows_pinned:
-                    init_command = "autoform init <target>"
+                    init_command = (
+                        'uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform init '
+                        f"{_shell_quote_one_line(target)}"
+                    )
                     if args.autoform_source:
                         # Without the source, init would pin this checkout's origin instead.
                         init_command += f" --autoform-source {shlex.quote(args.autoform_source)}"
@@ -558,6 +561,29 @@ def _ascii_text(value: object) -> str:
     """
 
     return ascii(str(value))[1:-1]
+
+
+def _shell_quote_one_line(value: str) -> str:
+    """Quote one filesystem argument without letting it forge another line.
+
+    Ordinary printable paths use the standard shell spelling. POSIX project
+    creation can also accept control bytes in filenames; Bash and Zsh ANSI-C
+    quoting keeps those paths executable while spelling every byte on one line.
+    """
+
+    if all(character.isprintable() and character not in "\r\n" for character in value):
+        return shlex.quote(value)
+    pieces: list[str] = []
+    for byte in os.fsencode(value):
+        if byte == 0x27:
+            pieces.append("\\'")
+        elif byte == 0x5C:
+            pieces.append("\\\\")
+        elif 0x20 <= byte <= 0x7E:
+            pieces.append(chr(byte))
+        else:
+            pieces.append(f"\\x{byte:02x}")
+    return "$'" + "".join(pieces) + "'"
 
 
 def _claim(args: argparse.Namespace) -> int:

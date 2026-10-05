@@ -161,9 +161,12 @@ Generated workflows are pinned as `init` pins them: `--autoform-ref` must be a
 full commit SHA, an explicit `--autoform-source` carries its own ref or none,
 and without flags the workflows pin the origin and HEAD commit of the Autoform
 checkout running the command, or of the marketplace checkout an installed
-plugin was copied from, read with local Git. Apart from those reads, the
-command runs no subprocesses, Lake, Lean, or network operations. Without a ref
-the local project is complete but the workflows are omitted.
+plugin was copied from, read with local Git. An inferred pin is used only when
+the checkout is clean and the bounded, link-free template snapshot and scaffold
+renderer match that commit; an installed copy must match the checkout too.
+Apart from those reads, the command runs no subprocesses, Lake, Lean, or network
+operations. Without a ref the local project is complete but the workflows are
+omitted.
 It fails closed where POSIX descriptor traversal, advisory locking, directory
 sync, or atomic no-replace rename is unavailable, including on Windows.
 The parent and each of its ancestors must be readable, because each is opened

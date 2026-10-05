@@ -10,6 +10,7 @@ fixed, so the tool writes it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,12 @@ from urllib.parse import urlsplit
 
 _TEMPLATES = Path(__file__).resolve().parent / "templates"
 _MAX_GITIGNORE_BYTES = 1024 * 1024
+_MAX_TEMPLATE_ENTRIES = 512
+_MAX_TEMPLATE_DEPTH = 16
+_MAX_TEMPLATE_FILE_BYTES = 1024 * 1024
+_MAX_TEMPLATE_TOTAL_BYTES = 8 * 1024 * 1024
+_MAX_SCAFFOLD_SOURCE_BYTES = 1024 * 1024
+_MAX_GIT_TREE_LIST_BYTES = 256 * 1024
 _WINDOWS_STAT_VIEWS = os.name == "nt"
 
 #: Template paths whose leading dot is dropped on disk so packaging tools and
@@ -151,7 +158,7 @@ def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -
     origin, which is normalized only when reading local checkout provenance.
     """
 
-    if not source or source != source.strip():
+    if not source or source != source.strip() or "?" in source or "#" in source:
         return None
     if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in source):
         return None
@@ -190,7 +197,156 @@ def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -
     return source
 
 
-def plugin_pin() -> tuple[str, str]:
+def _git_checkout_clean(root: Path) -> bool:
+    """Whether *root* has no tracked, staged, or untracked changes."""
+
+    try:
+        done = subprocess.run(
+            [
+                "git",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-C",
+                str(root),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and not done.stdout
+
+
+def _git_bytes(root: Path, *args: str, limit: int) -> bytes | None:
+    """Run a bounded local Git object query."""
+
+    try:
+        done = subprocess.run(
+            ["git", "--no-optional-locks", "-C", str(root), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0 or len(done.stdout) > limit:
+        return None
+    return done.stdout
+
+
+def _committed_scaffold_entries(
+    root: Path,
+    ref: str,
+) -> dict[str, tuple[str, str]]:
+    """Return ``path -> (mode, blob id)`` for the pinned scaffold surface."""
+
+    listing = _git_bytes(
+        root,
+        "ls-tree",
+        "-rz",
+        "--full-tree",
+        ref,
+        "--",
+        "autoform_cli/scaffold.py",
+        "autoform_cli/templates",
+        limit=_MAX_GIT_TREE_LIST_BYTES,
+    )
+    if listing is None:
+        raise ScaffoldError(["the pinned Autoform tree could not be read safely"])
+    entries: dict[str, tuple[str, str]] = {}
+    template_count = 0
+    object_length: int | None = None
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, encoded_path = record.split(b"\t", 1)
+            mode, kind, object_id = metadata.split(b" ")
+            path = encoded_path.decode("utf-8")
+            object_name = object_id.decode("ascii")
+        except (UnicodeError, ValueError):
+            raise ScaffoldError(["the pinned Autoform tree is invalid"]) from None
+        if (
+            path in entries
+            or kind != b"blob"
+            or mode not in {b"100644", b"100755"}
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_name) is None
+            or (object_length is not None and len(object_name) != object_length)
+        ):
+            raise ScaffoldError(["the pinned Autoform tree is invalid"])
+        object_length = len(object_name)
+        if path == "autoform_cli/scaffold.py":
+            entries[path] = (mode.decode("ascii"), object_name)
+            continue
+        prefix = "autoform_cli/templates/"
+        if not path.startswith(prefix) or template_count >= _MAX_TEMPLATE_ENTRIES:
+            raise ScaffoldError(["the pinned Autoform template tree is invalid"])
+        template_count += 1
+        entries[path] = (mode.decode("ascii"), object_name)
+    if "autoform_cli/scaffold.py" not in entries:
+        raise ScaffoldError(["the pinned Autoform renderer is missing"])
+    return entries
+
+
+def _git_blob_id(content: bytes, length: int) -> str | None:
+    algorithm = {40: "sha1", 64: "sha256"}.get(length)
+    if algorithm is None:
+        return None
+    try:
+        digest = hashlib.new(algorithm, usedforsecurity=False)
+    except (TypeError, ValueError):
+        try:
+            digest = hashlib.new(algorithm)
+        except ValueError:
+            return None
+    digest.update(f"blob {len(content)}\0".encode("ascii"))
+    digest.update(content)
+    return digest.hexdigest()
+
+
+def _matches_committed_scaffold(
+    committed: dict[str, tuple[str, str]],
+    templates: tuple[tuple[str, bytes, int], ...],
+    scaffold_source: bytes,
+    scaffold_mode: int,
+) -> bool:
+    """Whether retained bytes and output-affecting modes equal the Git tree."""
+
+    lengths = {len(object_name) for _mode, object_name in committed.values()}
+    if len(lengths) != 1:
+        return False
+    object_length = lengths.pop()
+    actual: dict[str, tuple[str, str]] = {}
+    for path, content, mode in (
+        ("autoform_cli/scaffold.py", scaffold_source, scaffold_mode),
+        *(
+            (f"autoform_cli/templates/{relative}", content, mode)
+            for relative, content, mode in templates
+        ),
+    ):
+        git_mode = (
+            committed.get(path, ("", ""))[0]
+            if _WINDOWS_STAT_VIEWS
+            else {0o644: "100644", 0o755: "100755"}.get(mode)
+        )
+        object_name = _git_blob_id(content, object_length)
+        if git_mode is None or object_name is None or path in actual:
+            return False
+        actual[path] = (git_mode, object_name)
+    return actual == committed
+
+
+def plugin_pin(
+    templates: tuple[tuple[str, bytes, int], ...] | None = None,
+) -> tuple[str, str]:
     """The Autoform source and commit generated CI should install, if knowable.
 
     Read from the Autoform checkout this CLI runs out of, or, when there is none
@@ -200,6 +356,11 @@ def plugin_pin() -> tuple[str, str]:
     the root of a checkout: a directory that merely sits inside somebody else's
     repository answers questions about that repository.
 
+    The checkout must be clean, and its committed renderer, template paths,
+    bytes, and output-affecting modes must match both the retained generation
+    snapshot and any installed plugin copy. Otherwise the commit does not
+    describe the bytes doing the scaffolding, so no pin is returned.
+
     Returns empty strings when neither is available. An earlier version fell
     back to `facebookresearch/autoform-bot@main` instead. That commit predates
     `autoform_cli` entirely, so every project scaffolded through the plugin got
@@ -208,15 +369,52 @@ def plugin_pin() -> tuple[str, str]:
     no pin: guessing here is what made the failure silent.
     """
 
-    root = _checkout_root(_here()) or _marketplace_checkout()
+    try:
+        retained_templates = _read_templates(_TEMPLATES) if templates is None else templates
+    except ScaffoldError:
+        return "", ""
+
+    running_root = _here()
+    root = _checkout_root(running_root) or _marketplace_checkout()
     if root is None:
         return "", ""
     source = _git("remote", "get-url", "origin", root=root)
     ref = _git("rev-parse", "HEAD", root=root)
+    if not source or not ref or not _FULL_SHA.fullmatch(ref) or not _git_checkout_clean(root):
+        return "", ""
+    try:
+        checkout_templates = _read_templates(root / "autoform_cli" / "templates")
+        running_scaffold, _running_identity, running_mode = _read_bounded_regular_file(
+            running_root / "autoform_cli" / "scaffold.py",
+            limit=_MAX_SCAFFOLD_SOURCE_BYTES,
+            label="Autoform scaffold source",
+        )
+        checkout_scaffold, _checkout_identity, checkout_mode = _read_bounded_regular_file(
+            root / "autoform_cli" / "scaffold.py",
+            limit=_MAX_SCAFFOLD_SOURCE_BYTES,
+            label="Autoform scaffold source",
+        )
+        committed = _committed_scaffold_entries(root, ref)
+    except ScaffoldError:
+        return "", ""
+    if (
+        retained_templates != checkout_templates
+        or (running_scaffold, running_mode) != (checkout_scaffold, checkout_mode)
+        or not _matches_committed_scaffold(
+            committed,
+            checkout_templates,
+            checkout_scaffold,
+            checkout_mode,
+        )
+        or _git("rev-parse", "HEAD", root=root) != ref
+        or _git("remote", "get-url", "origin", root=root) != source
+        or not _git_checkout_clean(root)
+    ):
+        return "", ""
     if not source or not source.endswith(".git"):
         source = f"{source}.git" if source else ""
     safe_source = _normalize_autoform_source(source, allow_github_scp=True)
-    if safe_source is None or not ref or not _FULL_SHA.fullmatch(ref):
+    if safe_source is None:
         return "", ""
     return safe_source, ref
 
@@ -254,6 +452,12 @@ class _ScaffoldFile:
     mode: int
 
 
+@dataclass(frozen=True, slots=True)
+class _TemplateSnapshot:
+    templates: tuple[tuple[str, bytes, int], ...]
+    generations: tuple[tuple[str, tuple[int, ...]], ...]
+
+
 def _destination(relative: str) -> str:
     for template_prefix, real_prefix in _DOTTED.items():
         if relative == template_prefix:
@@ -289,22 +493,188 @@ def _render(text: str, substitutions: dict[str, str]) -> str:
     )
 
 
-def _read_templates(root: Path) -> tuple[tuple[str, bytes, int], ...]:
-    """Every template file under *root* as ``(relative path, bytes, mode)``, sorted."""
+def _node_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _cross_interface_identity(identity: tuple[int, ...]) -> tuple[int, ...]:
+    """Normalize fields Windows exposes differently through stat and fstat."""
+
+    return identity[:-1] if _WINDOWS_STAT_VIEWS else identity
+
+
+def _is_link(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse)
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    *,
+    limit: int,
+    label: str,
+) -> tuple[bytes, tuple[int, ...], int]:
+    """Read one stable, bounded regular file without following links."""
+
+    descriptor: int | None = None
+    try:
+        before = os.stat(path, follow_symlinks=False)
+        before_identity = _node_identity(before)
+        if _is_link(before) or not stat.S_ISREG(before.st_mode):
+            raise ScaffoldError([f"the {label} is not a regular non-link file"])
+        if before.st_size > limit:
+            raise ScaffoldError([f"the {label} exceeds its {limit}-byte limit"])
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        opened_identity = _node_identity(opened)
+        if (
+            _is_link(opened)
+            or not stat.S_ISREG(opened.st_mode)
+            or _cross_interface_identity(opened_identity)
+            != _cross_interface_identity(before_identity)
+        ):
+            raise ScaffoldError([f"the {label} changed while it was being read"])
+
+        chunks: list[bytes] = []
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        after_identity = _node_identity(os.fstat(descriptor))
+        named_identity = _node_identity(os.stat(path, follow_symlinks=False))
+        if (
+            opened_identity != after_identity
+            or before_identity != named_identity
+            or len(content) > limit
+        ):
+            message = (
+                f"the {label} exceeds its {limit}-byte limit"
+                if len(content) > limit
+                else f"the {label} changed while it was being read"
+            )
+            raise ScaffoldError([message])
+        return content, after_identity, stat.S_IMODE(opened.st_mode)
+    except ScaffoldError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise ScaffoldError([f"the {label} could not be read safely"]) from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _capture_template_snapshot(root: Path) -> _TemplateSnapshot:
+    """Capture one bounded, link-free generation of the template tree."""
 
     templates: list[tuple[str, bytes, int]] = []
-    for template in sorted(root.rglob("*")):
-        relative_path = template.relative_to(root)
-        if (
-            not template.is_file()
-            or "__pycache__" in relative_path.parts
-            or template.suffix == ".pyc"
-        ):
-            continue
-        templates.append(
-            (relative_path.as_posix(), template.read_bytes(), stat.S_IMODE(template.stat().st_mode))
-        )
-    return tuple(templates)
+    generations: list[tuple[str, tuple[int, ...]]] = []
+    entry_count = 0
+    total_bytes = 0
+
+    def directory_names(directory: Path, *, count: bool) -> tuple[str, ...]:
+        nonlocal entry_count
+        names: list[str] = []
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if count:
+                    entry_count += 1
+                    if entry_count > _MAX_TEMPLATE_ENTRIES:
+                        raise ScaffoldError(
+                            [f"the Autoform template tree exceeds {_MAX_TEMPLATE_ENTRIES} entries"]
+                        )
+                names.append(entry.name)
+                if len(names) > _MAX_TEMPLATE_ENTRIES:
+                    raise ScaffoldError(
+                        [f"the Autoform template tree exceeds {_MAX_TEMPLATE_ENTRIES} entries"]
+                    )
+        return tuple(sorted(names))
+
+    def walk(directory: Path, relative: Path, depth: int) -> None:
+        nonlocal total_bytes
+        if depth > _MAX_TEMPLATE_DEPTH:
+            raise ScaffoldError(
+                [f"the Autoform template tree exceeds {_MAX_TEMPLATE_DEPTH} directory levels"]
+            )
+        before = os.stat(directory, follow_symlinks=False)
+        before_identity = _node_identity(before)
+        if _is_link(before) or not stat.S_ISDIR(before.st_mode):
+            raise ScaffoldError(["the Autoform template tree contains a non-directory link"])
+        names = directory_names(directory, count=True)
+        for name in names:
+            path = directory / name
+            child_relative = relative / name
+            metadata = os.stat(path, follow_symlinks=False)
+            if "__pycache__" in child_relative.parts or child_relative.suffix == ".pyc":
+                continue
+            if _is_link(metadata):
+                raise ScaffoldError(["the Autoform template tree contains a link"])
+            if stat.S_ISDIR(metadata.st_mode):
+                walk(path, child_relative, depth + 1)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ScaffoldError(["the Autoform template tree contains a non-regular file"])
+            content, identity, mode = _read_bounded_regular_file(
+                path,
+                limit=_MAX_TEMPLATE_FILE_BYTES,
+                label="Autoform template file",
+            )
+            total_bytes += len(content)
+            if total_bytes > _MAX_TEMPLATE_TOTAL_BYTES:
+                raise ScaffoldError(
+                    [
+                        "the Autoform template tree exceeds its "
+                        f"{_MAX_TEMPLATE_TOTAL_BYTES}-byte total limit"
+                    ]
+                )
+            relative_name = child_relative.as_posix()
+            templates.append((relative_name, content, mode))
+            generations.append((relative_name, identity))
+
+        after_identity = _node_identity(os.stat(directory, follow_symlinks=False))
+        if before_identity != after_identity or names != directory_names(directory, count=False):
+            raise ScaffoldError(["the Autoform template tree changed while it was being read"])
+        generations.append(((relative.as_posix() or ".") + "/", after_identity))
+
+    try:
+        walk(root, Path(), 0)
+    except ScaffoldError:
+        raise
+    except (OSError, TypeError, ValueError, UnicodeError):
+        raise ScaffoldError(["the Autoform template tree could not be read safely"]) from None
+    return _TemplateSnapshot(tuple(sorted(templates)), tuple(sorted(generations)))
+
+
+def _read_templates(root: Path) -> tuple[tuple[str, bytes, int], ...]:
+    """Read one stable, bounded generation of regular non-link templates."""
+
+    first = _capture_template_snapshot(root)
+    second = _capture_template_snapshot(root)
+    if first != second:
+        raise ScaffoldError(["the Autoform template tree changed while it was being read"])
+    return second.templates
 
 
 def _require_complete_templates(templates: tuple[tuple[str, bytes, int], ...]) -> None:
@@ -561,7 +931,12 @@ def scaffold_project(
     if issues:
         raise ScaffoldError(issues)
 
-    pinned_source, pinned_ref = plugin_pin()
+    # Retain the exact stable bytes that pin discovery validates. A later read
+    # could race with a template replacement and generate content different
+    # from the commit named by the workflows.
+    templates = _read_templates(_TEMPLATES)
+    _require_complete_templates(templates)
+    pinned_source, pinned_ref = ("", "") if given_source else plugin_pin(templates)
     safe_pinned_source = _normalize_autoform_source(pinned_source, allow_github_scp=True)
     if safe_pinned_source is None or not _FULL_SHA.fullmatch(pinned_ref.lower()):
         pinned_source, pinned_ref = "", ""
@@ -578,7 +953,6 @@ def scaffold_project(
     # project whose first CI step fails for a reason no file in it explains. So
     # the ref alone decides: without one the workflows are skipped and reported.
     unpinned = not ref
-    templates = _read_templates(_TEMPLATES)
     planned, omitted = _scaffold_plan(
         templates,
         title=title.strip(),

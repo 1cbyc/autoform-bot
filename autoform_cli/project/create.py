@@ -44,9 +44,10 @@ _LEAN_TOOLCHAIN = re.compile(
     r"\.(?P<patch>0|[1-9][0-9]{0,8})(?:-rc[1-9][0-9]{0,8})?)"
 )
 # Safe inside a TOML basic string, never a Git option, and free of the
-# `: ^ ~ @ { ? * [` revision operators. Ranges such as a..b and other names Git
-# refuses as refs still pass and fail at `lake update`.
+# `: ^ ~ @ { ? * [` revision operators. Additional checks below enforce the
+# structural restrictions Git applies to ref names.
 _MATHLIB_REV = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
+_LONGEST_LAKE_ARTIFACT_SUFFIX = ".olean.private.hash"
 _MINIMUM_LEAN = (4, 27, 0)
 _LOCK_WAIT_SECONDS = 30.0
 _LOCK_POLL_SECONDS = 0.05
@@ -174,12 +175,21 @@ def create_project(
     _validate_package_for_release(package_name, roots_bundle)
     release_bundle = roots_bundle if version.release is not None else None
     warnings = _version_warnings(version)
-    workflow_source, workflow_ref = _resolve_workflow_pin(autoform_source, autoform_ref)
     try:
+        # Pin discovery validates this exact stable snapshot, and the plan keeps
+        # these retained bytes rather than reopening the template tree.
+        templates = _read_templates(_TEMPLATES)
+        _require_complete_templates(templates)
+        workflow_source, workflow_ref = _resolve_workflow_pin(
+            autoform_source,
+            autoform_ref,
+            templates=templates,
+        )
         plan, workflows_pinned = _build_project_plan(
             package_name,
             version,
             release_bundle,
+            templates=templates,
             autoform_source=workflow_source,
             autoform_ref=workflow_ref,
         )
@@ -430,12 +440,16 @@ def _validate_package(package: str | None, parent: Path) -> str:
             "project-create-safety-unavailable",
             "This platform cannot validate the generated Lean filename safely.",
         ) from None
-    if len(f"{package}.lean".encode("ascii")) > name_limit:
+    if not _package_artifact_fits(package, name_limit):
         raise ProjectCreateError(
             "project-name-invalid",
-            "Project name is too long for a Lean module on the target filesystem.",
+            "Project name is too long for Lean and Lake artifacts on the target filesystem.",
         )
     return package
+
+
+def _package_artifact_fits(package: str, name_limit: int) -> bool:
+    return len(f"{package}{_LONGEST_LAKE_ARTIFACT_SUFFIX}".encode("ascii")) <= name_limit
 
 
 def _require_package_filename_fit(package: str, parent_descriptor: int) -> None:
@@ -446,10 +460,10 @@ def _require_package_filename_fit(package: str, parent_descriptor: int) -> None:
             "project-create-safety-unavailable",
             "This platform cannot validate the generated Lean filename safely.",
         ) from None
-    if len(f"{package}.lean".encode("ascii")) > name_limit:
+    if not _package_artifact_fits(package, name_limit):
         raise ProjectCreateError(
             "project-name-invalid",
-            "Project name is too long for a Lean module on the target filesystem.",
+            "Project name is too long for Lean and Lake artifacts on the target filesystem.",
         )
 
 
@@ -499,11 +513,12 @@ def _resolve_version(
         )
     toolchain = f"leanprover/lean4:{match['tag']}"
     revision = match["tag"] if mathlib_rev is None else mathlib_rev
-    if not isinstance(revision, str) or _MATHLIB_REV.fullmatch(revision) is None:
+    if not isinstance(revision, str) or not _valid_mathlib_revision(revision):
         raise ProjectCreateError(
             "project-version-invalid",
-            "The Mathlib revision must be a tag, branch, or commit: 1 to 255 ASCII letters, "
-            "digits, dots, underscores, hyphens, or slashes, starting with a letter or digit.",
+            "The Mathlib revision must be a valid Git tag, branch, or commit spelling: 1 to 255 "
+            "ASCII letters, digits, dots, underscores, hyphens, or slashes, starting with a "
+            "letter or digit.",
         )
     catalog = load_release_catalog()
     for release in catalog.releases:
@@ -513,6 +528,25 @@ def _resolve_version(
         ):
             return _ProjectVersion(release.lean_toolchain, release.mathlib_git, release.mathlib_rev, release)
     return _ProjectVersion(toolchain, catalog.recommended.mathlib_git, revision, None)
+
+
+def _valid_mathlib_revision(revision: str) -> bool:
+    """Whether *revision* fits the safe grammar and Git's ref-name rules."""
+
+    if (
+        _MATHLIB_REV.fullmatch(revision) is None
+        or ".." in revision
+        or "@{" in revision
+        or revision.endswith(".")
+    ):
+        return False
+    parts = revision.split("/")
+    return all(
+        part
+        and not part.startswith(".")
+        and not part.endswith(".lock")
+        for part in parts
+    )
 
 
 def _version_warnings(version: _ProjectVersion) -> tuple[tuple[str, str], ...]:
@@ -552,7 +586,12 @@ def _validate_package_for_release(package: str, bundle: _ReleaseBundle) -> None:
         )
 
 
-def _resolve_workflow_pin(source: str, ref: str) -> tuple[str, str]:
+def _resolve_workflow_pin(
+    source: str,
+    ref: str,
+    *,
+    templates: tuple[tuple[str, bytes, int], ...],
+) -> tuple[str, str]:
     """Choose the Autoform source and commit the generated workflows install.
 
     The rules are `autoform init`'s and run before any filesystem state
@@ -584,7 +623,7 @@ def _resolve_workflow_pin(source: str, ref: str) -> tuple[str, str]:
             )
         return given_source, given_ref
     # Looked up on the module so one replacement governs `init` and `project new`.
-    pinned_source, pinned_ref = scaffold.plugin_pin()
+    pinned_source, pinned_ref = scaffold.plugin_pin(templates)
     safe_pinned_source = _normalize_autoform_source(pinned_source, allow_github_scp=True)
     if safe_pinned_source is None or _FULL_SHA.fullmatch(pinned_ref.lower()) is None:
         safe_pinned_source, pinned_ref = None, ""
@@ -865,12 +904,11 @@ def _build_project_plan(
     version: _ProjectVersion,
     release_bundle: _ReleaseBundle | None,
     *,
+    templates: tuple[tuple[str, bytes, int], ...],
     autoform_source: str,
     autoform_ref: str,
 ) -> tuple[tuple[_ScaffoldFile, ...], bool]:
     files = list(_core_project_plan(package, version, release_bundle))
-    templates = _read_templates(_TEMPLATES)
-    _require_complete_templates(templates)
     scaffold_files, _ = _scaffold_plan(
         templates,
         title=package,

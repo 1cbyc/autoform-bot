@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shlex
 import shutil
 import socket
 import stat
@@ -53,7 +54,7 @@ def _no_checkout_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     # Without explicit flags, creation pins workflows to the running checkout
     # like `autoform init`; default to no pin so results do not depend on
     # whether this tree has an `origin` remote.
-    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: ("", ""))
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda _templates=None: ("", ""))
 
 
 def test_creation_without_a_pin_omits_the_workflows(tmp_path: Path) -> None:
@@ -68,7 +69,9 @@ def test_creation_without_a_pin_omits_the_workflows(tmp_path: Path) -> None:
 def test_creation_pins_workflows_to_the_running_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: (_SOURCE, "b" * 40))
+    monkeypatch.setattr(
+        scaffold_module, "plugin_pin", lambda _templates=None: (_SOURCE, "b" * 40)
+    )
     target = tmp_path / "Project"
 
     result = create_project(target, package="Project", release_id=_RELEASE)
@@ -90,7 +93,9 @@ def test_creation_pins_workflows_to_the_running_checkout(
 def test_creation_ignores_an_unusable_checkout_pin(
     source: str, revision: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: (source, revision))
+    monkeypatch.setattr(
+        scaffold_module, "plugin_pin", lambda _templates=None: (source, revision)
+    )
     target = tmp_path / "Project"
 
     result = create_project(target, package="Project", release_id=_RELEASE)
@@ -106,7 +111,7 @@ def test_creation_ignores_an_unusable_checkout_pin(
 def test_an_explicit_ref_alone_keeps_the_checkout_or_default_source(
     pin: tuple[str, str], expected_source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda: pin)
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda _templates=None: pin)
     target = tmp_path / "Project"
 
     result = create_project(target, package="Project", release_id=_RELEASE, autoform_ref="1" * 40)
@@ -120,7 +125,7 @@ def test_an_explicit_ref_alone_keeps_the_checkout_or_default_source(
 def test_an_explicit_source_never_inherits_the_checkout_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def forbidden():
+    def forbidden(*_args, **_kwargs):
         raise AssertionError("an explicit source consulted the checkout pin")
 
     monkeypatch.setattr(scaffold_module, "plugin_pin", forbidden)
@@ -157,6 +162,8 @@ def test_creation_accepts_an_explicit_workflow_pin(tmp_path: Path) -> None:
         ("https://example.test/owner/autoform.git", "main"),
         ("https://user:secret@example.test/autoform.git", "1" * 40),
         ("http://example.test/owner/autoform.git", "1" * 40),
+        ("https://example.test/owner/autoform.git?", "1" * 40),
+        ("https://example.test/owner/autoform.git#", "1" * 40),
         ("", "1" * 12),
     ],
 )
@@ -501,10 +508,28 @@ def test_rejects_non_string_package_before_writing(tmp_path: Path) -> None:
     assert not list(tmp_path.glob(".autoform-new-*"))
 
 
+def test_package_name_reserves_the_longest_lake_artifact_filename(tmp_path: Path) -> None:
+    name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+    suffix_bytes = len(create_module._LONGEST_LAKE_ARTIFACT_SUFFIX.encode("ascii"))
+    if name_limit <= suffix_bytes:
+        pytest.skip("filesystem name limit is too small for a Lean package")
+    boundary = "A" * (name_limit - suffix_bytes)
+
+    result = create_project(tmp_path / "Accepted", package=boundary, release_id=_RELEASE)
+
+    assert result.package == boundary
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(tmp_path / "Rejected", package=f"{boundary}A", release_id=_RELEASE)
+    assert raised.value.code == "project-name-invalid"
+    assert not (tmp_path / "Rejected").exists()
+
+
 def test_open_parent_descriptor_rechecks_the_generated_module_filename_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    package = "A" * 256
+    name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+    suffix_bytes = len(create_module._LONGEST_LAKE_ARTIFACT_SUFFIX.encode("ascii"))
+    package = "A" * (name_limit - suffix_bytes + 1)
     monkeypatch.setattr(
         create_module, "_validate_package", lambda _package, _parent: package
     )
@@ -682,6 +707,12 @@ def test_rejects_invalid_lean_toolchains_before_writing(tmp_path: Path, toolchai
         "a~1",
         "a@{1}",
         "@",
+        "a..b",
+        "a/.b",
+        "a/b.lock",
+        "a//b",
+        "a/",
+        "a.",
         ".a",
         "/a",
         "_a",
@@ -1638,7 +1669,8 @@ def test_cli_unlisted_json_reports_warnings(tmp_path: Path, capsys) -> None:
 
 
 def test_cli_unlisted_human_output_warns_on_stderr(tmp_path: Path, capsys) -> None:
-    arguments = ["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project"]
+    target = tmp_path / "Project"
+    arguments = ["project", "new", os.fspath(target), "--package", "Project"]
 
     assert main([*arguments, "--lean-toolchain", "v4.30.0"]) == 0
 
@@ -1647,21 +1679,50 @@ def test_cli_unlisted_human_output_warns_on_stderr(tmp_path: Path, capsys) -> No
     assert captured.err.startswith("warning[project-release-unlisted]: ")
     assert captured.err.endswith(
         "warning: workflows were omitted because no immutable Autoform pin was available; "
-        "add them with: autoform init <target> --autoform-ref <40-char-sha>\n"
+        'add them with: uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform init '
+        f"{shlex.quote(os.fspath(target))} --autoform-ref <40-char-sha>\n"
     )
 
 
 def test_cli_omitted_workflows_hint_keeps_an_explicit_source(tmp_path: Path, capsys) -> None:
     source = "https://example.com/~team/autoform-bot.git"
-    arguments = ["project", "new", os.fspath(tmp_path / "Project"), "--package", "Project"]
+    target = tmp_path / "Project with ' shell syntax"
+    arguments = ["project", "new", os.fspath(target), "--package", "Project"]
 
     assert main([*arguments, "--release", _RELEASE, "--autoform-source", source]) == 0
 
     captured = capsys.readouterr()
     assert captured.err.endswith(
-        "add them with: autoform init <target> --autoform-source "
+        'add them with: uv run --project "<AUTOFORM_PLUGIN_ROOT>" autoform init '
+        f"{shlex.quote(os.fspath(target))} --autoform-source "
         "'https://example.com/~team/autoform-bot.git' --autoform-ref <40-char-sha>\n"
     )
+
+
+def test_cli_omitted_workflows_hint_cannot_become_a_multiline_diagnostic(
+    tmp_path: Path, capsys
+) -> None:
+    target = tmp_path / "Project\nforged-warning"
+
+    assert (
+        main(
+            [
+                "project",
+                "new",
+                os.fspath(target),
+                "--package",
+                "Project",
+                "--release",
+                _RELEASE,
+            ]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert captured.err.count("\n") == 1
+    assert "\\x0a" in captured.err
+    assert "\nforged-warning" not in captured.err
 
 
 def test_cli_json_is_stable_and_path_free(tmp_path: Path, capsys) -> None:

@@ -128,6 +128,9 @@ def test_setup_guidance_uses_the_offline_atomic_project_creator(repo_root: Path)
     assert "complete Autoform vault, site, ignore rules, and pinnable CI" in normalized
     assert "no later `init` is needed" in normalized
     assert "pins generated workflows exactly as `init` does" in normalized
+    assert "only when the checkout is clean" in normalized
+    assert "bounded, regular, link-free required template snapshot" in normalized
+    assert "installed copy must also match its marketplace checkout" in normalized
     assert "fails closed" in normalized and "including Windows" in normalized
     assert "Do not invent version pairs" not in normalized
     assert "--lean-toolchain" in normalized
