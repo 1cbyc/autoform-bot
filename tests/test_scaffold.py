@@ -611,7 +611,7 @@ def test_windows_cross_interface_gitignore_identity_ignores_ctime_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     destination = tmp_path / ".gitignore"
-    destination.write_text("/.lake\n", encoding="utf-8")
+    destination.write_bytes(b"/.lake\n")
     original_fstat = os.fstat
     original_stat = os.stat
 
