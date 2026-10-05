@@ -880,12 +880,12 @@ def _remember_descendants(
 
     try:
         children = psutil.Process(process.pid).children(recursive=True)
-    except (psutil.Error, OSError):
+    except (psutil.Error, OSError, SystemError):
         return
     for child in children:
         try:
             descendants[(child.pid, child.create_time())] = child
-        except (psutil.Error, OSError):
+        except (psutil.Error, OSError, SystemError):
             continue
 
 
@@ -894,23 +894,43 @@ def _remember_tagged_processes(
     descendants: dict[tuple[int, float], psutil.Process],
     *,
     root_pid: int,
+    strict: bool = True,
 ) -> None:
     """Find descendants that escaped the original parent and process group."""
 
-    for candidate in psutil.process_iter():
-        if candidate.pid in {os.getpid(), root_pid}:
-            continue
+    last_system_error: SystemError | None = None
+    for _attempt in range(2):
+        saw_system_error = False
         try:
-            if candidate.environ().get(_PROCESS_TOKEN_ENV) == token:
-                descendants[(candidate.pid, candidate.create_time())] = candidate
+            candidates = tuple(psutil.process_iter())
         except (psutil.Error, OSError):
+            candidates = ()
+        except SystemError as error:
+            last_system_error = error
             continue
+        for candidate in candidates:
+            if candidate.pid in {os.getpid(), root_pid}:
+                continue
+            try:
+                if candidate.environ().get(_PROCESS_TOKEN_ENV) == token:
+                    descendants[(candidate.pid, candidate.create_time())] = candidate
+            except (psutil.Error, OSError):
+                continue
+            except SystemError as error:
+                last_system_error = error
+                saw_system_error = True
+        if not saw_system_error:
+            return
+    if strict and last_system_error is not None:
+        raise SkeletonError(
+            ["cannot safely inspect descendant processes after a transient system error"]
+        ) from last_system_error
 
 
 def _process_is_alive(process: psutil.Process) -> bool:
     try:
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
-    except (psutil.Error, OSError):
+    except (psutil.Error, OSError, SystemError):
         return False
 
 
@@ -950,18 +970,23 @@ def _terminate_process_tree(
     started, available = time.perf_counter(), _remaining(deadline)
     for share, group_signal, method in ((0.4, "SIGTERM", "terminate"), (0.8, "SIGKILL", "kill")):
         _remember_descendants(process, descendants)
-        _remember_tagged_processes(token, descendants, root_pid=process.pid)
+        _remember_tagged_processes(
+            token,
+            descendants,
+            root_pid=process.pid,
+            strict=False,
+        )
         live = [child for child in descendants.values() if child.pid != process.pid and _process_is_alive(child)]
         if os.name == "posix":
             with contextlib.suppress(OSError):
                 os.killpg(process.pid, getattr(signal, group_signal))
         for target in ([process] if process.poll() is None else []) + live:
-            with contextlib.suppress(OSError, psutil.Error):
+            with contextlib.suppress(OSError, psutil.Error, SystemError):
                 getattr(target, method)()
         phase_deadline = started + available * share
         with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             process.wait(timeout=_remaining(phase_deadline))
-        with contextlib.suppress(OSError, psutil.Error):
+        with contextlib.suppress(OSError, psutil.Error, SystemError):
             psutil.wait_procs(live, timeout=_remaining(phase_deadline))
 
 
