@@ -158,6 +158,7 @@ def test_copied_plugin_project_entrypoints_need_no_autoform_on_path(repo_root, t
         "site/",
         "site-src/",
         "*.log",
+        ".claude/worktrees/",
     ]
 
     inspection = run("project", "inspect", str(target), "--json", cwd=parent)
