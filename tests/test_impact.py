@@ -129,9 +129,9 @@ def test_constructor_edges_carry_an_inductive_s_meaning() -> None:
 
     assert _ids(report.statement_impacted) == ["area", "shape"]
     assert report.proof_impacted == ()
-    assert [(helper.name, helper.kind, helper.impact, helper.owner) for helper in report.helpers] == [
-        ("A.Shape.mk", "constructor", "statement", "shape"),
-        ("A.Shape.rec", "recursor", "statement", "shape"),
+    assert [(helper.name, helper.kind, helper.impact, helper.owners) for helper in report.helpers] == [
+        ("A.Shape.mk", "constructor", "statement", ("shape",)),
+        ("A.Shape.rec", "recursor", "statement", ("shape",)),
     ]
 
 
@@ -197,8 +197,8 @@ def test_helpers_report_location_and_the_article_owning_the_nearest_ancestor() -
             "module": "Demo",
             "path": "Demo.lean",
             "line": 1,
-            "owner": "shared-a",
-            "claim_target": "shared-a",
+            "owners": ["shared-a", "shared-b"],
+            "claim_targets": ["shared-a", "shared-b"],
         },
         {
             "name": "A.uses.aux",
@@ -207,8 +207,8 @@ def test_helpers_report_location_and_the_article_owning_the_nearest_ancestor() -
             "module": "Demo",
             "path": "Demo.lean",
             "line": 2,
-            "owner": "uses",
-            "claim_target": "uses",
+            "owners": ["uses"],
+            "claim_targets": ["uses"],
         },
         {
             "name": "A.uses.aux.deep",
@@ -217,8 +217,8 @@ def test_helpers_report_location_and_the_article_owning_the_nearest_ancestor() -
             "module": "Demo",
             "path": "Demo.lean",
             "line": 3,
-            "owner": "uses",
-            "claim_target": "uses",
+            "owners": ["uses"],
+            "claim_targets": ["uses"],
         },
         {
             "name": "_private.Demo.Extra.0.A.priv",
@@ -227,15 +227,21 @@ def test_helpers_report_location_and_the_article_owning_the_nearest_ancestor() -
             "module": "Demo.Extra",
             "path": None,
             "line": None,
-            "owner": None,
-            "claim_target": _lean_key("_private.Demo.Extra.0.A.priv"),
+            "owners": [],
+            "claim_targets": [_lean_key("_private.Demo.Extra.0.A.priv")],
         },
     ]
     assert located == [helper.name for helper in report.helpers]
     assert _ids(report.statement_impacted) == ["uses"]
     # The helpers are repaired under their owners' claims, so shared-a is
     # claimed too, and the unowned helper under a key of its own.
-    assert report.claim_targets == ("base", _lean_key("_private.Demo.Extra.0.A.priv"), "shared-a", "uses")
+    assert report.claim_targets == (
+        "base",
+        _lean_key("_private.Demo.Extra.0.A.priv"),
+        "shared-a",
+        "shared-b",
+        "uses",
+    )
 
 
 def test_revised_names_resolve_by_component_and_are_never_their_own_helpers() -> None:
@@ -325,7 +331,10 @@ def test_a_contained_revision_says_it_can_be_revised_in_place() -> None:
     assert report.contained
     assert report.as_dict()["contained"] is True
     assert report.claim_targets == ("af_leaf",)
-    assert format_impact(report) == [
+    lines = format_impact(report)
+    assert lines.pop(2) == "Lean source revision: unbound"
+    assert re.fullmatch(r"Lean build revision: [0-9a-f]{64}", lines.pop(2))
+    assert lines == [
         "Revising A.leaf of chapter/leaf [af_leaf]",
         "Graph source revision: rev",
         "Contained: nothing outside chapter/leaf uses A.leaf, so it can be revised in place.",
@@ -355,7 +364,9 @@ def test_private_declarations_resolve_by_their_user_facing_names() -> None:
     # wins over a private constant with the same user-facing name.
     assert _ids(report.statement_impacted) == ["priv", "u"]
     assert report.statement_impacted[0].declarations == ("A.privT",)
-    assert [(helper.name, helper.owner) for helper in report.helpers] == [(f"{privT}.aux", "priv")]
+    assert [(helper.name, helper.owners) for helper in report.helpers] == [
+        (f"{privT}.aux", ("priv",))
+    ]
     assert report.claim_targets == ("base", "af_priv", "u")
     revised = _impact(records, articles, "base", ["A.privT"])
     assert revised.declarations == ("A.privT",)
@@ -374,7 +385,9 @@ def test_a_helper_of_an_unnamed_private_declaration_claims_the_article_naming_it
     report = _impact(records, articles, "base")
 
     assert report.statement_impacted == ()
-    assert [(helper.name, helper.owner) for helper in report.helpers] == [(f"{privT}.aux", "priv")]
+    assert [(helper.name, helper.owners) for helper in report.helpers] == [
+        (f"{privT}.aux", ("priv",))
+    ]
     assert report.claim_targets == ("base", "af_priv")
 
 
@@ -491,11 +504,17 @@ def test_helpers_the_revised_article_owns_keep_a_revision_contained() -> None:
     # A structure's generated companions are repaired under its own claim and
     # are still listed; a helper owned by another article or by none is not.
     assert owned.contained
-    assert [(helper.name, helper.owner) for helper in owned.helpers] == [("A.S.mk", "s"), ("A.S.rec", "s")]
+    assert [(helper.name, helper.owners) for helper in owned.helpers] == [
+        ("A.S.mk", ("s",)),
+        ("A.S.rec", ("s",)),
+    ]
     assert owned.claim_targets == ("s",)
-    assert format_impact(owned)[2] == "Contained: nothing outside s uses A.S, so it can be revised in place."
+    assert format_impact(owned)[4] == "Contained: nothing outside s uses A.S, so it can be revised in place."
     assert not shared.contained
-    assert [(helper.name, helper.owner) for helper in shared.helpers] == [("A.T.aux", "other"), ("A.loose", None)]
+    assert [(helper.name, helper.owners) for helper in shared.helpers] == [
+        ("A.T.aux", ("other", "t")),
+        ("A.loose", ()),
+    ]
     assert shared.claim_targets == ("t", _lean_key("A.loose"), "other")
 
 
@@ -521,15 +540,17 @@ def test_revisions_touching_one_unowned_helper_contend_for_its_claim() -> None:
     # under its owner's claim target.
     key = "lean/a-bridge-" + hashlib.sha256(b"A.bridge").hexdigest()[:16]
     assert claims._validate_key(key) == key
-    assert [(helper.name, helper.owner, helper.claim_target) for helper in left.helpers] == [
-        ("A.T.aux", "t", "af_t"),
-        ("A.bridge", None, key),
+    assert [(helper.name, helper.owners, helper.claim_targets) for helper in left.helpers] == [
+        ("A.T.aux", ("t",), ("af_t",)),
+        ("A.bridge", (), (key,)),
     ]
-    assert [(helper.name, helper.claim_target) for helper in right.helpers] == [("A.bridge", key)]
+    assert [(helper.name, helper.claim_targets) for helper in right.helpers] == [
+        ("A.bridge", (key,))
+    ]
     assert left.claim_targets == ("af_left", "af_t", key)
     assert right.claim_targets == ("af_right", key)
     assert not right.contained
-    assert json.loads(right.to_json())["helpers"][0]["claim_target"] == key
+    assert json.loads(right.to_json())["helpers"][0]["claim_targets"] == [key]
 
 
 def test_an_unowned_helper_claim_key_is_ref_safe_for_any_name() -> None:
@@ -539,7 +560,7 @@ def test_an_unowned_helper_claim_key_is_ref_safe_for_any_name() -> None:
 
     report = _impact(records, articles, "base")
 
-    keys = {helper.name: helper.claim_target for helper in report.helpers}
+    keys = {helper.name: helper.claim_targets[0] for helper in report.helpers}
     assert keys == {name: _lean_key(name) for name in names}
     assert keys["«∀»"].startswith("lean/declaration-")
     assert all(claims._validate_key(key) == key for key in keys.values())
@@ -627,18 +648,22 @@ def test_malformed_probe_output_fails_closed(lines: list[str], message: str) -> 
         parse_impact_output("\n".join(lines))
 
 
-def test_rendered_probe_imports_modules_and_names_local_prefixes() -> None:
-    source = render_impact_probe(imports=["Demo.B", "Demo", "Demo.B"], project_roots=["Demo.B", "Demo"])
+def test_rendered_probe_imports_modules_and_names_exact_local_modules() -> None:
+    source = render_impact_probe(
+        imports=["Demo.B", "Demo", "Demo.B"],
+        project_modules=["Internal", "Demo"],
+    )
 
     assert source.startswith("import Demo\nimport Demo.B\n-- Autoform impact probe.")
     assert (
-        'let projectRoots : List Name := [Name.str (Name.anonymous) "Demo", '
-        'Name.str (Name.str (Name.anonymous) "Demo") "B"]'
+        'let projectModules : Std.HashSet Name := Std.HashSet.ofList '
+        '[Name.str (Name.anonymous) "Demo", Name.str (Name.anonymous) "Internal"]'
     ) in source
+    assert ".isPrefixOf" not in source
     assert f'"{skeleton.PROBE_OUTPUT_ENV}"' in source
     assert IMPACT_MARKER in source
     with pytest.raises(SkeletonError, match="no imports"):
-        render_impact_probe(imports=[], project_roots=["Demo"])
+        render_impact_probe(imports=[], project_modules=["Demo"])
 
 
 _SHADOWED_STD = "object file '/deps/Std/Data.olean' of module Std.Data does not exist"
@@ -665,7 +690,7 @@ def test_probe_failures_name_the_impact_probe(
         "autoform_cli.skeleton._run_bounded_command",
         lambda command, **kwargs: subprocess.CompletedProcess(command, 1, stdout="", stderr=stderr),
     )
-    probe = render_impact_probe(imports=["Demo"], project_roots=["Demo"])
+    probe = render_impact_probe(imports=["Demo"], project_modules=["Demo"])
 
     with pytest.raises(SkeletonError) as impact:
         skeleton.run_probe(probe, tmp_path, label="impact probe")
@@ -682,7 +707,7 @@ def test_impact_probe_freshness_messages_never_mention_skeletons(tmp_path: Path,
         "autoform_cli.skeleton._run_bounded_command",
         lambda command, **kwargs: subprocess.CompletedProcess(command, 3, stdout="", stderr="Demo is out of date"),
     )
-    probe = render_impact_probe(imports=["Demo"], project_roots=["Demo"])
+    probe = render_impact_probe(imports=["Demo"], project_modules=["Demo"])
 
     def issues(label: str | None) -> tuple[str, ...]:
         with pytest.raises(SkeletonError) as caught:
@@ -728,17 +753,37 @@ def test_project_modules_follow_lake_globs(tmp_path: Path) -> None:
         "Other.Lone",
     )
     (tmp_path / "Demo" / "Sub" / "notes.md").write_text("", encoding="utf-8")
+    _sources(tmp_path / ".lake" / "packages" / "dep", "Demo.External")
 
     # `M` is one module, `M.*` the module and its submodules, `M.+` only its
-    # submodules; every glob base marks local constants, like a root.
+    # submodules. Locality is every repository-owned source module, independent
+    # of target globs and namespace prefixes.
     assert project_modules([_library(src, "Demo", "Demo.Sub.*", "Demo.Extra.+")]) == (
         ("Demo", "Demo.Extra.X", "Demo.Extra.Y.Z", "Demo.Sub", "Demo.Sub.A", "Demo.Sub.B.C"),
-        ("Demo", "Demo.Extra", "Demo.Sub"),
+        (
+            "Demo",
+            "Demo.Extra",
+            "Demo.Extra.X",
+            "Demo.Extra.Y.Z",
+            "Demo.Sub",
+            "Demo.Sub.A",
+            "Demo.Sub.B.C",
+            "Other.Lone",
+        ),
     )
     # Without globs, Lake builds the roots.
     assert project_modules([_library(src, roots=("Demo", "Other.Lone"))]) == (
         ("Demo", "Other.Lone"),
-        ("Demo", "Other.Lone"),
+        (
+            "Demo",
+            "Demo.Extra",
+            "Demo.Extra.X",
+            "Demo.Extra.Y.Z",
+            "Demo.Sub",
+            "Demo.Sub.A",
+            "Demo.Sub.B.C",
+            "Other.Lone",
+        ),
     )
 
 
@@ -874,6 +919,8 @@ def test_cli_writes_the_impact_report_as_canonical_json(tmp_path: Path, monkeypa
     assert output.err == ""
     report = json.loads(output.out)
     assert output.out == json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+    assert re.fullmatch(r"[0-9a-f]{64}", report.pop("lean_source_revision"))
+    assert re.fullmatch(r"[0-9a-f]{64}", report.pop("build_revision"))
     assert report == {
         "schema": IMPACT_SCHEMA,
         "source_revision": source_revision,
@@ -894,8 +941,8 @@ def test_cli_writes_the_impact_report_as_canonical_json(tmp_path: Path, monkeypa
                 "module": "Demo",
                 "path": "Demo.lean",
                 "line": 5,
-                "owner": None,
-                "claim_target": "lean/demo-base-eq-7f17aa41d1461243",
+                "owners": [],
+                "claim_targets": ["lean/demo-base-eq-7f17aa41d1461243"],
             }
         ],
         "undeclared_dependencies": ["chapter/loose"],
@@ -923,7 +970,10 @@ def test_cli_text_report_lists_each_section(tmp_path: Path, monkeypatch, capsys)
 
     output = capsys.readouterr()
     assert code == 0, output.err
-    assert output.out.splitlines() == [
+    lines = output.out.splitlines()
+    assert re.fullmatch(r"Lean source revision: [0-9a-f]{64}", lines.pop(2))
+    assert re.fullmatch(r"Lean build revision: [0-9a-f]{64}", lines.pop(2))
+    assert lines == [
         f"Revising Demo.base of chapter/base [{_BASE_ID}]",
         f"Graph source revision: {source_revision}",
         "Statement impacted:",
@@ -931,7 +981,7 @@ def test_cli_text_report_lists_each_section(tmp_path: Path, monkeypatch, capsys)
         "Proof impacted:",
         "  chapter/loose: Demo.loose",
         "Helpers no article names:",
-        "  Demo.base_eq (theorem, statement) Demo.lean:5; no owner; claim lean/demo-base-eq-7f17aa41d1461243",
+        "  Demo.base_eq (theorem, statement) Demo.lean:5; no owner; claims lean/demo-base-eq-7f17aa41d1461243",
         "Impacted without a Markdown dependency path to the revised article: chapter/loose",
         "Deprecated:",
         "  Demo.gone: no users, safe to delete",
@@ -981,7 +1031,7 @@ def test_cli_text_escapes_terminal_control_characters(tmp_path: Path, monkeypatc
     output = capsys.readouterr()
     assert code == 0, output.err
     assert "\x1b" not in output.out
-    line = "  Demo.bad\\x1b[2Jname (theorem, statement) Demo.lean; no owner; claim lean/demo-bad-2jname-6d30903d669991fb"
+    line = "  Demo.bad\\x1b[2Jname (theorem, statement) Demo.lean; no owner; claims lean/demo-bad-2jname-6d30903d669991fb"
     assert line in output.out.splitlines()
 
 
@@ -1127,6 +1177,49 @@ def test_revision_impact_refuses_a_roadmap_that_changes_while_it_is_read(
     with pytest.raises(ImpactError, match="^the roadmap changed while it was read; rerun the command$"):
         revision_impact(project, selector, lean_root=lean_root)
     assert calls == []
+
+
+def test_revision_impact_refuses_a_roadmap_that_changes_during_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _blueprint_project(tmp_path, "Demo")
+    lean_root = _stub_lean_root(tmp_path)
+    _stub_probe(monkeypatch)
+    original = skeleton.run_probe
+
+    def run_then_change(*args, **kwargs):
+        output = original(*args, **kwargs)
+        _rewrite_base(project)
+        return output
+
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", run_then_change)
+    with pytest.raises(
+        ImpactError,
+        match="^the roadmap changed while the impact probe ran; rerun the command$",
+    ):
+        revision_impact(project, "chapter/base", lean_root=lean_root)
+
+
+def test_revision_impact_refuses_lean_sources_that_change_during_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _blueprint_project(tmp_path, "Demo")
+    lean_root = _stub_lean_root(tmp_path)
+    _stub_probe(monkeypatch)
+    original = skeleton.run_probe
+
+    def run_then_change(*args, **kwargs):
+        output = original(*args, **kwargs)
+        source = lean_root / "Demo.lean"
+        source.write_text(source.read_text(encoding="utf-8") + "\n-- changed\n", encoding="utf-8")
+        return output
+
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", run_then_change)
+    with pytest.raises(
+        ImpactError,
+        match="^the Lean sources changed while the impact probe ran; rebuild and rerun the command$",
+    ):
+        revision_impact(project, "chapter/base", lean_root=lean_root)
 
 
 # --------------------------------------------------------------------------- #
@@ -1310,13 +1403,13 @@ def test_the_probe_reads_a_built_project(tmp_path: Path, monkeypatch, capsys) ->
     assert [(item["id"], item["declarations"]) for item in report["proof_impacted"]] == [
         ("chapter/proved", ["Imp.proved"])
     ]
-    assert [(h["name"], h["kind"], h["impact"], h["path"], h["line"], h["owner"]) for h in report["helpers"]] == [
-        ("Imp.P", "def", "statement", "Imp/Basic.lean", 9, None),
-        ("Imp.P_iff", "theorem", "statement", "Imp/Basic.lean", 11, None),
-        ("Imp.base_eq", "theorem", "statement", "Imp/Basic.lean", 5, None),
-        ("Imp.oldEq", "theorem", "statement", "Imp/Basic.lean", 14, None),
-        ("Imp.oldUnused", "theorem", "statement", "Imp/Basic.lean", 17, None),
-        ("Imp.usesOld", "theorem", "statement", "Imp/Extra.lean", 10, None),
+    assert [(h["name"], h["kind"], h["impact"], h["path"], h["line"], h["owners"]) for h in report["helpers"]] == [
+        ("Imp.P", "def", "statement", "Imp/Basic.lean", 9, []),
+        ("Imp.P_iff", "theorem", "statement", "Imp/Basic.lean", 11, []),
+        ("Imp.base_eq", "theorem", "statement", "Imp/Basic.lean", 5, []),
+        ("Imp.oldEq", "theorem", "statement", "Imp/Basic.lean", 14, []),
+        ("Imp.oldUnused", "theorem", "statement", "Imp/Basic.lean", 17, []),
+        ("Imp.usesOld", "theorem", "statement", "Imp/Extra.lean", 10, []),
     ]
     assert report["undeclared_dependencies"] == ["chapter/simp"]
     # The equation lemma `@[simp]` gives oldSeed goes when oldSeed does.
@@ -1327,9 +1420,13 @@ def test_the_probe_reads_a_built_project(tmp_path: Path, monkeypatch, capsys) ->
     ]
     assert report["deprecated_unused"] == ["Imp.oldSeed", "Imp.oldUnused"]
     unowned = sorted(_lean_key(h["name"]) for h in report["helpers"])
-    assert [h["claim_target"] for h in report["helpers"]] == [_lean_key(h["name"]) for h in report["helpers"]]
+    assert [h["claim_targets"] for h in report["helpers"]] == [
+        [_lean_key(h["name"])] for h in report["helpers"]
+    ]
     assert report["claim_targets"] == ["chapter/base", "chapter/proved", "chapter/simp", "chapter/uses", *unowned]
     assert report["source_revision"] == source_revision
+    assert re.fullmatch(r"[0-9a-f]{64}", report["lean_source_revision"])
+    assert re.fullmatch(r"[0-9a-f]{64}", report["build_revision"])
 
     (probed,) = outputs
     records = parse_impact_output(probed)
@@ -1373,10 +1470,10 @@ def test_the_probe_reads_a_built_project(tmp_path: Path, monkeypatch, capsys) ->
     # the `_unsafe_rec` companion.
     assert "Imp.seedLoop._unsafe_rec" in records["Imp.seedLoop"].value_uses
     assert _ids(seed.statement_impacted) == ["chapter/loop", "chapter/priv", "chapter/seed-eq", "chapter/uses-alias"]
-    assert [(helper.name, helper.owner) for helper in seed.helpers] == [
-        ("Imp.seedAgain", None),
-        ("Imp.seedAlias", None),
-        (f"{priv}.aux", "chapter/priv"),
+    assert [(helper.name, helper.owners) for helper in seed.helpers] == [
+        ("Imp.seedAgain", ()),
+        ("Imp.seedAlias", ()),
+        (f"{priv}.aux", ("chapter/priv",)),
     ]
     assert compute_impact(records, more, more[1], ["Imp.privSeed"], source_revision="rev").contained
     # The alias's type copies seedEq's without mentioning it.
@@ -1396,4 +1493,4 @@ def test_the_probe_reads_a_built_project(tmp_path: Path, monkeypatch, capsys) ->
     box = compute_impact(records, more, more[4], ["Imp.Box"], source_revision="rev")
     assert box.contained
     assert box.helpers
-    assert {helper.owner for helper in box.helpers} == {"chapter/box"}
+    assert {owner for helper in box.helpers for owner in helper.owners} == {"chapter/box"}

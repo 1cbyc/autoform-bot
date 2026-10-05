@@ -522,6 +522,29 @@ frontmatter. `work context` may still select that article by its path ID to
 report the migration blocker. Both commands are read-only projections of
 Markdown.
 
+Inspect the Lean consequences of revising an article before editing it:
+
+```bash
+autoform work impact chapter/result . --lean-root .
+autoform work impact chapter/result . --lean-root . --declaration MyProject.helper --json
+```
+
+`work impact` runs a bounded Lean probe against a fresh build and reports
+statement-impacted and proof-impacted articles, unnamed helpers, missing
+Markdown dependency paths, deprecated declarations and their users, whether
+the change is contained, and the complete `claim_targets` set. Helpers shared
+by several articles contribute every owner's claim; an unowned helper gets a
+stable `lean/<slug>-<digest>` target. Project locality is an exact inventory of
+regular repository source modules, never a namespace-prefix guess.
+
+The command snapshots and rereads both the roadmap and repository Lean sources
+around the probe. JSON uses `autoform-impact/v1` and binds its answer to the
+Markdown `source_revision`, the repository `lean_source_revision`, and a
+`build_revision` hash of the normalized Lean records. The probe imports project
+modules, so run it only in a trusted checkout or sandbox. It compares elaborated
+types and values; changes to notation, attributes, instance priority, or
+unreported generated declarations still require human review.
+
 Plan durable article identity metadata without changing the blueprint:
 
 ```bash

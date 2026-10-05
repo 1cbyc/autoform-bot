@@ -109,14 +109,14 @@ end AutoformImpact
 
 set_option maxHeartbeats 0 in
 run_cmd do
-  let projectRoots : List Name := [{project_roots}]
+  let projectModules : Std.HashSet Name := Std.HashSet.ofList [{project_modules}]
   let env ← getEnv
   -- `env.header` is slow to reach from the interpreted probe, so module names
   -- are read once.
   let moduleNames := env.header.moduleNames
   let moduleOf (n : Name) : Option Name :=
     (env.getModuleIdxFor? n).map fun idx => moduleNames[idx.toNat]!
-  let isLocalModule (m : Name) : Bool := projectRoots.any (fun projectRoot => projectRoot.isPrefixOf m)
+  let isLocalModule (m : Name) : Bool := projectModules.contains m
   let isLocal (n : Name) : Bool := (moduleOf n).any isLocalModule
   -- Records go to the file the CLI names: a command's stdout is buffered into
   -- one message, and any other write could split a record.

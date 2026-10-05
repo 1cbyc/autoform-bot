@@ -16,7 +16,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import skeleton
@@ -188,25 +188,30 @@ def _name_key(name: str) -> tuple[object, ...]:
 
 #: Module name components the probe can import without quoting.
 _MODULE_COMPONENT = re.compile(r"[A-Za-z_][A-Za-z0-9_'!?]*")
+_IGNORED_SOURCE_DIRECTORIES = frozenset(
+    {".git", ".lake", ".claude", ".venv", "__pycache__", "node_modules", "site", "site-src"}
+)
+_MAX_PROJECT_MODULES = 10_000
+_MAX_SOURCE_DEPTH = 64
 
 
 def project_modules(libraries: Sequence[LeanLibrary]) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Return the modules Lake builds for ``libraries`` and the local module prefixes.
+    """Return the probe imports and exact repository-owned module names.
 
     A library's ``globs`` select its modules as Lake's ``Glob`` does: ``M`` is
     one module, ``M.*`` the module and its submodules, ``M.+`` its strict
-    submodules, found by walking the source tree like ``forEachModuleInDir``.
-    A library without globs builds its roots. A module is local when it equals
-    or lies under a library root or a glob base.
+    submodules, found by walking the source tree like ``forEachModuleInDir``. A
+    library without globs builds its roots. Locality is an exact allowlist of
+    ``.lean`` files beneath the project libraries' source directories, not a
+    namespace prefix.
     """
 
     modules: set[str] = set()
-    prefixes: set[str] = set()
+    local_modules: set[str] = set()
     for library in libraries:
-        prefixes.update(library.roots)
+        local_modules.update(_source_modules(library))
         for glob in library.globs or library.roots:
             base, mode = _glob(glob, library)
-            prefixes.add(base)
             directory = library.src_dir.joinpath(*base.split("."))
             if mode != "+":
                 if not directory.with_suffix(".lean").is_file():
@@ -220,7 +225,46 @@ def project_modules(libraries: Sequence[LeanLibrary]) -> tuple[tuple[str, ...], 
                 modules.update(f"{base}.{module}" for module in _submodules(directory, library))
     if not modules:
         raise SkeletonError(["the Lake configuration selects no modules"])
-    return tuple(sorted(modules)), tuple(sorted(prefixes))
+    return tuple(sorted(modules)), tuple(sorted(local_modules))
+
+
+def _source_modules(library: LeanLibrary) -> set[str]:
+    """Bounded, link-free module inventory beneath one project ``srcDir``."""
+
+    source = library.src_dir
+    if not source.is_dir() or source.is_symlink():
+        raise SkeletonError([f"lean_lib {library.name}: source directory is missing or symbolic: {source}"])
+    found: set[str] = set()
+    for directory, names, files in os.walk(source, followlinks=False):
+        current = Path(directory)
+        relative_directory = current.relative_to(source)
+        if len(relative_directory.parts) > _MAX_SOURCE_DEPTH:
+            raise SkeletonError(
+                [f"lean_lib {library.name}: source tree exceeds {_MAX_SOURCE_DEPTH} directory levels"]
+            )
+        kept: list[str] = []
+        for name in sorted(names):
+            child = current / name
+            if name in _IGNORED_SOURCE_DIRECTORIES:
+                continue
+            if child.is_symlink() or os.path.lexists(child / ".git"):
+                continue
+            kept.append(name)
+        names[:] = kept
+        for name in sorted(files):
+            path = current / name
+            if path.suffix != ".lean" or path.is_symlink():
+                continue
+            relative = path.relative_to(source).with_suffix("")
+            module = ".".join(relative.parts)
+            if not module:
+                continue
+            found.add(module)
+            if len(found) > _MAX_PROJECT_MODULES:
+                raise SkeletonError(
+                    [f"lean_lib {library.name}: source tree exceeds {_MAX_PROJECT_MODULES} Lean modules"]
+                )
+    return found
 
 
 def _glob(glob: str, library: LeanLibrary) -> tuple[str, str]:
@@ -273,7 +317,7 @@ def _impact_template() -> str:
     return (Path(__file__).parent / "probes" / "impact_probe.lean").read_text(encoding="utf-8")
 
 
-def render_impact_probe(*, imports: Iterable[str], project_roots: Iterable[str]) -> str:
+def render_impact_probe(*, imports: Iterable[str], project_modules: Iterable[str]) -> str:
     """Render the Lean program that records every project-local constant."""
 
     modules = sorted(set(imports))
@@ -284,7 +328,7 @@ def render_impact_probe(*, imports: Iterable[str], project_roots: Iterable[str])
         marker=IMPACT_MARKER,
         output_env=skeleton.PROBE_OUTPUT_ENV,
         output_limit=skeleton.DEFAULT_PROBE_OUTPUT_LIMIT,
-        project_roots=", ".join(_lean_name(name) for name in sorted(set(project_roots))),
+        project_modules=", ".join(_lean_name(name) for name in sorted(set(project_modules))),
     )
 
 
@@ -335,10 +379,10 @@ class ImpactHelper:
     module: str
     path: str | None
     line: int | None
-    owner: str | None
-    #: The owner's claim target, else a key of the helper's own, so that
-    #: revisions touching the same unowned helper contend for one claim.
-    claim_target: str
+    owners: tuple[str, ...]
+    #: Every owner's claim target, or one key derived from the helper's own
+    #: name, so all revisions touching it contend for the same claim set.
+    claim_targets: tuple[str, ...]
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -348,8 +392,8 @@ class ImpactHelper:
             "module": self.module,
             "path": self.path,
             "line": self.line,
-            "owner": self.owner,
-            "claim_target": self.claim_target,
+            "owners": list(self.owners),
+            "claim_targets": list(self.claim_targets),
         }
 
 
@@ -382,6 +426,8 @@ class ImpactReport:
     """What revising ``declarations`` of ``article`` affects."""
 
     source_revision: str
+    lean_source_revision: str
+    build_revision: str
     article: ImpactArticle
     declarations: tuple[str, ...]
     statement_impacted: tuple[ImpactedArticle, ...]
@@ -404,13 +450,15 @@ class ImpactReport:
         return not (
             self.statement_impacted
             or self.proof_impacted
-            or any(helper.owner != self.article.id for helper in self.helpers)
+            or any(set(helper.owners) != {self.article.id} for helper in self.helpers)
         )
 
     def as_dict(self) -> dict[str, object]:
         return {
             "schema": IMPACT_SCHEMA,
             "source_revision": self.source_revision,
+            "lean_source_revision": self.lean_source_revision,
+            "build_revision": self.build_revision,
             "article": {
                 "id": self.article.id,
                 "article_id": self.article.article_id,
@@ -441,6 +489,7 @@ def compute_impact(
     declarations: Sequence[str],
     *,
     source_revision: str,
+    lean_source_revision: str = "",
     locate: Locator | None = None,
 ) -> ImpactReport:
     """Compute what revising ``declarations`` of article ``revised`` affects.
@@ -518,9 +567,13 @@ def compute_impact(
             continue
         path, line = locate(record) if locate is not None else (None, None)
         impact = "statement" if name in meaning else "proof"
-        owner = _owner(record, records, named)
-        target = by_id[owner].claim_target if owner in by_id else _helper_claim_key(name)
-        helpers.append(ImpactHelper(name, record.kind, impact, record.module, path, line, owner, target))
+        owners = _owners(record, records, named)
+        targets = tuple(
+            sorted({by_id[owner].claim_target for owner in owners if owner in by_id})
+        ) or (_helper_claim_key(name),)
+        helpers.append(
+            ImpactHelper(name, record.kind, impact, record.module, path, line, owners, targets)
+        )
 
     impacted = (*statement_impacted, *proof_impacted)
     undeclared = sorted(item.id for item in impacted if not _reaches(item.id, revised.id, by_id))
@@ -540,12 +593,16 @@ def compute_impact(
         if record.deprecated
     )
 
-    # A helper is repaired under its owner's claim, so the owner is claimed
-    # too; an unowned helper is repaired under a claim keyed by its own name.
-    others = {item.claim_target for item in impacted} | {helper.claim_target for helper in helpers}
+    # A helper is repaired under every owning article's claim; an unowned
+    # helper contributes the key derived from its own name.
+    others = {item.claim_target for item in impacted} | {
+        target for helper in helpers for target in helper.claim_targets
+    }
     claim_targets = (revised.claim_target, *sorted(others - {revised.claim_target}))
     return ImpactReport(
         source_revision=source_revision,
+        lean_source_revision=lean_source_revision,
+        build_revision=_build_revision(records),
         article=revised,
         declarations=tuple(revised_names.values()),
         statement_impacted=tuple(statement_impacted),
@@ -556,6 +613,14 @@ def compute_impact(
         deprecated_unused=tuple(item.name for item in deprecated if not item.users and not item.articles),
         claim_targets=claim_targets,
     )
+
+
+def _build_revision(records: Mapping[str, ConstantRecord]) -> str:
+    """Hash the exact normalized Lean environment records behind a report."""
+
+    payload = {name: asdict(records[name]) for name in sorted(records)}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _helper_claim_key(name: str) -> str:
@@ -610,18 +675,22 @@ def _reverse_closure(
     return reached
 
 
-def _owner(record: ConstantRecord, records: Mapping[str, ConstantRecord], named: Mapping[str, list[str]]) -> str | None:
-    """The article naming the nearest ``parent`` ancestor of ``record``, if any."""
+def _owners(
+    record: ConstantRecord,
+    records: Mapping[str, ConstantRecord],
+    named: Mapping[str, list[str]],
+) -> tuple[str, ...]:
+    """Every article naming the nearest ``parent`` ancestor of ``record``."""
 
     seen: set[str] = set()
     parent = record.parent
     while parent is not None and parent not in seen:
         if parent in named:
-            return min(named[parent])
+            return tuple(sorted(set(named[parent])))
         seen.add(parent)
         ancestor = records.get(parent)
         parent = ancestor.parent if ancestor is not None else None
-    return None
+    return ()
 
 
 def _descends_from(record: ConstantRecord, ancestor: str, records: Mapping[str, ConstantRecord]) -> bool:
@@ -724,30 +793,41 @@ def revision_impact(
 
     root = Path(lean_root).expanduser().resolve()
     libraries = lean_libraries(root)
-    modules, prefixes = project_modules(libraries)
+    source_index = index_project(root)
+    modules, local_modules = project_modules(libraries)
     output = skeleton.run_probe(
-        render_impact_probe(imports=modules, project_roots=prefixes),
+        render_impact_probe(imports=modules, project_modules=local_modules),
         root,
         timeout=skeleton.DEFAULT_PROBE_TIMEOUT if timeout is None else timeout,
         label="impact probe",
     )
+    latest = load_runtime_graph(project_or_blueprint)
+    if latest.source_revision != source_revision:
+        raise ImpactError("the roadmap changed while the impact probe ran; rerun the command")
+    if index_project(root).source_digest != source_index.source_digest:
+        raise ImpactError("the Lean sources changed while the impact probe ran; rebuild and rerun the command")
     return compute_impact(
         parse_impact_output(output),
         tuple(articles.values()),
         revised,
         names,
         source_revision=source_revision,
-        locate=_locator(libraries, root),
+        lean_source_revision=source_index.source_digest,
+        locate=_locator(libraries, root, source_index),
     )
 
 
-def _locator(libraries: tuple[LeanLibrary, ...], root: Path) -> Locator:
+def _locator(
+    libraries: tuple[LeanLibrary, ...],
+    root: Path,
+    source_index: SourceIndex | None = None,
+) -> Locator:
     """Locate a constant through the lexical source index, else by its module's file.
 
     The index is built on first use, since a contained revision locates nothing.
     """
 
-    index: SourceIndex | None = None
+    index = source_index
 
     def locate(record: ConstantRecord) -> tuple[str | None, int | None]:
         nonlocal index
@@ -769,6 +849,8 @@ def format_impact(report: ImpactReport) -> list[str]:
     lines = [
         f"Revising {names} of {_label(report.article.id, report.article.article_id)}",
         f"Graph source revision: {report.source_revision}",
+        f"Lean source revision: {report.lean_source_revision or 'unbound'}",
+        f"Lean build revision: {report.build_revision}",
     ]
     if report.contained:
         lines.append(
@@ -787,8 +869,16 @@ def format_impact(report: ImpactReport) -> list[str]:
             where = helper.path or helper.module
             if helper.path and helper.line is not None:
                 where = f"{where}:{helper.line}"
-            owner = f"owner {helper.owner}" if helper.owner else "no owner"
-            lines.append(f"  {helper.name} ({helper.kind}, {helper.impact}) {where}; {owner}; claim {helper.claim_target}")
+            if len(helper.owners) == 1:
+                ownership = f"owner {helper.owners[0]}"
+            elif helper.owners:
+                ownership = "owners " + ", ".join(helper.owners)
+            else:
+                ownership = "no owner"
+            claims = "claims " + ", ".join(helper.claim_targets)
+            lines.append(
+                f"  {helper.name} ({helper.kind}, {helper.impact}) {where}; {ownership}; {claims}"
+            )
     if report.undeclared_dependencies:
         lines.append(
             "Impacted without a Markdown dependency path to the revised article: "
