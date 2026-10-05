@@ -25,6 +25,8 @@ CLAIM_SCHEMA = "autoform-claim/v1"
 CLAIM_TTL_S = 1500
 CLAIM_HEARTBEAT_S = 300
 CLAIM_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+_SCP_REPOSITORY_RE = re.compile(r"^(?:[^/@:]+@)?(?:\[[^\]]+\]|[^/:]+):.+$")
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "autoform",
@@ -100,7 +102,11 @@ class ClaimBoard:
         if not worker_id:
             raise ValueError("worker_id must not be empty")
         raw_repo_url = os.fspath(repo_url)
-        if "://" not in raw_repo_url and not re.match(r"^[^/]+@[^:]+:", raw_repo_url):
+        is_remote = "://" in raw_repo_url or (
+            _WINDOWS_DRIVE_RE.match(raw_repo_url) is None
+            and _SCP_REPOSITORY_RE.match(raw_repo_url) is not None
+        )
+        if not is_remote:
             raw_repo_url = str(Path(raw_repo_url).expanduser().resolve())
         self.repo_url = raw_repo_url
         self.worker_id = worker_id
@@ -133,7 +139,12 @@ class ClaimBoard:
     def _ensure_scratch(self) -> None:
         if (self.scratch / "HEAD").is_file():
             return
-        self.scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            self.scratch.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ClaimTransportError(
+                "cannot prepare the local claim-board scratch directory"
+            ) from exc
         self._git(["init", "--bare", "--quiet", "."])
 
     @staticmethod

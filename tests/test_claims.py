@@ -43,6 +43,39 @@ def _board(tmp_path: Path, repo: Path, owner: str) -> claims.ClaimBoard:
     return claims.ClaimBoard(repo, owner, tmp_path / f"scratch-{owner}")
 
 
+def test_claim_board_recognizes_scp_remote_without_explicit_user(tmp_path: Path) -> None:
+    board = claims.ClaimBoard(
+        "github-work:org/repo.git",
+        "worker",
+        tmp_path / "scratch",
+    )
+
+    assert board.repo_url == "github-work:org/repo.git"
+
+
+def test_claim_board_does_not_treat_windows_drive_as_scp_remote(tmp_path: Path) -> None:
+    board = claims.ClaimBoard(
+        r"C:\projects\claims.git",
+        "worker",
+        tmp_path / "scratch",
+    )
+
+    assert board.repo_url != r"C:\projects\claims.git"
+    assert Path(board.repo_url).is_absolute()
+
+
+def test_unwritable_scratch_is_a_clean_transport_error(
+    tmp_path: Path,
+    board_repo: Path,
+) -> None:
+    scratch = tmp_path / "scratch"
+    scratch.write_text("not a directory", encoding="utf-8")
+    board = claims.ClaimBoard(board_repo, "worker", scratch)
+
+    with pytest.raises(claims.ClaimTransportError, match="prepare.*scratch"):
+        board.read("author/node")
+
+
 def _plant_message(repo: Path, key: str, message: str) -> str:
     tree = _git("mktree", cwd=repo, input_text="")
     commit = _git("commit-tree", tree, "-m", message, cwd=repo)
