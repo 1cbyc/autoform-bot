@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -1874,6 +1875,75 @@ def test_parent_swapped_for_a_link_before_the_open_never_opens_a_device(
         diagnostic.code == "unreadable-file" and diagnostic.path == "lakefile.toml"
         for diagnostic in result.diagnostics
     )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0 or not (hasattr(os, "O_PATH") or hasattr(os, "O_SEARCH")),
+    reason="needs POSIX permissions that apply and search-only directory opens",
+)
+def test_decision_file_linked_into_a_search_only_directory_is_read_like_lake(tmp_path: Path) -> None:
+    # Lake and elan need search permission, not read permission, on the
+    # directories on the way to a file.
+    root = _project(tmp_path)
+    target = _move_behind_symlink(root, "lean-toolchain")
+    target.parent.chmod(0o311)
+    try:
+        result = inspect_project(root)
+    finally:
+        target.parent.chmod(0o755)
+
+    assert result.ok, result.diagnostics
+    assert result.compatibility.status == "supported"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+@pytest.mark.parametrize(("suffix", "absolute"), [("/", True), ("/.", False)])
+def test_link_target_that_must_be_a_directory_never_reads_a_file(tmp_path: Path, suffix: str, absolute: bool) -> None:
+    # A trailing "/" or "/." asks for a directory, so the kernel, and elan
+    # with it, refuses the regular file there.
+    root = _project(tmp_path)
+    target = _move_behind_symlink(root, "lean-toolchain")
+    link = root / "lean-toolchain"
+    link.unlink()
+    os.symlink(f"{target if absolute else os.path.relpath(target, root)}{suffix}", link)
+    with pytest.raises(NotADirectoryError):
+        link.read_bytes()
+
+    result = inspect_project(root)
+
+    assert [diagnostic.path for diagnostic in result.diagnostics if diagnostic.code == "unreadable-file"] == [
+        "lean-toolchain"
+    ]
+    assert "project-changed-during-inspection" not in _codes(result)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+@pytest.mark.parametrize("extra", [0, 1])
+def test_link_chains_are_followed_as_far_as_the_kernel_follows_them(tmp_path: Path, extra: int) -> None:
+    root = _project(tmp_path)
+    target = _move_behind_symlink(root, "lean-toolchain")
+    # lean-toolchain and the chain links below it, all relative.
+    links = project_snapshot._MAX_SYMLINKS + extra
+    chain = tmp_path / "chain"
+    chain.mkdir()
+    (chain / "0").symlink_to(os.path.relpath(target, chain))
+    for index in range(1, links - 1):
+        (chain / str(index)).symlink_to(str(index - 1))
+    link = root / "lean-toolchain"
+    link.unlink()
+    link.symlink_to(os.path.relpath(chain / str(links - 2), root))
+    if extra:
+        with pytest.raises(OSError) as error:
+            link.read_bytes()
+        assert error.value.errno == errno.ELOOP
+    else:
+        link.read_bytes()
+
+    result = inspect_project(root)
+
+    unreadable = [diagnostic.path for diagnostic in result.diagnostics if diagnostic.code == "unreadable-file"]
+    assert unreadable == (["lean-toolchain"] if extra else [])
+    assert "project-changed-during-inspection" not in _codes(result)
 
 
 def test_autoform_paths_need_their_exact_spelling(tmp_path: Path) -> None:

@@ -28,6 +28,8 @@ def main() -> int:
             return original_open(path, flags, *args, **kwargs)
 
         project_inspect.os.open = racing_open
+        # A wrapped os.open is not in os.supports_dir_fd; keep the descriptor-relative opens.
+        project_inspect.os.supports_dir_fd.add(racing_open)
     elif mode != "inspect":
         raise ValueError(f"unknown FIFO probe mode: {mode}")
 

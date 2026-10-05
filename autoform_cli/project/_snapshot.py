@@ -5,11 +5,13 @@ from __future__ import annotations
 import errno
 import os
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 _MAX_FILE_BYTES = 1024 * 1024
-_MAX_SYMLINKS = 40
+# Links one lookup may follow (MAXSYMLINKS): 40 on Linux, 32 on macOS and the BSDs.
+_MAX_SYMLINKS = 40 if sys.platform.startswith("linux") else 32
 _ROOT_MARKERS = ("lakefile.lean", "lakefile.toml", "lean-toolchain")
 _MANIFEST = "lake-manifest.json"
 _OVERRIDES = ".lake/package-overrides.json"
@@ -157,11 +159,12 @@ def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tup
     metadata, and the identities of every directory searched and every link
     followed, ending with the directory that holds the entry.  Lookups follow
     the kernel's rules: a relative target continues from the link's directory,
-    an absolute one from ``/``, and ``..`` is the parent of the directory
-    reached so far.  Ancestors of ``root`` are identified by device and inode
-    alone: inspection already trusts them to lead to the same root, and
-    entries coming and going in a home or temporary directory are not a
-    project change.
+    an absolute one from ``/``, ``..`` is the parent of the directory reached
+    so far, a target ending in ``/`` or ``/.`` must be a directory, and one
+    lookup follows at most ``_MAX_SYMLINKS`` links.  Ancestors of ``root``
+    are identified by device and inode alone: inspection already trusts them
+    to lead to the same root, and entries coming and going in a home or
+    temporary directory are not a project change.
     """
 
     ancestors = set(root.parents)
@@ -176,6 +179,8 @@ def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tup
         identity = _node_identity(holder)
         route.append(identity[:3] if directory in ancestors else identity)
         name = pending.pop(0)
+        if name == ".":
+            continue
         if name == "..":
             directory = directory.parent
             continue
@@ -186,17 +191,20 @@ def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tup
             if links > _MAX_SYMLINKS:
                 raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(root / relative))
             route.append(_node_identity(metadata))
-            target = Path(os.readlink(candidate))
+            raw = os.readlink(candidate)
+            target = Path(raw)
+            # Path drops a trailing "/" or "/.", after which only a directory resolves.
+            must_be_directory = ["."] if raw.endswith(("/", "/.")) else []
             if target.is_absolute():
                 directory = Path(target.anchor)
-                pending[:0] = target.parts[1:]
+                pending[:0] = [*target.parts[1:], *must_be_directory]
             else:
-                pending[:0] = target.parts
+                pending[:0] = [*target.parts, *must_be_directory]
             continue
         if not pending:
             return candidate, metadata, tuple(route)
         directory = candidate
-    # Only ``..`` or a link to ``/`` ends on the directory reached so far.
+    # Only ``.``, ``..`` or a link to ``/`` ends on the directory reached so far.
     raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(directory))
 
 
@@ -216,13 +224,16 @@ def _open_resolved(path: Path, flags: int, holder: tuple[int, ...]) -> int | Non
     With POSIX ``dir_fd`` support the directory is opened first and must be
     the one the walk searched (the same device and inode), so a parent
     replaced by a link cannot lead the open anywhere else, and ``O_NOFOLLOW``
-    refuses a final link.  Returns ``None`` when the directory changed.
+    refuses a final link.  Where the platform can, the directory is opened
+    for search only (``O_PATH`` or ``O_SEARCH``), so it needs search
+    permission and not read permission, as in a lookup by path.  Returns
+    ``None`` when the directory changed.
     """
 
     if os.open not in os.supports_dir_fd or not hasattr(os, "O_DIRECTORY"):
         return os.open(path, flags)
     directory_flags = (
-        os.O_RDONLY
+        (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY)
         | os.O_DIRECTORY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NONBLOCK", 0)
