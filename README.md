@@ -4,9 +4,6 @@ A plugin for Claude Code and Codex that helps turn mathematical papers and
 notes into Lean 4 formalizations: plan the work, write proofs, and review
 progress from your coding assistant.
 
-Install from `main`. The historical
-`execution` branch and its custom worker/prover stack are deprecated.
-
 ## Installation
 
 Requires Python 3.10+, [`uv`](https://docs.astral.sh/uv/), Git, and Lean 4
