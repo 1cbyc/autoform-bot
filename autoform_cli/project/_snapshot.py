@@ -49,10 +49,12 @@ class _DecisionSnapshot:
 def _capture_decision_snapshot(root: Path) -> _DecisionSnapshot:
     """Read all decision files once; callers re-read and compare the full value.
 
-    POSIX opens use ``O_NONBLOCK`` and ``O_NOFOLLOW``.  The descriptor is
-    verified as a regular file before any read, the read is bounded, and both
-    descriptor and pathname identities are checked afterwards.  Platforms
-    without those flags still get the same pre/open/post identity checks.
+    Decision files and ``.lake`` are read through symlinks, as Lake and elan
+    read them.  POSIX opens use ``O_NONBLOCK``.  The file a path resolves to
+    must be regular before it is opened, the descriptor is verified as a
+    regular file before any read, the read is bounded, and both descriptor
+    and pathname identities are checked afterwards.  Platforms without that
+    flag still get the same pre/open/post identity checks.
     """
 
     try:
@@ -76,7 +78,14 @@ def _capture_decision_snapshot(root: Path) -> _DecisionSnapshot:
 
 
 def _capture_file(root: Path, relative: str) -> _FileSnapshot:
-    """Capture one decision file without ever reading a non-regular node."""
+    """Capture one decision file through symlinks without ever reading a non-regular node.
+
+    An entry that does not resolve to a regular file, including a dangling or
+    looping link, is present but unreadable.  It is identified by the entry
+    itself, because a device's times can change while the link to it does not
+    (writes touch ``/dev/null`` on macOS).  As in Lake, a file beneath a
+    dangling parent link is missing.
+    """
 
     path = root / relative
     parent_tokens: list[tuple[Path, tuple[int, ...]]] = []
@@ -84,24 +93,27 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
         parent = root
         for part in Path(relative).parts[:-1]:
             parent = parent / part
-            metadata = os.stat(parent, follow_symlinks=False)
+            metadata = os.stat(parent)
             if not stat.S_ISDIR(metadata.st_mode):
-                return _FileSnapshot("unreadable", _node_identity(metadata))
+                return _FileSnapshot("unreadable", _node_identity(os.stat(parent, follow_symlinks=False)))
             parent_tokens.append((parent, _node_identity(metadata)))
-        before = os.stat(path, follow_symlinks=False)
+        entry = os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
         return _FileSnapshot("missing")
     except (OSError, TypeError, ValueError):
         return _FileSnapshot("unreadable")
-    before_token = _node_identity(before)
+    try:
+        before = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return _FileSnapshot("unreadable", _node_identity(entry))
     if not stat.S_ISREG(before.st_mode):
-        return _FileSnapshot("unreadable", before_token)
+        return _FileSnapshot("unreadable", _node_identity(entry))
+    before_token = _node_identity(before)
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None = None
     try:
-        descriptor = _open_beneath(root, relative, flags)
+        descriptor = os.open(path, flags)
         opened = os.fstat(descriptor)
         opened_token = _node_identity(opened)
         if (
@@ -121,10 +133,8 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
         data = b"".join(chunks)
         after_token = _node_identity(os.fstat(descriptor))
         try:
-            path_token = _node_identity(os.stat(path, follow_symlinks=False))
-            parents_unchanged = all(
-                _node_identity(os.stat(parent, follow_symlinks=False)) == token for parent, token in parent_tokens
-            )
+            path_token = _node_identity(os.stat(path))
+            parents_unchanged = all(_node_identity(os.stat(parent)) == token for parent, token in parent_tokens)
         except (OSError, TypeError, ValueError):
             return _FileSnapshot("changed", after_token)
         if (
@@ -140,7 +150,7 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
         # A stable permission failure remains comparable across snapshots.  A
         # replacement is caught by the pathname identity in the second pass.
         try:
-            current = os.stat(path, follow_symlinks=False)
+            current = os.stat(path)
             current_token = _node_identity(current)
         except (OSError, TypeError, ValueError):
             return _FileSnapshot("changed")
@@ -148,29 +158,6 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
     finally:
         if descriptor is not None:
             os.close(descriptor)
-
-
-def _open_beneath(root: Path, relative: str, flags: int) -> int:
-    """Open a file below ``root`` without following parent links when POSIX supports it."""
-
-    if os.open not in os.supports_dir_fd or not hasattr(os, "O_DIRECTORY"):
-        return os.open(root / relative, flags)
-    directory_flags = (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    parent = os.open(root, directory_flags)
-    try:
-        for part in Path(relative).parts[:-1]:
-            child = os.open(part, directory_flags, dir_fd=parent)
-            os.close(parent)
-            parent = child
-        return os.open(Path(relative).name, flags, dir_fd=parent)
-    finally:
-        os.close(parent)
 
 
 def _decision_aliases(root: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -188,7 +175,7 @@ def _decision_aliases(root: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
     lake_aliases = next(values for name, values in aliases if name == ".lake")
     if lake_aliases:
         try:
-            lake_entries = _list_directory_beneath(root, ".lake")
+            lake_entries = _list_directory(root / ".lake")
             override = Path(_OVERRIDES).name
             aliases.append(
                 (_OVERRIDES, tuple(sorted(entry for entry in lake_entries if entry.casefold() == override.casefold())))
@@ -200,23 +187,18 @@ def _decision_aliases(root: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
     return tuple(aliases)
 
 
-def _list_directory_beneath(root: Path, relative: str) -> list[str]:
-    if os.open not in os.supports_dir_fd or not hasattr(os, "O_DIRECTORY"):
-        metadata = os.stat(root / relative, follow_symlinks=False)
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise OSError(relative)
-        return os.listdir(root / relative)
-    flags = (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor = _open_beneath(root, relative, flags)
+def _list_directory(path: Path) -> list[str]:
+    """List a directory through symlinks without opening any other kind of node."""
+
+    if os.listdir not in os.supports_fd or not hasattr(os, "O_DIRECTORY"):
+        if not stat.S_ISDIR(os.stat(path).st_mode):
+            raise OSError(path)
+        return os.listdir(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
     try:
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise OSError(relative)
+            raise OSError(path)
         return os.listdir(descriptor)
     finally:
         os.close(descriptor)
@@ -246,13 +228,17 @@ def _cross_interface_identity(identity: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def _directory_generation(path: Path) -> tuple[str, tuple[int, ...] | None]:
+    """Identify a directory through symlinks, and anything else by its own entry."""
+
     try:
-        metadata = os.stat(path, follow_symlinks=False)
+        metadata = os.stat(path)
+        if not stat.S_ISDIR(metadata.st_mode):
+            return "other", _node_identity(os.stat(path, follow_symlinks=False))
     except FileNotFoundError:
         return "missing", None
     except (OSError, TypeError, ValueError):
         return "unreadable", None
-    return ("directory" if stat.S_ISDIR(metadata.st_mode) else "other", _node_identity(metadata))
+    return "directory", _node_identity(metadata)
 
 
 def _path_present(path: Path) -> bool:
