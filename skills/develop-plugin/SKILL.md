@@ -7,19 +7,16 @@ description: >-
 
 # Develop Autoform from consumer nudges
 
-Treat Autoform as an example-based plugin installed in independent Lean
-repositories. Use the Cabannes thesis only as an executable consumer.
+Treat Autoform as an example-based plugin installed in an independent formalization
+repository. Use Cabannes as its executable consumer; keep Cabannes-specific
+facts in the example and references, never product code.
 
-Inspect the worktree and consumer behavior; name a refactor's invariant.
+Treat user nudges as product evidence. Distill rules and tests
+so future agents need less steering; preserve insight, not the transcript.
 
-Distill consumer nudges into owning-skill decision rules and focused acceptance
-tests. Preserve reusable insight, not the transcript or one-off choice.
-
-Implement reusable behavior; keep Cabannes-specific facts in its example and
-references.
-
-Keep plugin and formalization roots distinct. Keep shared agent entrypoints
-concise and link command/schema details as on-demand references.
+Keep plugin and formalization roots distinct. Agents can infer routine details;
+keep shared agent entrypoints concise and link on-demand references. State a consumer
+scenario and invariant.
 
 Bundled workflow SHAs are compatibility locks, not update channels: while
 reachable they stay valid as `main` advances but grow feature-stale. When the
@@ -27,7 +24,7 @@ example needs newer behavior, update its canonical `facebookresearch` source
 and full SHA together, update mirror assertions, and run the example commands
 through that exact pin. Never substitute a branch, tag, or personal fork.
 
-Run focused checks, then normally run:
+Run checks, then:
 
 ```bash
 make lint
@@ -36,6 +33,7 @@ make check-example
 ```
 
 Run `lake build` when example Lean results change. Validate edited skills and
-the manifest with skill-creator and plugin-creator. Report outcomes and checks.
+the manifest with skill-creator and plugin-creator. Use cachebuster and
+reinstall only to test installed discovery in a new thread. Report outcomes.
 Treat rewritten private declaration safety as fail-closed evidence: correlate
 the official user name to its lexical declaration by source coordinates.
