@@ -10,14 +10,15 @@ description: >-
 Treat Autoform as an example-based plugin in an independent formalization
 repository. Use the Cabannes thesis as executable consumer.
 
-Inspect the worktree, state a consumer scenario, observe installed behavior,
-and name the invariant. Treat user nudges as product evidence: preserve the
-insight, not the transcript, in an owning-skill trigger, rule, focused test,
-and assertion; future agents need less steering.
+Inspect the worktree; state a consumer scenario, installed behavior,
+and invariant. Treat user nudges as product evidence. Preserve the insight,
+not the transcript, as an owning-skill rule, focused test, and assertion;
+future agents need less steering.
 
-Implement reusable behavior. Keep Cabannes-specific facts in examples and
-references. Keep roots distinct. Agents can infer routine details; record only
-fragile constraints.
+Implement reusable behavior. Keep Cabannes-specific facts in examples. Keep
+plugin and formalization roots distinct. Agents can infer routine details.
+Keep shared agent entrypoints concise and link command/schema details as
+on-demand references.
 
 Source indexes, revisions, and links form one evidence boundary. Require
 retained descriptors; repeated pathname reads are not a generation boundary.
@@ -34,7 +35,7 @@ make check-example
 ```
 
 Run `lake build` when example Lean results change. Validate edited skills and
-the manifest with skill-creator and plugin-creator. Use cachebuster and reinstall
-only to test installed discovery in a new thread. Report outcome and checks.
+the manifest with skill-creator and plugin-creator. Use cachebuster and
+reinstall only to test installed discovery in a new thread.
 Treat rewritten private declaration safety as fail-closed evidence: correlate
 the official user name to its lexical declaration by source coordinates.

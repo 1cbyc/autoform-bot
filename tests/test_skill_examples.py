@@ -55,6 +55,33 @@ def test_human_review_distinguishes_roadmap_progress_from_source_scope(
     assert "overview, progress, project graph" not in skill
 
 
+def test_formalize_replaces_custom_orchestration_with_the_markdown_frontier(
+    repo_root: Path,
+) -> None:
+    skill = (repo_root / "skills/formalize/SKILL.md").read_text(encoding="utf-8")
+    metadata = (repo_root / "skills/formalize/agents/openai.yaml").read_text(encoding="utf-8")
+    codex = (repo_root / ".codex-plugin/plugin.json").read_text(encoding="utf-8")
+    muse = (repo_root / ".muse-plugin/plugin.json").read_text(encoding="utf-8")
+    normalized = " ".join(skill.split())
+
+    for required in (
+        "autoform work list",
+        "autoform work context",
+        "claim_target",
+        "separate Git worktrees",
+        "shared Lean LSP and REPL",
+        "## Execution notes",
+        "returns to Roadmap",
+    ):
+        assert required in skill
+    assert "no custom scheduler or provider adapter" in normalized
+    assert "ready, running, retrying, failed, or blocked scheduler states" in normalized
+    assert "never a transcript or retry counter" in normalized
+    assert "$formalize" in metadata
+    assert "Formalize the ready Markdown roadmap frontier" in codex
+    assert '"id": "formalize"' in muse
+
+
 def test_development_guidance_requires_fail_closed_local_safety(repo_root: Path) -> None:
     development = (repo_root / "skills" / "develop-plugin" / "SKILL.md").read_text(
         encoding="utf-8"
@@ -67,6 +94,24 @@ def test_development_guidance_requires_fail_closed_local_safety(repo_root: Path)
     assert "repeated pathname reads are not a generation boundary" in normalized
     assert "marker schema in its owning feature" in normalized
     assert "match the blob at the stable detected commit" in normalized
+
+
+def test_development_guidance_uses_progressive_command_reference(repo_root: Path) -> None:
+    development = (repo_root / "skills/develop-plugin/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    cli_reference = (repo_root / "autoform_cli/README.md").read_text(encoding="utf-8")
+    inspection_reference = (repo_root / "autoform_cli/project/README.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(development.split())
+
+    assert "plugin and formalization roots distinct" in normalized
+    assert "shared agent entrypoints concise" in normalized
+    assert "on-demand references" in normalized
+    assert "[project-inspection reference](project/README.md)" in cli_reference
+    assert "| `target-unreadable` |" not in cli_reference
+    assert "| `target-unreadable` |" in inspection_reference
 
 
 def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:
@@ -170,6 +215,9 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
         "Developed with "
         "[AutoformBot](https://github.com/facebookresearch/autoform-bot)."
     ) in readme
+    assert ".claude/worktrees/" in (example / ".gitignore").read_text(
+        encoding="utf-8"
+    ).splitlines()
     assert (example / "src/CabannesThesis.lean").is_file()
     assert (example / "src/CabannesThesis/Basic.lean").is_file()
     toolchain = (example / "lean-toolchain").read_text(encoding="utf-8").strip()
@@ -480,6 +528,73 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
     assert (repo_root / "skills/agent-review/references/roadmap-quality.md").is_file()
 
 
+def test_readback_faithfulness_contract_is_hash_bound_and_machine_readable(
+    repo_root: Path,
+) -> None:
+    skill = (repo_root / "skills/agent-review/SKILL.md").read_text(encoding="utf-8")
+    rubric = (
+        repo_root / "skills/agent-review/references/readback-faithfulness.md"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(rubric.split())
+
+    assert "isolated read-back-judge role" in skill
+    assert "exact JSON output replaces this\ngeneral report layout" in skill
+    for required in (
+        "trusted coordinator",
+        "blind auditor",
+        "faithfulness judge",
+        "packet hash",
+        "article packet hash",
+        "article review hash",
+        "read-back hash is required",
+    ):
+        assert required in normalized
+
+    def template(marker: str) -> dict[str, object]:
+        fenced = rubric.split(f"<!-- {marker} -->\n```json\n", 1)[1]
+        return json.loads(fenced.split("\n```", 1)[0])
+
+    item = template("readback-faithfulness-item-template")
+    verdict = template("readback-faithfulness-verdict-template")
+    provenance = {
+        "item",
+        "declarations",
+        "article_skeleton_hash",
+        "article_packet_hash",
+        "article_review_hash",
+        "passage_hash",
+    }
+    assert item["schema"] == "autoform-readback-faithfulness-item/v1"
+    assert verdict["schema"] == "autoform-readback-faithfulness-verdict/v1"
+    assert provenance <= item.keys() and provenance <= verdict.keys()
+    assert item["declarations"] == verdict["declarations"]
+    declaration = item["declarations"][0]
+    assert set(declaration) == {
+        "id",
+        "skeleton_hash",
+        "packet_hash",
+        "read_back_hash",
+    }
+
+    category_rows = {}
+    table = rubric.split("## Categories and decisions", 1)[1].split("## Exact output", 1)[0]
+    for line in table.splitlines():
+        match = re.match(r"\| `([^`]+)` \| `([^`]+)` \|", line)
+        if match:
+            category_rows[match.group(1)] = match.group(2)
+    assert category_rows["elaboration"] == "agrees"
+    assert category_rows["equivalent-reformulation"] == "review"
+    for category in (
+        "hypothesis-missing",
+        "hypothesis-added",
+        "conclusion-weaker",
+        "conclusion-stronger",
+    ):
+        assert category_rows[category] == "disagrees"
+    assert category_rows["evidence-missing"] == "unknown"
+    assert "hypothesis-missing: generalizes" not in rubric
+
+
 def test_roadmap_skill_owns_a_complete_pass(repo_root: Path) -> None:
     """A direct Roadmap invocation is a full job, not one planning checkpoint."""
 
@@ -658,8 +773,8 @@ def test_example_workflows_match_the_scaffold_templates(repo_root: Path) -> None
     """The executable example differs only by its concrete immutable pin."""
 
     substitutions = {
-        "{{AUTOFORM_SOURCE_YAML}}": '"https://github.com/VivienCabannes/autoform-bot.git"',
-        "{{AUTOFORM_REF_YAML}}": '"43097b2c07e68df899d6b8bca7849d091c294754"',
+        "{{AUTOFORM_SOURCE_YAML}}": '"https://github.com/facebookresearch/autoform-bot.git"',
+        "{{AUTOFORM_REF_YAML}}": '"c994d83f9fab1f40d69b2f279d4c62ca937a0186"',
     }
     template_dir = repo_root / "autoform_cli/templates/github/workflows"
     example_dir = repo_root / _EXAMPLE / ".github/workflows"
