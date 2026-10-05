@@ -21,6 +21,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 _TEMPLATES = Path(__file__).resolve().parent / "templates"
+_MAX_GITIGNORE_BYTES = 1024 * 1024
+_WINDOWS_STAT_VIEWS = os.name == "nt"
 
 #: Template paths whose leading dot is dropped on disk so packaging tools and
 #: ignore rules do not swallow them.
@@ -362,7 +364,107 @@ def _scaffold_plan(
     return tuple(files), tuple(skipped)
 
 
-def _atomic_write(destination: Path, content: bytes, *, mode: int) -> None:
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _cross_interface_identity(
+    identity: tuple[int, int, int, int, int, int],
+) -> tuple[int, ...]:
+    """Normalize Windows path-stat birth time versus fstat change time."""
+
+    return identity[:-1] if _WINDOWS_STAT_VIEWS else identity
+
+
+def _read_gitignore_snapshot(
+    path: Path,
+) -> tuple[bytes, tuple[int, int, int, int, int, int], int]:
+    """Read one bounded regular file without following a replacement link."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        attributes = getattr(opened, "st_file_attributes", 0)
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if not stat.S_ISREG(opened.st_mode) or attributes & reparse:
+            raise ScaffoldError([f"refusing to merge non-regular .gitignore: {path}"])
+        if opened.st_size > _MAX_GITIGNORE_BYTES:
+            raise ScaffoldError(
+                [f"refusing to merge .gitignore larger than {_MAX_GITIGNORE_BYTES} bytes"]
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, _MAX_GITIGNORE_BYTES - total + 1))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_GITIGNORE_BYTES:
+                raise ScaffoldError(
+                    [f"refusing to merge .gitignore larger than {_MAX_GITIGNORE_BYTES} bytes"]
+                )
+        after = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+        opened_identity = _file_identity(opened)
+        after_identity = _file_identity(after)
+        named_identity = _file_identity(named)
+        if (
+            after_identity != opened_identity
+            or _cross_interface_identity(named_identity)
+            != _cross_interface_identity(opened_identity)
+        ):
+            raise ScaffoldError([f".gitignore changed while it was being inspected: {path}"])
+        return b"".join(chunks), named_identity, stat.S_IMODE(opened.st_mode)
+    except ScaffoldError:
+        raise
+    except OSError as error:
+        raise ScaffoldError([f"cannot safely inspect existing .gitignore: {path}"]) from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _merge_gitignore(existing: bytes, required: bytes) -> bytes | None:
+    """Append missing generated ignore rules while preserving authored bytes."""
+
+    existing_lines = {line.removesuffix(b"\r") for line in existing.splitlines()}
+    missing = [
+        line
+        for line in required.splitlines()
+        if line and line.removesuffix(b"\r") not in existing_lines
+    ]
+    if not missing:
+        return None
+    separator = b"" if not existing or existing.endswith((b"\n", b"\r")) else b"\n"
+    return existing + separator + b"\n".join(missing) + b"\n"
+
+
+def _atomic_write(
+    destination: Path,
+    content: bytes,
+    *,
+    mode: int,
+    expected_identity: tuple[int, int, int, int, int, int] | None = None,
+) -> None:
     """Replace *destination* from a same-directory temporary file.
 
     Replacing rather than truncating is essential when an existing destination
@@ -379,6 +481,17 @@ def _atomic_write(destination: Path, content: bytes, *, mode: int) -> None:
             output.flush()
             os.fsync(output.fileno())
         temporary.chmod(mode)
+        if expected_identity is not None:
+            try:
+                current = os.stat(destination, follow_symlinks=False)
+            except OSError as error:
+                raise ScaffoldError(
+                    [f".gitignore changed before Autoform could merge it: {destination}"]
+                ) from error
+            if _file_identity(current) != expected_identity:
+                raise ScaffoldError(
+                    [f".gitignore changed before Autoform could merge it: {destination}"]
+                )
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -410,8 +523,9 @@ def scaffold_project(
 ) -> ScaffoldResult:
     """Write the blueprint vault, site config, and CI into *target*.
 
-    Existing files are never overwritten unless *force* is set; they come back
-    in ``skipped`` so a repair run reports exactly what it left in place.
+    Existing files are never overwritten unless *force* is set, except that a
+    regular root ``.gitignore`` is atomically extended with missing Autoform
+    rules. Skipped paths report everything else the repair left in place.
     """
 
     requested = Path(target).expanduser()
@@ -489,6 +603,18 @@ def scaffold_project(
                     [f"refusing to write outside the project through a link: {probe}"]
                 )
         if destination.exists() and not force:
+            if planned_file.relative == ".gitignore":
+                existing, identity, mode = _read_gitignore_snapshot(destination)
+                merged = _merge_gitignore(existing, planned_file.content)
+                if merged is not None:
+                    _atomic_write(
+                        destination,
+                        merged,
+                        mode=mode,
+                        expected_identity=identity,
+                    )
+                    written.append(planned_file.relative)
+                    continue
             skipped.append(planned_file.relative)
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -281,6 +282,127 @@ def test_scaffolded_gitignore_covers_agent_bootstrap_output(tmp_path: Path) -> N
 
     scaffold_project(tmp_path, title="Finite Flat")
     assert "*.log" in (tmp_path / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_scaffold_merges_autoform_rules_into_lake_gitignore(tmp_path: Path) -> None:
+    lake_ignore = b"/.lake\n# project-specific\n"
+    (tmp_path / ".gitignore").write_bytes(lake_ignore)
+
+    result = scaffold_project(tmp_path, title="Finite Flat")
+
+    merged = (tmp_path / ".gitignore").read_bytes()
+    assert merged.startswith(lake_ignore)
+    for rule in (b".lake/", b"site/", b"site-src/", b"*.log"):
+        assert merged.splitlines().count(rule) == 1
+    assert ".gitignore" in result.written
+    assert ".gitignore" not in result.skipped
+
+    again = scaffold_project(tmp_path, title="Finite Flat")
+    assert (tmp_path / ".gitignore").read_bytes() == merged
+    assert ".gitignore" in again.skipped
+
+
+@pytest.mark.parametrize(
+    "lake_ignore",
+    [b"/.lake\r\n# local\r\n", b"/.lake\n# no final newline"],
+)
+def test_gitignore_merge_preserves_existing_line_endings_and_content(
+    lake_ignore: bytes, tmp_path: Path
+) -> None:
+    destination = tmp_path / ".gitignore"
+    destination.write_bytes(lake_ignore)
+
+    scaffold_project(tmp_path, title="Finite Flat")
+
+    merged = destination.read_bytes()
+    assert merged.startswith(lake_ignore)
+    assert b"site/\n" in merged
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are unavailable")
+def test_gitignore_merge_rejects_a_fifo_without_blocking(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / ".gitignore")
+
+    with pytest.raises(ScaffoldError, match="non-regular .gitignore"):
+        scaffold_project(tmp_path, title="Finite Flat")
+
+
+def test_gitignore_merge_rejects_oversized_input(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").write_bytes(
+        b"x" * (scaffold_module._MAX_GITIGNORE_BYTES + 1)
+    )
+
+    with pytest.raises(ScaffoldError, match="larger than"):
+        scaffold_project(tmp_path, title="Finite Flat")
+
+
+def test_gitignore_merge_rejects_a_concurrent_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / ".gitignore"
+    destination.write_text("/.lake\n", encoding="utf-8")
+    original = scaffold_module._merge_gitignore
+
+    def replace_after_read(existing: bytes, required: bytes) -> bytes | None:
+        merged = original(existing, required)
+        destination.write_text("changed concurrently\n", encoding="utf-8")
+        return merged
+
+    monkeypatch.setattr(scaffold_module, "_merge_gitignore", replace_after_read)
+
+    with pytest.raises(ScaffoldError, match="changed before Autoform could merge"):
+        scaffold_project(tmp_path, title="Finite Flat")
+    assert destination.read_text(encoding="utf-8") == "changed concurrently\n"
+
+
+def test_gitignore_merge_atomically_breaks_hard_links(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    authored = tmp_path / "authored-ignore"
+    authored.write_text("/.lake\n", encoding="utf-8")
+    destination = project / ".gitignore"
+    os.link(authored, destination)
+    original_inode = authored.stat().st_ino
+
+    scaffold_project(project, title="Finite Flat")
+
+    assert authored.read_text(encoding="utf-8") == "/.lake\n"
+    assert authored.stat().st_ino == original_inode
+    assert destination.stat().st_ino != original_inode
+    assert "site/" in destination.read_text(encoding="utf-8")
+
+
+def test_windows_cross_interface_gitignore_identity_ignores_ctime_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / ".gitignore"
+    destination.write_text("/.lake\n", encoding="utf-8")
+    original_fstat = os.fstat
+    original_stat = os.stat
+
+    def view(metadata: os.stat_result, changed_ns: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino,
+            st_mode=metadata.st_mode,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_ctime_ns=changed_ns,
+            st_file_attributes=0,
+        )
+
+    monkeypatch.setattr(scaffold_module.os, "fstat", lambda descriptor: view(original_fstat(descriptor), 10))
+    monkeypatch.setattr(
+        scaffold_module.os,
+        "stat",
+        lambda path, **kwargs: view(original_stat(path, **kwargs), 20),
+    )
+    monkeypatch.setattr(scaffold_module, "_WINDOWS_STAT_VIEWS", True)
+
+    content, identity, _mode = scaffold_module._read_gitignore_snapshot(destination)
+
+    assert content == b"/.lake\n"
+    assert identity[-1] == 20
 
 
 def test_scaffolded_blueprint_tracks_authored_structure(tmp_path: Path) -> None:
