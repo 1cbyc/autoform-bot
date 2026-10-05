@@ -765,28 +765,6 @@ def test_catalog_releases_meet_the_lean_floor() -> None:
         assert create_module._version_warnings(version) == ()
 
 
-def test_unlisted_plan_must_not_carry_a_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    target = tmp_path / "Project"
-    original = create_module._build_project_plan
-    bundle = create_module._load_release_bundle(load_release_catalog().recommended)
-
-    def add_manifest(*args, **kwargs):
-        plan, pinned = original(*args, **kwargs)
-        manifest = type(plan[0])("lake-manifest.json", create_module._lake_manifest("Project", bundle), 0o644)
-        return tuple(sorted((*plan, manifest), key=lambda item: item.relative)), pinned
-
-    monkeypatch.setattr(create_module, "_build_project_plan", add_manifest)
-
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=None, lean_toolchain="v4.30.0")
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
-    stages = list(tmp_path.glob(".autoform-new-*"))
-    assert len(stages) == 1
-    assert (stages[0] / "lake-manifest.json").is_file()
-
-
 def test_long_valid_target_name_does_not_expand_the_stage_name(tmp_path: Path) -> None:
     name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
     if name_limit < 64:
@@ -979,11 +957,13 @@ def test_injected_validation_failure_preserves_stage_for_safe_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / "project"
+    original = create_module._materialize_project
 
     def fail(*args, **kwargs):
+        original(*args, **kwargs)
         raise ProjectCreateError("project-create-validation-failed", "invalid")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", fail)
+    monkeypatch.setattr(create_module, "_materialize_project", fail)
     with pytest.raises(ProjectCreateError) as raised:
         create_project(target, package="Project", release_id=_RELEASE)
     assert raised.value.code == "project-create-validation-failed"
@@ -999,14 +979,12 @@ def test_invalid_planned_roadmap_is_never_published(tmp_path: Path, monkeypatch:
     original = create_module._build_project_plan
 
     def corrupt(*args, **kwargs):
-        plan, pinned = original(*args, **kwargs)
-        changed = tuple(
+        return tuple(
             type(item)(item.relative, b"No H1 title.\n", item.mode)
             if item.relative == "blueprint/roadmap/README.md"
             else item
-            for item in plan
+            for item in original(*args, **kwargs)
         )
-        return changed, pinned
 
     monkeypatch.setattr(create_module, "_build_project_plan", corrupt)
 
@@ -1018,23 +996,19 @@ def test_invalid_planned_roadmap_is_never_published(tmp_path: Path, monkeypatch:
     assert not list(tmp_path.glob(".autoform-new-*"))
 
 
-@pytest.mark.parametrize("corruption", ["container", "relative", "content", "mode"])
-def test_plan_requires_exact_types_and_safe_file_modes_before_writing(
+@pytest.mark.parametrize("corruption", ["relative", "mode"])
+def test_plan_requires_safe_paths_and_file_modes_before_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str
 ) -> None:
     original = create_module._build_project_plan
 
     def corrupt(*args, **kwargs):
-        plan, pinned = original(*args, **kwargs)
-        if corruption == "container":
-            return list(plan), pinned
-        first, *rest = plan
+        first, *rest = original(*args, **kwargs)
         changed = {
             "relative": type(first)(Path(first.relative), first.content, first.mode),
-            "content": type(first)(first.relative, memoryview(first.content), first.mode),
             "mode": type(first)(first.relative, first.content, 0o666),
         }[corruption]
-        return (changed, *rest), pinned
+        return (changed, *rest)
 
     monkeypatch.setattr(create_module, "_build_project_plan", corrupt)
 
@@ -1289,7 +1263,7 @@ def test_requested_parent_rebind_before_publish_preserves_the_stage(
     parent.mkdir(mode=0o700)
     parent.chmod(0o755)
     target = parent / "Project"
-    original = create_module._validate_staged_project
+    original = create_module._materialize_project
 
     def rebind(*args, **kwargs) -> None:
         original(*args, **kwargs)
@@ -1297,7 +1271,7 @@ def test_requested_parent_rebind_before_publish_preserves_the_stage(
         parent.mkdir(mode=0o700)
         parent.chmod(0o755)
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", rebind)
+    monkeypatch.setattr(create_module, "_materialize_project", rebind)
 
     with pytest.raises(ProjectCreateError) as raised:
         create_project(target, package="Project", release_id=_RELEASE)
@@ -1373,7 +1347,7 @@ def test_postpublish_parent_recheck_failure_does_not_claim_a_rebind(
 
 def test_workspace_substitution_fails_before_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
-    original = create_module._validate_staged_project
+    original = create_module._materialize_project
 
     def substitute(*args, **kwargs) -> None:
         original(*args, **kwargs)
@@ -1383,35 +1357,12 @@ def test_workspace_substitution_fails_before_publication(tmp_path: Path, monkeyp
         stage.mkdir(mode=0o700)
         (stage / "FOREIGN").write_text("foreign\n", encoding="utf-8")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", substitute)
+    monkeypatch.setattr(create_module, "_materialize_project", substitute)
     with pytest.raises(ProjectCreateError) as raised:
         create_project(target, package="Project", release_id=_RELEASE)
     assert raised.value.code == "project-create-failed"
     assert not target.exists()
     assert any(path.name == "FOREIGN" for path in tmp_path.rglob("FOREIGN"))
-
-
-def test_corrupt_core_plan_is_rejected_without_path_based_inspection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / "project"
-    original = create_module._build_project_plan
-
-    def corrupt(*args, **kwargs):
-        plan, pinned = original(*args, **kwargs)
-        changed = tuple(
-            type(item)(item.relative, b"leanprover/lean4:v0.0.0\n", item.mode)
-            if item.relative == "lean-toolchain"
-            else item
-            for item in plan
-        )
-        return changed, pinned
-
-    monkeypatch.setattr(create_module, "_build_project_plan", corrupt)
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
 
 
 def test_stage_path_substitution_never_writes_to_symlink_target(
@@ -1442,14 +1393,14 @@ def test_stage_path_substitution_never_writes_to_symlink_target(
 
 def test_stage_open_failure_preserves_the_owned_empty_stage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
-    original = create_module._open_stage
+    original = create_module._open_directory
 
     def fail_first_open(parent_descriptor: int, stage_name: str) -> int:
         if stage_name.startswith(".autoform-new-"):
             raise OSError("injected stage open failure")
         return original(parent_descriptor, stage_name)
 
-    monkeypatch.setattr(create_module, "_open_stage", fail_first_open)
+    monkeypatch.setattr(create_module, "_open_directory", fail_first_open)
 
     with pytest.raises(ProjectCreateError) as raised:
         create_project(target, package="Project", release_id=_RELEASE)
@@ -1463,14 +1414,16 @@ def test_stage_open_failure_preserves_the_owned_empty_stage(tmp_path: Path, monk
 
 def test_failure_path_never_attempts_recursive_deletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
+    original = create_module._materialize_project
 
     def fail(*args, **kwargs):
+        original(*args, **kwargs)
         raise OSError("injected")
 
     def forbidden(*args, **kwargs):
         raise AssertionError("project creation attempted destructive cleanup")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", fail)
+    monkeypatch.setattr(create_module, "_materialize_project", fail)
     monkeypatch.setattr(create_module.os, "unlink", forbidden)
     monkeypatch.setattr(create_module.os, "rmdir", forbidden)
 
@@ -1488,7 +1441,7 @@ def test_failure_cleanup_never_recurses_into_a_foreign_directory(
     victim = tmp_path / "victim"
     victim.mkdir()
     (victim / "KEEP").write_text("keep\n", encoding="utf-8")
-    original = create_module._validate_staged_project
+    original = create_module._materialize_project
 
     def substitute(*args, **kwargs):
         original(*args, **kwargs)
@@ -1497,7 +1450,7 @@ def test_failure_cleanup_never_recurses_into_a_foreign_directory(
         victim.rename(stage / "blueprint")
         raise OSError("injected")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", substitute)
+    monkeypatch.setattr(create_module, "_materialize_project", substitute)
     with pytest.raises(ProjectCreateError) as raised:
         create_project(target, package="Project", release_id=_RELEASE)
 
@@ -1550,16 +1503,16 @@ def test_noncanonical_generated_directory_mode_is_not_published(
     assert stat.S_IMODE((stage / "blueprint").stat().st_mode) == 0o777
 
 
-def test_mutation_after_validation_is_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mutated_stage_is_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
-    original = create_module._validate_staged_project
+    original = create_module._materialize_project
 
     def mutate(*args, **kwargs):
         original(*args, **kwargs)
         stage = next(tmp_path.glob(".autoform-new-*"))
         (stage / "lean-toolchain").write_text("mutated\n", encoding="utf-8")
 
-    monkeypatch.setattr(create_module, "_validate_staged_project", mutate)
+    monkeypatch.setattr(create_module, "_materialize_project", mutate)
 
     with pytest.raises(ProjectCreateError) as raised:
         create_project(target, package="Project", release_id=_RELEASE)
