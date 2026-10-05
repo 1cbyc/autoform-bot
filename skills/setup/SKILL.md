@@ -60,10 +60,11 @@ Mathlib revision. Such a project is created without `lake-manifest.json` and
 with a warning: run `lake update` in it, which needs network access and
 downloads the Mathlib build cache, then commit the manifest it writes. Autoform
 needs Lean v4.27.0 or newer, and `project new` also warns below that.
-The target's parent must not be group- or world-writable unless it is a sticky
-directory owned by the user or root, such as `/tmp`. If `project new` reports
-`project-parent-unsafe`, choose another parent or, with the user's agreement,
-remove that write access with `chmod g-w,o-w`.
+Every component of the target parent must be a real directory, not a symlink;
+on macOS use `/private/tmp`, not the `/tmp` alias. The parent must not be group-
+or world-writable unless it is a sticky directory owned by the user or root. If
+`project new` reports `project-parent-unsafe`, choose another parent or, with the
+user's agreement, remove that write access with `chmod g-w,o-w`.
 
 `project new` writes the requested `lean-toolchain` and Mathlib revision (by
 default the recommended, locked catalog pair), the Lean shell, and the complete

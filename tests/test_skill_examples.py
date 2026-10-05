@@ -127,6 +127,8 @@ def test_setup_guidance_uses_the_offline_atomic_project_creator(repo_root: Path)
     assert "without running Lake, Lean, or network operations" in normalized
     assert "complete Autoform vault, site, ignore rules, and pinnable CI" in normalized
     assert "no later `init` is needed" in normalized
+    assert "Every component of the target parent must be a real directory, not a symlink" in normalized
+    assert "on macOS use `/private/tmp`, not the `/tmp` alias" in normalized
     assert "pins generated workflows exactly as `init` does" in normalized
     assert "cached remote-tracking ref contains that commit" in normalized
     assert "prefers Autoform's canonical repository" in normalized

@@ -863,16 +863,23 @@ def test_never_overwrites_existing_target(tmp_path: Path, kind: str) -> None:
     assert after == before
 
 
-def test_normal_macos_tmp_alias_is_supported() -> None:
+def test_macos_tmp_alias_is_rejected_but_private_tmp_is_supported() -> None:
     if not Path("/tmp").is_symlink():
         pytest.skip("platform has no /tmp alias")
-    parent = Path("/tmp") / f"autoform-new-test-{os.getpid()}"
+    canonical_root = Path("/private/tmp")
+    assert Path("/tmp").resolve() == canonical_root
+    name = f"autoform-new-test-{os.getpid()}"
+    parent = canonical_root / name
     parent.mkdir(mode=0o700)
     parent.chmod(0o755)
-    target = parent / "Project"
     try:
-        create_project(target, package="Project", release_id=_RELEASE)
-        assert inspect_project(parent.resolve() / "Project").ok
+        with pytest.raises(ProjectCreateError) as raised:
+            create_project(Path("/tmp") / name / "Project", package="Project", release_id=_RELEASE)
+        assert raised.value.code == "project-path-is-symlink"
+        assert not (parent / "Project").exists()
+
+        create_project(parent / "Project", package="Project", release_id=_RELEASE)
+        assert inspect_project(parent / "Project").ok
     finally:
         shutil.rmtree(parent, ignore_errors=True)
 
@@ -2085,6 +2092,49 @@ def test_symlinked_parent_at_open_is_reported_as_a_link(
 
     assert raised.value.code == "project-path-is-symlink"
     assert not list(real.iterdir())
+
+
+def test_static_parent_alias_is_rejected_without_resolving_it(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(alias / "Project", package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-path-is-symlink"
+    assert not list(real.iterdir())
+
+
+def test_alias_cannot_be_swapped_after_resolution_before_link_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first"
+    first.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(first, target_is_directory=True)
+    original_resolve = Path.resolve
+    stale_resolution_observed = False
+
+    def resolve_then_replace(path: Path, *args, **kwargs):
+        nonlocal stale_resolution_observed
+        resolved = original_resolve(path, *args, **kwargs)
+        if path == alias:
+            stale_resolution_observed = True
+            alias.unlink()
+            alias.mkdir(mode=0o700)
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", resolve_then_replace)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(alias / "Project", package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-path-is-symlink"
+    assert not stale_resolution_observed
+    assert not (first / "Project").exists()
+    assert not (alias / "Project").exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="project creation requires POSIX path binding")

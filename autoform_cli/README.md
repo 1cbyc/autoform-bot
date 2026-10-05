@@ -176,10 +176,12 @@ runs no subprocesses, Lake, Lean, or network operations. Without a ref the local
 project is complete but the workflows are omitted.
 It fails closed where POSIX descriptor traversal, advisory locking, directory
 sync, or atomic no-replace rename is unavailable, including on Windows.
-The parent and each of its ancestors must be readable, because each is opened
-without following links (`project-parent-inaccessible` otherwise). The parent
-must not be group- or world-writable unless it is a sticky directory owned by
-you or root, such as `/tmp`; otherwise creation fails with
+The parent and each of its ancestors must be readable real directories, because
+each caller-supplied path component is opened without following links
+(`project-parent-inaccessible` or `project-path-is-symlink` otherwise). On
+macOS, use the canonical `/private/tmp` path rather than the `/tmp` symlink. The
+parent must not be group- or world-writable unless it is a sticky directory
+owned by you or root; otherwise creation fails with
 `project-parent-unsafe`, which `chmod g-w,o-w` on the parent fixes. Creations in
 one parent are serialized with an advisory lock, and a lock held elsewhere for
 30 seconds fails with `project-parent-busy`.

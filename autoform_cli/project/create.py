@@ -665,45 +665,10 @@ def _validate_target(target: str | Path | None) -> Path:
         raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.")
     if _unsafe_parent_metadata(metadata.st_mode, metadata.st_uid):
         raise ProjectCreateError("project-parent-unsafe", _UNSAFE_PARENT_MESSAGE)
-    try:
-        canonical_parent = parent.resolve(strict=True)
-    except (OSError, RuntimeError, ValueError):
-        raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.") from None
-    if canonical_parent != parent and _only_trusted_system_links(parent):
-        return canonical_parent / raw.name
-    # Keep the caller's normalized path. `_open_parent` traverses this exact
-    # spelling with O_NOFOLLOW, so a symlink alias cannot be resolved here and
-    # later retargeted while publication continues in the old directory.
+    # Keep every caller-supplied path component. `_open_parent` traverses this
+    # exact absolute spelling with O_NOFOLLOW, so no alias can be resolved here
+    # and later retargeted while publication continues in the old directory.
     return raw
-
-
-def _only_trusted_system_links(path: Path) -> bool:
-    """Whether every symlink component is protected by a root-owned directory.
-
-    macOS exposes conventional paths such as ``/tmp`` through root-owned links.
-    Those aliases are not retargetable by an ordinary caller and remain useful;
-    any link in a group- or world-writable or non-root-owned directory stays in
-    the requested spelling so `_open_parent` rejects it with ``O_NOFOLLOW``.
-    """
-
-    current = Path(path.anchor)
-    try:
-        for part in path.parts[1:]:
-            parent = current
-            current /= part
-            metadata = os.stat(current, follow_symlinks=False)
-            if not stat.S_ISLNK(metadata.st_mode):
-                continue
-            parent_metadata = os.stat(parent, follow_symlinks=False)
-            if (
-                metadata.st_uid != 0
-                or parent_metadata.st_uid != 0
-                or parent_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            ):
-                return False
-    except (OSError, TypeError, ValueError):
-        return False
-    return True
 
 
 def _parent_access_error(error: OSError) -> ProjectCreateError:
