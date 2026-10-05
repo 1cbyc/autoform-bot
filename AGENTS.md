@@ -51,6 +51,8 @@ owning skill for product behavior.
 - Files under `autoform_cli/templates/` are product templates. When a generated
   workflow, audit helper, ignore rule, or site configuration changes, update its
   bundled-example mirror and the equivalence test in the same PR.
+- Keep release versions synchronized across `pyproject.toml`, `uv.lock`, Claude
+  and Muse manifests, and the semantic base of Codex's cachebuster version.
 - Pin Actions, Elan, Autoform, and consumer dependencies immutably. Use the
   canonical `https://github.com/facebookresearch/autoform-bot.git` source and a
   full commit SHA, never a branch, tag, abbreviated SHA, or personal fork.
