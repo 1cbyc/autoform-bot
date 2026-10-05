@@ -184,15 +184,26 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.live_state = live_state
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
-    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+    def _accept_local_request(self) -> bool:
+        """Reject nonlocal browser authority before any response surface."""
+
         port = int(self.server.server_address[1])
         hosts = self.headers.get_all("Host", failobj=[])
         if len(hosts) != 1 or not _local_authority(hosts[0], port):
             self.send_error(421, "dashboard Host must match its loopback listener")
-            return
+            return False
         origins = self.headers.get_all("Origin", failobj=[])
         if len(origins) > 1 or (origins and not _local_origin(origins[0], port)):
             self.send_error(403, "dashboard Origin must match its loopback listener")
+            return False
+        return True
+
+    def do_HEAD(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        if self._accept_local_request():
+            super().do_HEAD()
+
+    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        if not self._accept_local_request():
             return
         if urlsplit(self.path).path != LIVE_ENDPOINT:
             super().do_GET()

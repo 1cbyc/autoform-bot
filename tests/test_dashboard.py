@@ -189,10 +189,12 @@ def test_dashboard_handler_serves_static_site_and_no_store_overlay(tmp_path: Pat
         thread.join(timeout=5)
 
 
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
 @pytest.mark.parametrize("path", ["/", LIVE_ENDPOINT])
 def test_dashboard_rejects_dns_rebinding_host_before_serving(
     tmp_path: Path,
     path: str,
+    method: str,
 ) -> None:
     site = tmp_path / "site"
     site.mkdir()
@@ -209,7 +211,7 @@ def test_dashboard_rejects_dns_rebinding_host_before_serving(
     try:
         host, port = server.server_address
         connection = http.client.HTTPConnection(host, port, timeout=5)
-        connection.request("GET", path, headers={"Host": "attacker.example"})
+        connection.request(method, path, headers={"Host": "attacker.example"})
         response = connection.getresponse()
         response.read()
         connection.close()
@@ -222,8 +224,10 @@ def test_dashboard_rejects_dns_rebinding_host_before_serving(
         thread.join(timeout=5)
 
 
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
 def test_dashboard_rejects_cross_origin_request_before_loading_claims(
     tmp_path: Path,
+    method: str,
 ) -> None:
     site = tmp_path / "site"
     site.mkdir()
@@ -240,7 +244,7 @@ def test_dashboard_rejects_cross_origin_request_before_loading_claims(
         host, port = server.server_address
         connection = http.client.HTTPConnection(host, port, timeout=5)
         connection.request(
-            "GET",
+            method,
             LIVE_ENDPOINT,
             headers={
                 "Host": f"127.0.0.1:{port}",
