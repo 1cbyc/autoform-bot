@@ -111,18 +111,42 @@ def test_quick_start_keeps_the_cli_agent_facing(repo_root: Path) -> None:
 
 
 def test_setup_guidance_uses_the_offline_atomic_project_creator(repo_root: Path) -> None:
-    setup = (repo_root / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
+    setup_root = repo_root / "skills" / "setup"
+    setup = (setup_root / "SKILL.md").read_text(encoding="utf-8")
     normalized = " ".join(setup.split())
 
-    assert "autoform project new <TARGET>" in normalized
+    assert (
+        'uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform project inspect '
+        '"$PROJECT" --json'
+    ) in setup
+    assert (
+        'uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform project new '
+        '"$TARGET" --package "$PACKAGE"'
+    ) in setup
     assert "never overwrites an existing target" in normalized
     assert "without running Lake, Lean, or network operations" in normalized
+    assert "complete Autoform vault, site, ignore rules, and pinnable CI" in normalized
+    assert "no later `init` is needed" in normalized
     assert "pins generated workflows exactly as `init` does" in normalized
     assert "fails closed" in normalized and "including Windows" in normalized
     assert "Do not invent version pairs" not in normalized
     assert "--lean-toolchain" in normalized
     assert "lake update" in normalized
     assert "v4.27.0" in normalized
+    assert "scripts/workspace_inspector.py" not in setup
+    assert "scripts/make_project.sh" not in setup
+    for document in sorted(setup_root.rglob("*.md")):
+        text = document.read_text(encoding="utf-8")
+        for reference in re.findall(r"(?<![A-Za-z0-9_])scripts/[A-Za-z0-9_./-]+", text):
+            assert (repo_root / reference).is_file(), (
+                f"{document.relative_to(repo_root)} references missing helper {reference}"
+            )
+    for document in sorted(setup_root.rglob("*.md")):
+        text = document.read_text(encoding="utf-8")
+        for reference in re.findall(r"(?<![A-Za-z0-9_])scripts/[A-Za-z0-9_./-]+", text):
+            assert (repo_root / reference).is_file(), (
+                f"{document.relative_to(repo_root)} references missing helper {reference}"
+            )
 
 
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
@@ -718,10 +742,13 @@ def test_skills_delegate_the_command_line_to_the_reference(repo_root: Path) -> N
     citing = 0
     for skill in sorted((repo_root / "skills").glob("*/SKILL.md")):
         text = skill.read_text(encoding="utf-8")
-        assert "uv run --project" not in text, (
-            f"{skill.relative_to(repo_root)} restates a CLI invocation; "
-            "link to autoform_cli/README.md#commands instead"
-        )
+        if skill.parent.name == "setup":
+            assert text.count("uv run --project") == 3
+        else:
+            assert "uv run --project" not in text, (
+                f"{skill.relative_to(repo_root)} restates a CLI invocation; "
+                "link to autoform_cli/README.md#commands instead"
+            )
         if "autoform_cli/README.md" in text:
             citing += 1
     assert citing >= 3

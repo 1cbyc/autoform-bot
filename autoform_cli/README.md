@@ -195,7 +195,8 @@ newer (the skeleton probe uses that release's `String` API and the generated
 audit reads ILean `decls`); older toolchains get a `project-lean-below-minimum`
 warning. With `--json`, such a pair reports `"release": null` and its warnings
 go to the `warnings` array; otherwise warnings go to stderr. Either way the
-exit status stays 0.
+exit status stays 0. Successful JSON uses schema
+`autoform-project-creation/v1`.
 
 `project inspect` is local and read-only. It inspects the nearest enclosing Lean
 project without running Lake, Lean, Git, or the network. For automation, use

@@ -309,6 +309,13 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
     assert result.package == "FiniteFlat"
     assert result.release == _RELEASE
     assert result.target == "FiniteFlat"
+    assert result.as_dict()["schema"] == "autoform-project-creation/v1"
+    assert (target / ".gitignore").read_text(encoding="utf-8").splitlines() == [
+        ".lake/",
+        "site/",
+        "site-src/",
+        "*.log",
+    ]
     assert (target / "lean-toolchain").read_text(encoding="utf-8") == ("leanprover/lean4:v4.32.2\n")
     assert (target / "lakefile.toml").read_text(encoding="utf-8") == (
         'name = "FiniteFlat"\n'
@@ -1760,7 +1767,9 @@ def test_cli_postcommit_output_is_ascii_and_backslash_safe(tmp_path: Path) -> No
     )
     assert machine.returncode == 0, machine.stderr
     assert all(ord(character) < 128 for character in machine.stdout)
-    assert json.loads(machine.stdout)["target"] == json_target.name
+    payload = json.loads(machine.stdout)
+    assert payload["schema"] == "autoform-project-creation/v1"
+    assert payload["target"] == json_target.name
 
 
 @pytest.mark.parametrize("name", [os.fsdecode(b"project-\xff"), "project-\ud800"])

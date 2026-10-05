@@ -7,11 +7,17 @@ from .catalog import (
     load_release_catalog,
     parse_release_catalog,
 )
-from .create import ProjectCreateError, ProjectCreateResult, create_project
+from .create import (
+    PROJECT_CREATION_SCHEMA,
+    ProjectCreateError,
+    ProjectCreateResult,
+    create_project,
+)
 from .inspect import PROJECT_INSPECTION_SCHEMA, ProjectInspection, inspect_project
 
 __all__ = [
     "PROJECT_INSPECTION_SCHEMA",
+    "PROJECT_CREATION_SCHEMA",
     "RELEASE_CATALOG_SCHEMA",
     "ProjectCatalogError",
     "ProjectCreateError",

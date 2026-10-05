@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+import pytest
 
 
 def test_main_plugin_surface_excludes_deicyde_orchestration(repo_root):
@@ -82,6 +86,86 @@ def test_mcp_launchers_use_plugin_only_as_the_uv_project(repo_root):
         assert server["cwd"] == "${CLAUDE_PLUGIN_ROOT}"
         assert server["args"][:3] == ["run", "--project", "${CLAUDE_PLUGIN_ROOT}"]
         assert "LEAN_PROJECT_DIR" not in json.dumps(server)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="project new requires POSIX publication")
+def test_copied_plugin_project_entrypoints_need_no_autoform_on_path(repo_root, tmp_path):
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    for name in ("LICENSE", "pyproject.toml", "uv.lock"):
+        shutil.copy2(repo_root / name, plugin / name)
+    for package in ("autoform_cli", "servers"):
+        shutil.copytree(
+            repo_root / package,
+            plugin / package,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    environment = os.environ.copy()
+    environment["PATH"] = str(empty_path)
+    environment.pop("VIRTUAL_ENV", None)
+    uv = shutil.which("uv")
+    assert uv is not None
+    assert shutil.which("autoform", path=environment["PATH"]) is None
+
+    def run(*arguments: str, cwd: Path = tmp_path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                uv,
+                "run",
+                "--python",
+                sys.executable,
+                "--project",
+                str(plugin),
+                "autoform",
+                *arguments,
+            ],
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+
+    versions = run("project", "versions", "--json")
+    assert versions.returncode == 0, versions.stderr
+    release = json.loads(versions.stdout)["releases"][0]
+
+    parent = tmp_path / "consumer"
+    parent.mkdir(mode=0o700)
+    target = parent / "CopiedProject"
+    created = run(
+        "project",
+        "new",
+        str(target),
+        "--package",
+        "CopiedProject",
+        "--release",
+        release["id"],
+        "--json",
+        cwd=parent,
+    )
+    assert created.returncode == 0, created.stdout + created.stderr
+    payload = json.loads(created.stdout)
+    assert payload["schema"] == "autoform-project-creation/v1"
+    assert payload["release"] == release["id"]
+    assert (target / ".gitignore").read_text(encoding="utf-8").splitlines() == [
+        ".lake/",
+        "site/",
+        "site-src/",
+        "*.log",
+    ]
+
+    inspection = run("project", "inspect", str(target), "--json", cwd=parent)
+    assert inspection.returncode == 0, inspection.stderr
+    report = json.loads(inspection.stdout)
+    assert report["compatibility"] == {
+        "recommended_release": release["id"],
+        "release": release["id"],
+        "status": "supported",
+    }
 
 
 def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):

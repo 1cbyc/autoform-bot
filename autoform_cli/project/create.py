@@ -33,6 +33,7 @@ _PACKAGE_NAME = re.compile(r"[A-Z][A-Za-z0-9]*")
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _RESERVED_PACKAGE_NAMES = frozenset({"Prop", "Sort", "Type"})
 _CREATION_RELEASE_SCHEMA = "autoform-project-creation-release/v1"
+PROJECT_CREATION_SCHEMA = "autoform-project-creation/v1"
 _RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _STAGE_ATTEMPTS = 32
 _TOOLCHAIN_MODULE_ROOTS = frozenset({"Init", "Lake", "Lean", "Std"})
@@ -111,6 +112,7 @@ class ProjectCreateResult:
             "ok": True,
             "package": self.package,
             "release": self.release,
+            "schema": PROJECT_CREATION_SCHEMA,
             "target": self.target,
             "warnings": [{"code": code, "message": message} for code, message in self.warnings],
             "workflows_pinned": self.workflows_pinned,

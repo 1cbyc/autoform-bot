@@ -17,12 +17,20 @@ MkDocs, CI, and optionally publication. It does not scope sources, choose
 theorems, write roadmap nodes, or prove results; Roadmap owns that work.
 
 Inspect before writing and preserve existing Lean, Markdown, workflow, and
-ignore files. Use `scripts/workspace_inspector.py` when auditing an existing
-Lean workspace. Infer safe local defaults from the request and repository. If a
-material choice is missing, ask once for the run type (new, repair, or inspect),
-UpperCamelCase package name, target directory, and whether publication is
-wanted. Without explicit publication approval, make no remote changes. Setup
-prepares the shell and stops before
+ignore files. Resolve `AUTOFORM_PLUGIN_ROOT` from the loaded plugin and inspect
+an existing project through the supported read-only entrypoint:
+
+```bash
+AUTOFORM_PLUGIN_ROOT="<loaded-plugin-root>"
+PROJECT="<existing-project>"
+uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform project inspect "$PROJECT" --json
+```
+
+Infer safe local defaults from the request and repository. If a material choice
+is missing, ask once for the run type (new, repair, or inspect), UpperCamelCase
+package name, target directory, and whether publication is wanted. Without
+explicit publication approval, make no remote changes. Setup prepares the shell
+and stops before
 mathematical planning.
 
 Read the repo-shaped [Cabannes thesis project](assets/cabannes-thesis-project/README.md)
@@ -36,7 +44,10 @@ For a new repository, require a target directory that does not already exist,
 then create the complete local project atomically:
 
 ```bash
-autoform project new <TARGET> --package <UpperCamelCaseName>
+AUTOFORM_PLUGIN_ROOT="<loaded-plugin-root>"
+TARGET="<absent-target>"
+PACKAGE="<UpperCamelCaseName>"
+uv run --project "$AUTOFORM_PLUGIN_ROOT" autoform project new "$TARGET" --package "$PACKAGE"
 ```
 
 Without version flags `project new` uses the recommended release from
@@ -55,25 +66,28 @@ directory owned by the user or root, such as `/tmp`. If `project new` reports
 remove that write access with `chmod g-w,o-w`.
 
 `project new` writes the requested `lean-toolchain` and Mathlib revision (by
-default the recommended, locked catalog pair), the Lean shell, and the Autoform vault without running Lake, Lean, or network
-operations; it never overwrites an existing target. It fails closed on
-platforms without the required POSIX filesystem operations, including Windows.
+default the recommended, locked catalog pair), the Lean shell, and the complete
+Autoform vault, site, ignore rules, and pinnable CI without running Lake, Lean,
+or network operations; no later `init` is needed. It never overwrites an
+existing target and fails closed on platforms without the required POSIX
+filesystem operations, including Windows.
 It pins generated workflows exactly as `init` does, described below, and omits
 them when there is no commit to pin;
-`autoform init <TARGET> --autoform-ref <40-char-sha>` adds them later. Do not
-invent workflow sources or revisions, and do not copy the populated example as a
-project generator.
+invoke `init` later through the same plugin-root launcher, passing the target
+and `--autoform-ref <40-char-sha>`. Do not invent workflow sources or revisions,
+and do not copy the populated example as a project generator.
 
 For an incomplete existing repository, preserve its authored configuration and
-use `autoform init` only for the Autoform vault/site overlay until the dedicated
-repair command is available.
+run `autoform init` through the same `uv run --project "$AUTOFORM_PLUGIN_ROOT"`
+prefix only for the Autoform vault/site repair overlay.
 
 `autoform init` is the whole vault: `blueprint/` with its landing page,
 `roadmap/README.md`, `coverage/`, and `sources/`, plus `mkdocs.yml`, the theme
 override, both workflows, and ignore rules. Do not hand-build any of it and do
 not copy the bundled example: the layout is fixed, and a chapter written as a
 sibling file instead of `<chapter>/README.md` still validates while publishing
-a book with no chapters. `init` never overwrites an existing file, so it is
+a book with no chapters. `init` preserves existing files, atomically adding
+only missing Autoform rules to a bounded regular root `.gitignore`, so it is
 also the repair path; it reports what it left alone. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
