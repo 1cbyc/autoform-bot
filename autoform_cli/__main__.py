@@ -560,6 +560,8 @@ def _work_impact(args: argparse.Namespace) -> int:
     for line in format_impact(report):
         print(_human_text(line))
     return 0
+
+
 def _print_project_inspection(result) -> None:
     if result.project_root is not None:
         print(f"Project root: {_human_text(result.project_root)}")
