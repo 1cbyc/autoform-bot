@@ -19,7 +19,7 @@ from pathlib import Path
 import tomli
 
 from . import _snapshot
-from ._lake_4_32 import (
+from ._lake_metadata import (
     LakeProject,
     LakeTarget,
     MathlibLock,

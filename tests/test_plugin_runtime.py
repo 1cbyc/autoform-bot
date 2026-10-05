@@ -102,7 +102,7 @@ def test_wheel_contains_only_the_minimal_runtime(repo_root, tmp_path):
             "autoform_cli/graph.py",
             "autoform_cli/probes/skeleton_probe.lean",
             "autoform_cli/project/README.md",
-            "autoform_cli/project/_lake_4_32.py",
+            "autoform_cli/project/_lake_metadata.py",
             "autoform_cli/project/_snapshot.py",
             "autoform_cli/visualize.py",
             "autoform_cli/project/releases.json",
