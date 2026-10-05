@@ -25,7 +25,7 @@ A direct-Mathlib-only manifest is invalid.
 Implement reusable plugin behavior. Keep Cabannes-specific facts in examples.
 
 Keep plugin and formalization roots distinct. Agents can infer routine details;
-keep skills to non-obvious constraints and fragile domain steps.
+keep shared agent entrypoints concise and link command/schema details as on-demand references.
 
 Run focused checks, then normally run:
 
