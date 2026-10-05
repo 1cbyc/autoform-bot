@@ -118,6 +118,7 @@ def test_development_guidance_maintains_example_compatibility_pins(
     normalized = " ".join(development.split())
 
     assert "compatibility locks, not update channels" in normalized
+    assert "stay valid as `main` advances but grow feature-stale" in normalized
     assert "canonical `facebookresearch` source and full SHA together" in normalized
     assert "run the example commands through that exact pin" in normalized
     assert "branch, tag, or personal fork" in normalized
