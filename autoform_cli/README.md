@@ -130,6 +130,10 @@ autoform init . --title "Finite Flat Group Schemes" \
 
 Pass `--autoform-ref <sha>` to pin the generated workflows at an immutable
 commit, `--force` to overwrite, and `--json` for machine-readable output.
+An existing root `.gitignore` must be a bounded single-link regular file;
+missing Autoform rules are appended through one retained descriptor. If an
+append cannot be fully reverified, the error says it may be partial and the
+file must be inspected before retrying.
 
 Create or inspect a Lean project and list Autoform's bundled known-good release pairs:
 
@@ -159,14 +163,17 @@ Its release identity is cross-checked with the public catalog and its complete
 Lake manifest before any filesystem state is created.
 Generated workflows are pinned as `init` pins them: `--autoform-ref` must be a
 full commit SHA, an explicit `--autoform-source` carries its own ref or none,
-and without flags the workflows pin the origin and HEAD commit of the Autoform
-checkout running the command, or of the marketplace checkout an installed
-plugin was copied from, read with local Git. An inferred pin is used only when
-the checkout is clean and the bounded, link-free template snapshot and scaffold
-renderer match that commit; an installed copy must match the checkout too.
-Apart from those reads, the command runs no subprocesses, Lake, Lean, or network
-operations. Without a ref the local project is complete but the workflows are
-omitted.
+and without flags the workflows pin the HEAD commit of the Autoform checkout
+running the command, or of the marketplace checkout an installed plugin was
+copied from, read with local Git. Source selection prefers Autoform's canonical
+repository, then `origin`, then `upstream`, then a unique remaining safe remote,
+but only when one of its cached tracking refs contains HEAD. An inferred pin is
+used only when tracked files are clean and the bounded, link-free template
+snapshot and scaffold renderer match that commit in paths, bytes, and
+executable-bit classification; an installed copy must match the checkout too.
+Local Git replacement objects are ignored. Apart from those reads, the command
+runs no subprocesses, Lake, Lean, or network operations. Without a ref the local
+project is complete but the workflows are omitted.
 It fails closed where POSIX descriptor traversal, advisory locking, directory
 sync, or atomic no-replace rename is unavailable, including on Windows.
 The parent and each of its ancestors must be readable, because each is opened

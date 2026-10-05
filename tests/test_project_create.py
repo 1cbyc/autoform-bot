@@ -2087,6 +2087,37 @@ def test_symlinked_parent_at_open_is_reported_as_a_link(
     assert not list(real.iterdir())
 
 
+@pytest.mark.skipif(os.name != "posix", reason="project creation requires POSIX path binding")
+def test_retargeted_parent_alias_never_publishes_at_the_old_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir(mode=0o700)
+    second.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(first, target_is_directory=True)
+    target = alias / "Project"
+    validate_package = create_module._validate_package
+
+    def validate_then_retarget(package, parent):
+        validated = validate_package(package, parent)
+        alias.unlink()
+        alias.symlink_to(second, target_is_directory=True)
+        return validated
+
+    monkeypatch.setattr(create_module, "_validate_package", validate_then_retarget)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-path-is-symlink"
+    assert not (first / "Project").exists()
+    assert not (second / "Project").exists()
+    assert not list(first.glob(".autoform-new-*"))
+    assert not list(second.glob(".autoform-new-*"))
+
+
 @pytest.mark.parametrize("component", ["parent", "ancestor"])
 def test_file_swapped_in_before_open_is_not_called_a_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str

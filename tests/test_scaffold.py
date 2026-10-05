@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,7 +51,12 @@ def test_scaffold_ignores_python_cache_artifacts(
     monkeypatch.setattr(scaffold_module, "_TEMPLATES", templates)
 
     project = tmp_path / "project"
-    result = scaffold_project(project, title="Cache-safe")
+    result = scaffold_project(
+        project,
+        title="Cache-safe",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="1" * 40,
+    )
 
     assert ".github/autoform_audit.py" in result.written
     assert not (project / ".github/__pycache__").exists()
@@ -181,7 +187,13 @@ def test_scaffold_uses_the_template_snapshot_validated_for_its_pin(
 
 
 def test_scaffold_writes_the_whole_vault(tmp_path: Path) -> None:
-    result = scaffold_project(tmp_path, title="Finite Flat", repository_url="https://example.test/repo")
+    result = scaffold_project(
+        tmp_path,
+        title="Finite Flat",
+        repository_url="https://example.test/repo",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="1" * 40,
+    )
 
     assert set(result.written) == _EXPECTED
     assert result.skipped == ()
@@ -284,10 +296,14 @@ def test_no_placeholder_survives_anywhere(tmp_path: Path) -> None:
 
 
 def test_rerun_is_idempotent_and_reports_what_it_left(tmp_path: Path) -> None:
-    scaffold_project(tmp_path, title="Finite Flat")
+    options = {
+        "autoform_source": "https://example.test/autoform.git",
+        "autoform_ref": "1" * 40,
+    }
+    scaffold_project(tmp_path, title="Finite Flat", **options)
     (tmp_path / "blueprint/README.md").write_text("# Hand written\n", encoding="utf-8")
 
-    again = scaffold_project(tmp_path, title="Finite Flat")
+    again = scaffold_project(tmp_path, title="Finite Flat", **options)
 
     assert again.written == ()
     assert set(again.skipped) == _EXPECTED
@@ -329,6 +345,30 @@ def test_force_atomically_breaks_hard_links_for_rendered_and_static_files(
     assert linked.read_bytes() == b"authored\n"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="exact POSIX template modes are unavailable")
+def test_scaffold_normalizes_template_modes_independently_of_installer_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = tmp_path / "templates"
+    shutil.copytree(scaffold_module._TEMPLATES, templates)
+    for template in templates.rglob("*"):
+        if template.is_file():
+            template.chmod(0o775 if template.stat().st_mode & stat.S_IXUSR else 0o664)
+    monkeypatch.setattr(scaffold_module, "_TEMPLATES", templates)
+    project = tmp_path / "project"
+
+    result = scaffold_project(
+        project,
+        title="Canonical modes",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="1" * 40,
+    )
+
+    modes = {relative: stat.S_IMODE((project / relative).stat().st_mode) for relative in result.written}
+    assert modes.pop(".github/autoform_audit.py") == 0o755
+    assert set(modes.values()) == {0o644}
+
+
 def test_refuses_an_empty_title(tmp_path: Path) -> None:
     with pytest.raises(ScaffoldError, match="title must not be empty"):
         scaffold_project(tmp_path, title="   ")
@@ -347,7 +387,22 @@ def test_refuses_a_symlinked_target(tmp_path: Path) -> None:
 def test_cli_reports_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     from autoform_cli.__main__ import main
 
-    assert main(["init", str(tmp_path), "--title", "Finite Flat", "--json"]) == 0
+    assert (
+        main(
+            [
+                "init",
+                str(tmp_path),
+                "--title",
+                "Finite Flat",
+                "--autoform-source",
+                "https://example.test/autoform.git",
+                "--autoform-ref",
+                "1" * 40,
+                "--json",
+            ]
+        )
+        == 0
+    )
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["project"] == "Finite Flat"
@@ -459,26 +514,82 @@ def test_gitignore_merge_rejects_oversized_input(tmp_path: Path) -> None:
         scaffold_project(tmp_path, title="Finite Flat")
 
 
-def test_gitignore_merge_rejects_a_concurrent_replacement(
+def test_gitignore_append_never_overwrites_a_concurrent_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     destination = tmp_path / ".gitignore"
     destination.write_text("/.lake\n", encoding="utf-8")
-    original = scaffold_module._merge_gitignore
+    replacement = tmp_path / "replacement"
+    replacement.write_text("changed concurrently\n", encoding="utf-8")
+    original_write = os.write
+    replaced = False
 
-    def replace_after_read(existing: bytes, required: bytes) -> bytes | None:
-        merged = original(existing, required)
-        destination.write_text("changed concurrently\n", encoding="utf-8")
-        return merged
+    def replace_before_append(descriptor: int, content: bytes) -> int:
+        nonlocal replaced
+        if not replaced:
+            os.replace(replacement, destination)
+            replaced = True
+        return original_write(descriptor, content)
 
-    monkeypatch.setattr(scaffold_module, "_merge_gitignore", replace_after_read)
+    monkeypatch.setattr(scaffold_module.os, "write", replace_before_append)
 
-    with pytest.raises(ScaffoldError, match="changed before Autoform could merge"):
-        scaffold_project(tmp_path, title="Finite Flat")
+    with pytest.raises(ScaffoldError, match="may have been partially appended"):
+        scaffold_module._append_gitignore_rules(destination, b"/.lake\nsite/\n")
     assert destination.read_text(encoding="utf-8") == "changed concurrently\n"
 
 
-def test_gitignore_merge_atomically_breaks_hard_links(tmp_path: Path) -> None:
+def test_gitignore_append_reports_an_in_place_concurrent_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / ".gitignore"
+    destination.write_bytes(b"/.lake\n")
+    original_write = os.write
+    edited = False
+
+    def edit_before_append(descriptor: int, content: bytes) -> int:
+        nonlocal edited
+        if not edited:
+            with destination.open("ab") as authored:
+                authored.write(b"author-concurrent\n")
+                authored.flush()
+                os.fsync(authored.fileno())
+            edited = True
+        return original_write(descriptor, content)
+
+    monkeypatch.setattr(scaffold_module.os, "write", edit_before_append)
+
+    with pytest.raises(ScaffoldError, match="may have been partially appended"):
+        scaffold_module._append_gitignore_rules(destination, b"/.lake\nsite/\n")
+    content = destination.read_bytes()
+    assert content.startswith(b"/.lake\nauthor-concurrent\n")
+    assert b"site/\n" in content
+
+
+def test_gitignore_append_reports_a_partial_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / ".gitignore"
+    original = b"/.lake\n"
+    destination.write_bytes(original)
+    original_write = os.write
+    calls = 0
+
+    def fail_after_one_byte(descriptor: int, content: bytes) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_write(descriptor, content[:1])
+        raise OSError("injected append failure")
+
+    monkeypatch.setattr(scaffold_module.os, "write", fail_after_one_byte)
+
+    with pytest.raises(ScaffoldError, match="may have been partially appended"):
+        scaffold_module._append_gitignore_rules(destination, b"/.lake\nsite/\n")
+    assert destination.read_bytes().startswith(original)
+    assert len(destination.read_bytes()) == len(original) + 1
+
+
+def test_gitignore_merge_refuses_hard_links(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     authored = tmp_path / "authored-ignore"
@@ -487,12 +598,13 @@ def test_gitignore_merge_atomically_breaks_hard_links(tmp_path: Path) -> None:
     os.link(authored, destination)
     original_inode = authored.stat().st_ino
 
-    scaffold_project(project, title="Finite Flat")
+    with pytest.raises(ScaffoldError, match="hard-linked .gitignore"):
+        scaffold_module._append_gitignore_rules(destination, b"/.lake\nsite/\n")
 
     assert authored.read_text(encoding="utf-8") == "/.lake\n"
     assert authored.stat().st_ino == original_inode
-    assert destination.stat().st_ino != original_inode
-    assert "site/" in destination.read_text(encoding="utf-8")
+    assert destination.stat().st_ino == original_inode
+    assert destination.read_text(encoding="utf-8") == "/.lake\n"
 
 
 def test_windows_cross_interface_gitignore_identity_ignores_ctime_only(
@@ -511,6 +623,7 @@ def test_windows_cross_interface_gitignore_identity_ignores_ctime_only(
             st_size=metadata.st_size,
             st_mtime_ns=metadata.st_mtime_ns,
             st_ctime_ns=changed_ns,
+            st_nlink=metadata.st_nlink,
             st_file_attributes=0,
         )
 
@@ -522,10 +635,8 @@ def test_windows_cross_interface_gitignore_identity_ignores_ctime_only(
     )
     monkeypatch.setattr(scaffold_module, "_WINDOWS_STAT_VIEWS", True)
 
-    content, identity, _mode = scaffold_module._read_gitignore_snapshot(destination)
-
-    assert content == b"/.lake\n"
-    assert identity[-1] == 20
+    assert not scaffold_module._append_gitignore_rules(destination, b"/.lake\n")
+    assert destination.read_bytes() == b"/.lake\n"
 
 
 def test_scaffolded_blueprint_tracks_authored_structure(tmp_path: Path) -> None:
@@ -560,7 +671,9 @@ def test_scaffolded_theme_defers_navigation_to_the_book(tmp_path: Path) -> None:
     assert "name: material" in mkdocs
 
 
-def test_generated_ci_pins_the_checkout_that_scaffolded_it(tmp_path: Path) -> None:
+def test_generated_ci_pins_the_checkout_that_scaffolded_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A floating ref installs an Autoform that may not have this CLI.
 
     `facebookresearch/autoform-bot@main` predates `autoform_cli` entirely, so
@@ -569,16 +682,24 @@ def test_generated_ci_pins_the_checkout_that_scaffolded_it(tmp_path: Path) -> No
     the scaffolding, which is immutable and known-good by construction.
     """
 
-    from autoform_cli.scaffold import plugin_pin
+    checkout = tmp_path / "checkout"
+    (checkout / "autoform_cli").mkdir(parents=True)
+    shutil.copy2(Path(scaffold_module.__file__), checkout / "autoform_cli" / "scaffold.py")
+    shutil.copytree(scaffold_module._TEMPLATES, checkout / "autoform_cli" / "templates")
+    head = _repository(checkout, "https://example.test/autoform.git")
+    monkeypatch.setattr(scaffold_module, "_here", lambda: checkout)
+    monkeypatch.setattr(scaffold_module, "_TEMPLATES", checkout / "autoform_cli" / "templates")
+    project = tmp_path / "project"
 
-    scaffold_project(tmp_path, title="Finite Flat")
-    source, ref = plugin_pin()
-    verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
+    scaffold_project(project, title="Finite Flat")
+    source, ref = scaffold_module.plugin_pin()
+    verify = (project / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
 
     assert f"AUTOFORM_SOURCE: {json.dumps(source)}" in verify
     assert f"AUTOFORM_REF: {json.dumps(ref)}" in verify
     assert '"git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}"' in verify
     assert re.fullmatch(r"[0-9a-f]{40}", ref), "the pin must be an immutable commit"
+    assert ref == head
     assert "@main" not in verify
 
 
@@ -748,7 +869,7 @@ def test_plugin_pin_is_empty_outside_a_checkout(monkeypatch: pytest.MonkeyPatch)
     assert scaffold_module.plugin_pin() == ("", "")
 
 
-def _repository(path: Path, remote: str) -> str:
+def _repository(path: Path, remote: str, *, advertise: bool = True) -> str:
     """Make *path* a real one-commit checkout and return its HEAD sha."""
     path.mkdir(parents=True, exist_ok=True)
     run = ["git", "-c", "user.email=t@test", "-c", "user.name=Test"]
@@ -759,7 +880,12 @@ def _repository(path: Path, remote: str) -> str:
     done = subprocess.run(
         [*run, "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=True
     )
-    return done.stdout.strip()
+    head = done.stdout.strip()
+    if advertise:
+        subprocess.run(
+            [*run, "update-ref", "refs/remotes/origin/main", head], cwd=path, check=True
+        )
+    return head
 
 
 def _fake_plugin_install(
@@ -814,16 +940,115 @@ def test_an_installed_plugin_pins_from_the_marketplace_checkout(
     )
 
 
+def test_plugin_pin_omits_a_local_commit_no_remote_tracking_ref_contains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    checkout = tmp_path / "checkout"
+    (checkout / "autoform_cli").mkdir(parents=True)
+    shutil.copy2(Path(scaffold_module.__file__), checkout / "autoform_cli" / "scaffold.py")
+    shutil.copytree(scaffold_module._TEMPLATES, checkout / "autoform_cli" / "templates")
+    _repository(checkout, "https://example.test/fork.git", advertise=False)
+    monkeypatch.setattr(scaffold_module, "_here", lambda: checkout)
+    monkeypatch.setattr(scaffold_module, "_TEMPLATES", checkout / "autoform_cli" / "templates")
+
+    assert scaffold_module.plugin_pin() == ("", "")
+
+
+def test_plugin_pin_ignores_git_replacement_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    checkout = tmp_path / "checkout"
+    (checkout / "autoform_cli").mkdir(parents=True)
+    shutil.copy2(Path(scaffold_module.__file__), checkout / "autoform_cli" / "scaffold.py")
+    shutil.copytree(scaffold_module._TEMPLATES, checkout / "autoform_cli" / "templates")
+    original = _repository(checkout, "https://example.test/autoform.git")
+    run = ["git", "-c", "user.email=t@test", "-c", "user.name=Test"]
+    renderer = checkout / "autoform_cli" / "scaffold.py"
+    renderer.write_bytes(renderer.read_bytes() + b"\n# replacement behavior\n")
+    subprocess.run([*run, "add", "autoform_cli/scaffold.py"], cwd=checkout, check=True)
+    subprocess.run([*run, "commit", "-q", "-m", "replacement"], cwd=checkout, check=True)
+    replacement = subprocess.run(
+        [*run, "rev-parse", "HEAD"],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    replacement_bytes = renderer.read_bytes()
+    subprocess.run([*run, "checkout", "-q", "--detach", original], cwd=checkout, check=True)
+    renderer.write_bytes(replacement_bytes)
+    subprocess.run([*run, "add", "autoform_cli/scaffold.py"], cwd=checkout, check=True)
+    subprocess.run([*run, "replace", original, replacement], cwd=checkout, check=True)
+    assert subprocess.run([*run, "diff", "--quiet", "HEAD", "--"], cwd=checkout).returncode == 0
+    assert (
+        subprocess.run([*run, "diff", "--cached", "--quiet", "HEAD", "--"], cwd=checkout).returncode
+        == 0
+    )
+    monkeypatch.setattr(scaffold_module, "_here", lambda: checkout)
+    monkeypatch.setattr(scaffold_module, "_TEMPLATES", checkout / "autoform_cli" / "templates")
+
+    assert scaffold_module.plugin_pin() == ("", "")
+
+
+def test_plugin_pin_prefers_canonical_upstream_over_a_containing_fork_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    checkout = tmp_path / "checkout"
+    (checkout / "autoform_cli").mkdir(parents=True)
+    shutil.copy2(Path(scaffold_module.__file__), checkout / "autoform_cli" / "scaffold.py")
+    shutil.copytree(scaffold_module._TEMPLATES, checkout / "autoform_cli" / "templates")
+    _repository(checkout, "https://example.test/fork.git")
+    run = ["git", "-c", "user.email=t@test", "-c", "user.name=Test"]
+    subprocess.run(
+        [*run, "commit", "-q", "--allow-empty", "-m", "upstream head"],
+        cwd=checkout,
+        check=True,
+    )
+    head = subprocess.run(
+        [*run, "rev-parse", "HEAD"],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(
+        [*run, "update-ref", "refs/remotes/origin/main", head], cwd=checkout, check=True
+    )
+    subprocess.run(
+        [
+            *run,
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/facebookresearch/autoform-bot.git",
+        ],
+        cwd=checkout,
+        check=True,
+    )
+    subprocess.run(
+        [*run, "update-ref", "refs/remotes/upstream/main", head], cwd=checkout, check=True
+    )
+    monkeypatch.setattr(scaffold_module, "_here", lambda: checkout)
+    monkeypatch.setattr(scaffold_module, "_TEMPLATES", checkout / "autoform_cli" / "templates")
+
+    assert scaffold_module.plugin_pin() == (scaffold_module.DEFAULT_AUTOFORM_SOURCE, head)
+
+
 @pytest.mark.parametrize(
     "changed",
     [
         "checkout-scaffold",
         "checkout-template",
-        "checkout-untracked",
         "copy-scaffold",
         "copy-template",
         "copy-extra-template",
-        "copy-mode",
+        "copy-executable-mode",
     ],
 )
 def test_plugin_pin_fails_closed_when_checkout_or_copy_bytes_do_not_match_head(
@@ -833,18 +1058,16 @@ def test_plugin_pin_fails_closed_when_checkout_or_copy_bytes_do_not_match_head(
 
     checkout, copied, _ = _fake_plugin_install(tmp_path, monkeypatch)
     selected = checkout if changed.startswith("checkout-") else copied
-    if changed == "copy-mode":
+    if changed == "copy-executable-mode":
         if os.name != "posix":
             pytest.skip("exact POSIX template modes are unavailable")
-        (selected / "autoform_cli" / "templates" / "README.md").chmod(0o600)
+        (selected / "autoform_cli" / "templates" / "README.md").chmod(0o755)
     if changed.endswith("scaffold"):
         path = selected / "autoform_cli" / "scaffold.py"
         path.write_bytes(path.read_bytes() + b"\n# changed\n")
     elif changed in {"checkout-template", "copy-template"}:
         path = selected / "autoform_cli" / "templates" / "README.md"
         path.write_bytes(path.read_bytes() + b"\nchanged\n")
-    elif changed == "checkout-untracked":
-        (selected / "untracked").write_text("different tree\n", encoding="utf-8")
     elif changed == "copy-extra-template":
         (selected / "autoform_cli" / "templates" / "extra").write_text(
             "different template surface\n", encoding="utf-8"
@@ -854,9 +1077,9 @@ def test_plugin_pin_fails_closed_when_checkout_or_copy_bytes_do_not_match_head(
 
 
 @pytest.mark.parametrize(
-    "change", ["tracked", "untracked", "ignored-template", "template-mode"]
+    "change", ["tracked", "ignored-template", "template-executable-mode"]
 )
-def test_direct_checkout_pin_requires_a_clean_worktree(
+def test_direct_checkout_pin_requires_a_matching_tracked_surface(
     change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from autoform_cli import scaffold as scaffold_module
@@ -873,8 +1096,6 @@ def test_direct_checkout_pin_requires_a_clean_worktree(
     if change == "tracked":
         path = checkout / "autoform_cli" / "scaffold.py"
         path.write_bytes(path.read_bytes() + b"\n# dirty\n")
-    elif change == "untracked":
-        (checkout / "untracked").write_text("dirty\n", encoding="utf-8")
     elif change == "ignored-template":
         exclude = checkout / ".git" / "info" / "exclude"
         with exclude.open("a", encoding="utf-8") as output:
@@ -886,10 +1107,46 @@ def test_direct_checkout_pin_requires_a_clean_worktree(
     else:
         if os.name != "posix":
             pytest.skip("exact POSIX template modes are unavailable")
-        (checkout / "autoform_cli" / "templates" / "README.md").chmod(0o600)
-        assert scaffold_module._git_checkout_clean(checkout)
+        (checkout / "autoform_cli" / "templates" / "README.md").chmod(0o755)
 
     assert scaffold_module.plugin_pin() == ("", "")
+
+
+def test_direct_checkout_pin_ignores_unrelated_untracked_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    checkout = tmp_path / "checkout"
+    (checkout / "autoform_cli").mkdir(parents=True)
+    shutil.copy2(Path(scaffold_module.__file__), checkout / "autoform_cli" / "scaffold.py")
+    shutil.copytree(scaffold_module._TEMPLATES, checkout / "autoform_cli" / "templates")
+    head = _repository(checkout, "https://example.test/autoform.git")
+    (checkout / "large-unrelated-output").write_bytes(b"x" * (1024 * 1024))
+    monkeypatch.setattr(scaffold_module, "_here", lambda: checkout)
+    monkeypatch.setattr(scaffold_module, "_TEMPLATES", checkout / "autoform_cli" / "templates")
+
+    assert scaffold_module.plugin_pin() == ("https://example.test/autoform.git", head)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exact POSIX template modes are unavailable")
+def test_plugin_pin_accepts_umask_permission_noise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoform_cli import scaffold as scaffold_module
+
+    checkout, copied, head = _fake_plugin_install(tmp_path, monkeypatch)
+    for root in (checkout, copied):
+        (root / "autoform_cli" / "scaffold.py").chmod(0o664)
+        for template in (root / "autoform_cli" / "templates").rglob("*"):
+            if template.is_file():
+                template.chmod(0o775 if template.stat().st_mode & stat.S_IXUSR else 0o664)
+
+    assert scaffold_module._git_checkout_clean(checkout)
+    assert scaffold_module.plugin_pin() == (
+        "https://github.com/owner/autoform-bot.git",
+        head,
+    )
 
 
 def test_an_unrelated_marketplace_checkout_is_not_trusted(

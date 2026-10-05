@@ -236,7 +236,7 @@ def create_project(
         os.fsync(stage_descriptor)
         _verify_project_plan(stage_descriptor, plan, root_mode=0o755)
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
-        # Re-resolve the canonical requested parent with O_NOFOLLOW at the last
+        # Reopen the original requested parent path with O_NOFOLLOW at the last
         # possible moment. Publication uses this fresh descriptor only after
         # its device, inode, and owner match the directory we locked and staged
         # in. A mismatch leaves the complete stage untouched.
@@ -669,7 +669,41 @@ def _validate_target(target: str | Path | None) -> Path:
         canonical_parent = parent.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         raise ProjectCreateError("project-parent-invalid", "The target parent is not a directory.") from None
-    return canonical_parent / raw.name
+    if canonical_parent != parent and _only_trusted_system_links(parent):
+        return canonical_parent / raw.name
+    # Keep the caller's normalized path. `_open_parent` traverses this exact
+    # spelling with O_NOFOLLOW, so a symlink alias cannot be resolved here and
+    # later retargeted while publication continues in the old directory.
+    return raw
+
+
+def _only_trusted_system_links(path: Path) -> bool:
+    """Whether every symlink component is protected by a root-owned directory.
+
+    macOS exposes conventional paths such as ``/tmp`` through root-owned links.
+    Those aliases are not retargetable by an ordinary caller and remain useful;
+    any link in a group- or world-writable or non-root-owned directory stays in
+    the requested spelling so `_open_parent` rejects it with ``O_NOFOLLOW``.
+    """
+
+    current = Path(path.anchor)
+    try:
+        for part in path.parts[1:]:
+            parent = current
+            current /= part
+            metadata = os.stat(current, follow_symlinks=False)
+            if not stat.S_ISLNK(metadata.st_mode):
+                continue
+            parent_metadata = os.stat(parent, follow_symlinks=False)
+            if (
+                metadata.st_uid != 0
+                or parent_metadata.st_uid != 0
+                or parent_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                return False
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _parent_access_error(error: OSError) -> ProjectCreateError:
@@ -916,12 +950,9 @@ def _build_project_plan(
         autoform_source=autoform_source or DEFAULT_AUTOFORM_SOURCE,
         autoform_ref=autoform_ref,
     )
-    # Template modes follow the installer's umask, such as 0o664 under umask
-    # 002; publish only whether each file is executable.
-    files.extend(
-        _ScaffoldFile(item.relative, item.content, 0o755 if item.mode & 0o100 else 0o644)
-        for item in scaffold_files
-    )
+    # The shared plan has already reduced installer modes to Git's executable
+    # bit, so `init` and `project new` publish the same canonical modes.
+    files.extend(scaffold_files)
     return tuple(sorted(files, key=lambda item: item.relative)), bool(autoform_ref)
 
 

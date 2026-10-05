@@ -86,20 +86,25 @@ prefix only for the Autoform vault/site repair overlay.
 override, both workflows, and ignore rules. Do not hand-build any of it and do
 not copy the bundled example: the layout is fixed, and a chapter written as a
 sibling file instead of `<chapter>/README.md` still validates while publishing
-a book with no chapters. `init` preserves existing files, atomically adding
-only missing Autoform rules to a bounded regular root `.gitignore`, so it is
-also the repair path; it reports what it left alone. See the
+a book with no chapters. `init` preserves existing files, appending only missing
+Autoform rules through a retained bounded regular root `.gitignore` file, so it
+is also the repair path; it reports what it left alone. See the
 [CLI reference](../../autoform_cli/README.md#commands) for its flags.
 
-`init` pins the generated workflows to the Autoform commit that ran it: the
-origin and HEAD commit of the Autoform checkout it runs from, or of the
+`init` pins the generated workflows to the Autoform commit that ran it, using a
+safe remote only when a cached remote-tracking ref contains that commit. It
+prefers Autoform's canonical repository, then `origin`, then `upstream`, then a
+unique remaining source from the Autoform checkout it runs from or the
 marketplace checkout an installed plugin was copied from. It infers that pin
-only when the checkout is clean and the retained bounded, regular, link-free
-required template snapshot and scaffold renderer match the pinned commit; an
-installed copy must also match its marketplace checkout. On any mismatch or
-when neither checkout can be read, `init` writes no CI rather than guess a ref:
+only when tracked files are clean and the retained bounded, regular, link-free
+required template snapshot and scaffold renderer match the pinned commit in
+path, bytes, and executable-bit classification; an installed copy must also
+match its marketplace checkout. All identity and tree reads ignore local Git
+replacement objects. On any mismatch or when no remote has that local
+containment evidence, `init` writes no CI rather than guess a source or ref:
 guessing produced projects whose first push failed with nothing in the workflow
-to explain why. When it reports that, find the commit the plugin was installed from and pass
+to explain why. When it reports that, find the commit the plugin was installed
+from and pass
 `--autoform-ref <40-char-sha>`, or say plainly that CI was not configured.
 Never invent a ref. It must be a full 40-character commit sha: `init` refuses a
 branch, a tag, or an abbreviated sha, because CI would silently reinstall a

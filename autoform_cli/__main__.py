@@ -54,7 +54,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     init.add_argument(
         "--autoform-source",
         default="",
-        help="Autoform Git source the generated workflows install from (default: this checkout's origin)",
+        help=(
+            "Autoform Git source the generated workflows install from "
+            "(default: a safe remote locally known to contain this checkout's HEAD)"
+        ),
     )
     init.add_argument(
         "--autoform-ref",
@@ -135,8 +138,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--autoform-source",
         default="",
         help=(
-            "Autoform Git source the generated workflows install from (default: the origin of "
-            "this checkout, or of the marketplace checkout an installed copy came from)"
+            "Autoform Git source the generated workflows install from (default: a safe remote "
+            "locally known to contain the HEAD of this checkout, or of the marketplace checkout "
+            "an installed copy came from)"
         ),
     )
     project_new.add_argument(

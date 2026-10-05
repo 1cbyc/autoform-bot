@@ -29,6 +29,7 @@ _MAX_TEMPLATE_FILE_BYTES = 1024 * 1024
 _MAX_TEMPLATE_TOTAL_BYTES = 8 * 1024 * 1024
 _MAX_SCAFFOLD_SOURCE_BYTES = 1024 * 1024
 _MAX_GIT_TREE_LIST_BYTES = 256 * 1024
+_MAX_GIT_REMOTE_LIST_BYTES = 64 * 1024
 _WINDOWS_STAT_VIEWS = os.name == "nt"
 
 #: Template paths whose leading dot is dropped on disk so packaging tools and
@@ -41,6 +42,7 @@ _DOTTED = {
 
 DEFAULT_AUTOFORM_SOURCE = "https://github.com/facebookresearch/autoform-bot.git"
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
+_REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _SOURCE_HOST = re.compile(
     r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -84,7 +86,7 @@ def _git(*args: str, root: Path | None = None) -> str | None:
 
     try:
         done = subprocess.run(
-            ["git", "-C", str(root or _here()), *args],
+            ["git", "--no-replace-objects", "-C", str(root or _here()), *args],
             capture_output=True,
             text=True,
             timeout=10,
@@ -198,30 +200,55 @@ def _normalize_autoform_source(source: str, *, allow_github_scp: bool = False) -
 
 
 def _git_checkout_clean(root: Path) -> bool:
-    """Whether *root* has no tracked, staged, or untracked changes."""
+    """Whether *root* has no tracked or staged changes from ``HEAD``."""
 
+    commands = (
+        [
+            "git",
+            "--no-optional-locks",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(root),
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+        [
+            "git",
+            "--no-optional-locks",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(root),
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ],
+    )
     try:
-        done = subprocess.run(
-            [
-                "git",
-                "--no-optional-locks",
-                "-c",
-                "core.fsmonitor=false",
-                "-C",
-                str(root),
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-                "--ignore-submodules=none",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
+        return all(
+            subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            ).returncode
+            == 0
+            for command in commands
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return done.returncode == 0 and not done.stdout
 
 
 def _git_bytes(root: Path, *args: str, limit: int) -> bytes | None:
@@ -229,7 +256,7 @@ def _git_bytes(root: Path, *args: str, limit: int) -> bytes | None:
 
     try:
         done = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(root), *args],
+            ["git", "--no-optional-locks", "--no-replace-objects", "-C", str(root), *args],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=10,
@@ -240,6 +267,68 @@ def _git_bytes(root: Path, *args: str, limit: int) -> bytes | None:
     if done.returncode != 0 or len(done.stdout) > limit:
         return None
     return done.stdout
+
+
+def _safe_remote_source(root: Path, remote: str) -> str | None:
+    source = _git("remote", "get-url", remote, root=root)
+    if not source:
+        return None
+    if not source.endswith(".git"):
+        source = f"{source}.git"
+    return _normalize_autoform_source(source, allow_github_scp=True)
+
+
+def _remote_contains_ref(root: Path, remote: str, ref: str) -> bool:
+    """Whether a cached tracking ref for *remote* contains *ref*."""
+
+    prefix = f"refs/remotes/{remote}/"
+    contained = _git_bytes(
+        root,
+        "for-each-ref",
+        f"--contains={ref}",
+        "--count=1",
+        "--format=%(refname)",
+        prefix,
+        limit=_MAX_GIT_REMOTE_LIST_BYTES,
+    )
+    if contained is None:
+        return False
+    try:
+        refs = contained.decode("utf-8").splitlines()
+    except UnicodeError:
+        return False
+    return bool(refs) and all(name.startswith(prefix) and name != prefix for name in refs)
+
+
+def _select_remote_source(root: Path, ref: str) -> str | None:
+    """Choose a safe remote whose cached tracking refs contain *ref*.
+
+    Prefer Autoform's canonical source, then conventional ``origin`` and
+    ``upstream`` names. Without those, accept only one distinct safe source so
+    automatic pinning never guesses between unrelated remotes.
+    """
+
+    encoded = _git_bytes(root, "remote", limit=_MAX_GIT_REMOTE_LIST_BYTES)
+    if encoded is None:
+        return None
+    try:
+        names = encoded.decode("utf-8").splitlines()
+    except UnicodeError:
+        return None
+    candidates: dict[str, str] = {}
+    for name in names:
+        if _REMOTE_NAME.fullmatch(name) is None or not _remote_contains_ref(root, name, ref):
+            continue
+        source = _safe_remote_source(root, name)
+        if source is not None:
+            candidates[name] = source
+    if DEFAULT_AUTOFORM_SOURCE in candidates.values():
+        return DEFAULT_AUTOFORM_SOURCE
+    for preferred in ("origin", "upstream"):
+        if preferred in candidates:
+            return candidates[preferred]
+    sources = set(candidates.values())
+    return sources.pop() if len(sources) == 1 else None
 
 
 def _committed_scaffold_entries(
@@ -312,6 +401,21 @@ def _git_blob_id(content: bytes, length: int) -> str | None:
     return digest.hexdigest()
 
 
+def _canonical_template_mode(mode: int) -> int:
+    """Canonical generated mode for Git's one-bit executable distinction."""
+
+    return 0o755 if mode & 0o111 else 0o644
+
+
+def _template_surface(
+    templates: tuple[tuple[str, bytes, int], ...],
+) -> tuple[tuple[str, bytes, int], ...]:
+    return tuple(
+        (relative, content, _canonical_template_mode(mode))
+        for relative, content, mode in templates
+    )
+
+
 def _matches_committed_scaffold(
     committed: dict[str, tuple[str, str]],
     templates: tuple[tuple[str, bytes, int], ...],
@@ -335,7 +439,7 @@ def _matches_committed_scaffold(
         git_mode = (
             committed.get(path, ("", ""))[0]
             if _WINDOWS_STAT_VIEWS
-            else {0o644: "100644", 0o755: "100755"}.get(mode)
+            else {0o644: "100644", 0o755: "100755"}.get(_canonical_template_mode(mode))
         )
         object_name = _git_blob_id(content, object_length)
         if git_mode is None or object_name is None or path in actual:
@@ -356,10 +460,12 @@ def plugin_pin(
     the root of a checkout: a directory that merely sits inside somebody else's
     repository answers questions about that repository.
 
-    The checkout must be clean, and its committed renderer, template paths,
-    bytes, and output-affecting modes must match both the retained generation
-    snapshot and any installed plugin copy. Otherwise the commit does not
-    describe the bytes doing the scaffolding, so no pin is returned.
+    Tracked checkout files must be clean, a cached tracking ref for the selected
+    remote must contain HEAD, and the committed renderer plus template paths,
+    bytes, and executable-bit classifications must match both the retained
+    generation snapshot and any installed plugin copy. Otherwise the source and
+    commit do not describe fetchable scaffold behavior, so no pin is returned.
+    Every Git identity and tree query ignores local replacement objects.
 
     Returns empty strings when neither is available. An earlier version fell
     back to `facebookresearch/autoform-bot@main` instead. That commit predates
@@ -378,9 +484,11 @@ def plugin_pin(
     root = _checkout_root(running_root) or _marketplace_checkout()
     if root is None:
         return "", ""
-    source = _git("remote", "get-url", "origin", root=root)
     ref = _git("rev-parse", "HEAD", root=root)
-    if not source or not ref or not _FULL_SHA.fullmatch(ref) or not _git_checkout_clean(root):
+    if ref is None or not _FULL_SHA.fullmatch(ref) or not _git_checkout_clean(root):
+        return "", ""
+    source = _select_remote_source(root, ref)
+    if source is None:
         return "", ""
     try:
         checkout_templates = _read_templates(root / "autoform_cli" / "templates")
@@ -398,8 +506,9 @@ def plugin_pin(
     except ScaffoldError:
         return "", ""
     if (
-        retained_templates != checkout_templates
-        or (running_scaffold, running_mode) != (checkout_scaffold, checkout_mode)
+        _template_surface(retained_templates) != _template_surface(checkout_templates)
+        or (running_scaffold, _canonical_template_mode(running_mode))
+        != (checkout_scaffold, _canonical_template_mode(checkout_mode))
         or not _matches_committed_scaffold(
             committed,
             checkout_templates,
@@ -407,16 +516,11 @@ def plugin_pin(
             checkout_mode,
         )
         or _git("rev-parse", "HEAD", root=root) != ref
-        or _git("remote", "get-url", "origin", root=root) != source
+        or _select_remote_source(root, ref) != source
         or not _git_checkout_clean(root)
     ):
         return "", ""
-    if not source or not source.endswith(".git"):
-        source = f"{source}.git" if source else ""
-    safe_source = _normalize_autoform_source(source, allow_github_scp=True)
-    if safe_source is None:
-        return "", ""
-    return safe_source, ref
+    return source, ref
 
 
 class ScaffoldError(ValueError):
@@ -728,7 +832,7 @@ def _scaffold_plan(
             _ScaffoldFile(
                 relative=destination,
                 content=content,
-                mode=template_mode,
+                mode=_canonical_template_mode(template_mode),
             )
         )
     return tuple(files), tuple(skipped)
@@ -753,68 +857,56 @@ def _cross_interface_identity(
     return identity[:-1] if _WINDOWS_STAT_VIEWS else identity
 
 
-def _read_gitignore_snapshot(
+def _read_gitignore_descriptor(
+    descriptor: int,
     path: Path,
-) -> tuple[bytes, tuple[int, int, int, int, int, int], int]:
-    """Read one bounded regular file without following a replacement link."""
+) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+    """Read a stable bounded snapshot from one retained regular file."""
 
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_BINARY", 0)
-    )
-    descriptor = -1
-    try:
-        descriptor = os.open(path, flags)
-        opened = os.fstat(descriptor)
-        attributes = getattr(opened, "st_file_attributes", 0)
-        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-        if not stat.S_ISREG(opened.st_mode) or attributes & reparse:
-            raise ScaffoldError([f"refusing to merge non-regular .gitignore: {path}"])
-        if opened.st_size > _MAX_GITIGNORE_BYTES:
+    opened = os.fstat(descriptor)
+    attributes = getattr(opened, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if not stat.S_ISREG(opened.st_mode) or attributes & reparse:
+        raise ScaffoldError([f"refusing to merge non-regular .gitignore: {path}"])
+    if opened.st_nlink != 1:
+        raise ScaffoldError([f"refusing to merge hard-linked .gitignore: {path}"])
+    if opened.st_size > _MAX_GITIGNORE_BYTES:
+        raise ScaffoldError(
+            [f"refusing to merge .gitignore larger than {_MAX_GITIGNORE_BYTES} bytes"]
+        )
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = os.read(descriptor, min(64 * 1024, _MAX_GITIGNORE_BYTES - total + 1))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > _MAX_GITIGNORE_BYTES:
             raise ScaffoldError(
                 [f"refusing to merge .gitignore larger than {_MAX_GITIGNORE_BYTES} bytes"]
             )
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(descriptor, min(64 * 1024, _MAX_GITIGNORE_BYTES - total + 1))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > _MAX_GITIGNORE_BYTES:
-                raise ScaffoldError(
-                    [f"refusing to merge .gitignore larger than {_MAX_GITIGNORE_BYTES} bytes"]
-                )
-        after = os.fstat(descriptor)
-        named = os.stat(path, follow_symlinks=False)
-        opened_identity = _file_identity(opened)
-        after_identity = _file_identity(after)
-        named_identity = _file_identity(named)
-        if (
-            after_identity != opened_identity
-            or _cross_interface_identity(named_identity)
-            != _cross_interface_identity(opened_identity)
-        ):
-            raise ScaffoldError([f".gitignore changed while it was being inspected: {path}"])
-        return b"".join(chunks), named_identity, stat.S_IMODE(opened.st_mode)
-    except ScaffoldError:
-        raise
-    except OSError as error:
-        raise ScaffoldError([f"cannot safely inspect existing .gitignore: {path}"]) from error
-    finally:
-        if descriptor >= 0:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+    after = os.fstat(descriptor)
+    named = os.stat(path, follow_symlinks=False)
+    opened_identity = _file_identity(opened)
+    after_identity = _file_identity(after)
+    named_identity = _file_identity(named)
+    named_attributes = getattr(named, "st_file_attributes", 0)
+    if (
+        after.st_nlink != 1
+        or named.st_nlink != 1
+        or named_attributes & reparse
+        or after_identity != opened_identity
+        or _cross_interface_identity(named_identity)
+        != _cross_interface_identity(opened_identity)
+    ):
+        raise ScaffoldError([f".gitignore changed while it was being inspected: {path}"])
+    return b"".join(chunks), named_identity
 
 
-def _merge_gitignore(existing: bytes, required: bytes) -> bytes | None:
-    """Append missing generated ignore rules while preserving authored bytes."""
+def _gitignore_suffix(existing: bytes, required: bytes) -> bytes | None:
+    """The missing suffix to append while preserving every authored byte."""
 
     existing_lines = {line.removesuffix(b"\r") for line in existing.splitlines()}
     missing = [
@@ -825,7 +917,97 @@ def _merge_gitignore(existing: bytes, required: bytes) -> bytes | None:
     if not missing:
         return None
     separator = b"" if not existing or existing.endswith((b"\n", b"\r")) else b"\n"
-    return existing + separator + b"\n".join(missing) + b"\n"
+    return separator + b"\n".join(missing) + b"\n"
+
+
+def _gitignore_identity_matches(
+    descriptor: int,
+    path: Path,
+    expected: tuple[int, int, int, int, int, int],
+) -> bool:
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return (
+        stat.S_ISREG(opened.st_mode)
+        and stat.S_ISREG(named.st_mode)
+        and not getattr(opened, "st_file_attributes", 0) & reparse
+        and not getattr(named, "st_file_attributes", 0) & reparse
+        and opened.st_nlink == 1
+        and named.st_nlink == 1
+        and _cross_interface_identity(_file_identity(opened))
+        == _cross_interface_identity(expected)
+        == _cross_interface_identity(_file_identity(named))
+    )
+
+
+def _append_gitignore_rules(path: Path, required: bytes) -> bool:
+    """Append missing rules through one retained descriptor without replacement."""
+
+    flags = (
+        os.O_RDWR
+        | os.O_APPEND
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    descriptor = -1
+    write_started = False
+    try:
+        descriptor = os.open(path, flags)
+        existing, identity = _read_gitignore_descriptor(descriptor, path)
+        suffix = _gitignore_suffix(existing, required)
+        if suffix is None:
+            os.close(descriptor)
+            descriptor = -1
+            return False
+        if len(existing) + len(suffix) > _MAX_GITIGNORE_BYTES:
+            raise ScaffoldError(
+                [f"refusing to merge .gitignore larger than {_MAX_GITIGNORE_BYTES} bytes"]
+            )
+        if not _gitignore_identity_matches(descriptor, path, identity):
+            raise ScaffoldError([f".gitignore changed before Autoform could append to it: {path}"])
+        expected = existing + suffix
+        offset = 0
+        write_started = True
+        while offset < len(suffix):
+            written = os.write(descriptor, suffix[offset:])
+            if written <= 0:
+                raise OSError("short .gitignore append")
+            offset += written
+        os.fsync(descriptor)
+        final, _identity = _read_gitignore_descriptor(descriptor, path)
+        if final != expected:
+            raise OSError(".gitignore changed during append")
+        os.close(descriptor)
+        descriptor = -1
+        return True
+    except ScaffoldError:
+        if write_started:
+            raise ScaffoldError(
+                [
+                    ".gitignore rules may have been partially appended; "
+                    f"inspect the file before retrying: {path}"
+                ]
+            ) from None
+        raise
+    except (OSError, TypeError, ValueError):
+        message = (
+            ".gitignore rules may have been partially appended; inspect the file before retrying"
+            if write_started
+            else "cannot safely inspect or append to existing .gitignore"
+        )
+        raise ScaffoldError([f"{message}: {path}"]) from None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _atomic_write(
@@ -833,7 +1015,6 @@ def _atomic_write(
     content: bytes,
     *,
     mode: int,
-    expected_identity: tuple[int, int, int, int, int, int] | None = None,
 ) -> None:
     """Replace *destination* from a same-directory temporary file.
 
@@ -851,17 +1032,6 @@ def _atomic_write(
             output.flush()
             os.fsync(output.fileno())
         temporary.chmod(mode)
-        if expected_identity is not None:
-            try:
-                current = os.stat(destination, follow_symlinks=False)
-            except OSError as error:
-                raise ScaffoldError(
-                    [f".gitignore changed before Autoform could merge it: {destination}"]
-                ) from error
-            if _file_identity(current) != expected_identity:
-                raise ScaffoldError(
-                    [f".gitignore changed before Autoform could merge it: {destination}"]
-                )
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -893,9 +1063,10 @@ def scaffold_project(
 ) -> ScaffoldResult:
     """Write the blueprint vault, site config, and CI into *target*.
 
-    Existing files are never overwritten unless *force* is set, except that a
-    regular root ``.gitignore`` is atomically extended with missing Autoform
-    rules. Skipped paths report everything else the repair left in place.
+    Existing files are never overwritten unless *force* is set, except that
+    missing Autoform rules are appended through a retained regular root
+    ``.gitignore`` descriptor. Skipped paths report everything else the repair
+    left in place.
     """
 
     requested = Path(target).expanduser()
@@ -978,15 +1149,7 @@ def scaffold_project(
                 )
         if destination.exists() and not force:
             if planned_file.relative == ".gitignore":
-                existing, identity, mode = _read_gitignore_snapshot(destination)
-                merged = _merge_gitignore(existing, planned_file.content)
-                if merged is not None:
-                    _atomic_write(
-                        destination,
-                        merged,
-                        mode=mode,
-                        expected_identity=identity,
-                    )
+                if _append_gitignore_rules(destination, planned_file.content):
                     written.append(planned_file.relative)
                     continue
             skipped.append(planned_file.relative)
