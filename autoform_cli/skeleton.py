@@ -898,15 +898,13 @@ def _remember_tagged_processes(
 ) -> None:
     """Find descendants that escaped the original parent and process group."""
 
-    last_system_error: SystemError | None = None
+    last_scan_error: BaseException | None = None
     for _attempt in range(2):
-        saw_system_error = False
+        retry = False
         try:
             candidates = tuple(psutil.process_iter())
-        except (psutil.Error, OSError):
-            candidates = ()
-        except SystemError as error:
-            last_system_error = error
+        except (psutil.Error, OSError, SystemError) as error:
+            last_scan_error = error
             continue
         for candidate in candidates:
             if candidate.pid in {os.getpid(), root_pid}:
@@ -917,21 +915,27 @@ def _remember_tagged_processes(
             except (psutil.Error, OSError):
                 continue
             except SystemError as error:
-                last_system_error = error
-                saw_system_error = True
-        if not saw_system_error:
+                last_scan_error = error
+                retry = True
+        if not retry:
             return
-    if strict and last_system_error is not None:
+    if strict and last_scan_error is not None:
         raise SkeletonError(
-            ["cannot safely inspect descendant processes after a transient system error"]
-        ) from last_system_error
+            ["cannot safely inspect descendant processes after repeated process-table errors"]
+        ) from last_scan_error
 
 
 def _process_is_alive(process: psutil.Process) -> bool:
     try:
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
-    except (psutil.Error, OSError, SystemError):
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return False
+    except (psutil.Error, OSError, SystemError):
+        # Uncertainty is live for the success gate and cleanup target list.  A
+        # disappeared/reused PID is handled by psutil's identity checks when
+        # termination is attempted; treating inspection failure as dead could
+        # let an escaped descendant survive a successful command.
+        return True
 
 
 def _process_group_is_alive(pid: int) -> bool:
