@@ -13,16 +13,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import skeleton
-from .lean import SourceIndex, index_project
+from ._tree_snapshot import TreeSnapshotError
+from .lean import IndexedSourceSnapshot, bind_project_source_snapshot
 from .runtime import load_runtime_graph
-from .skeleton import LeanLibrary, SkeletonError, _lean_name, _lean_name_parts, lean_libraries, path_of
+from .skeleton import LeanLibrary, SkeletonError, _lean_name, _lean_name_parts, lean_libraries
 from .work import work_context
 
 IMPACT_SCHEMA = "autoform-impact/v1"
@@ -188,83 +188,88 @@ def _name_key(name: str) -> tuple[object, ...]:
 
 #: Module name components the probe can import without quoting.
 _MODULE_COMPONENT = re.compile(r"[A-Za-z_][A-Za-z0-9_'!?]*")
-_IGNORED_SOURCE_DIRECTORIES = frozenset(
-    {".git", ".lake", ".claude", ".venv", "__pycache__", "node_modules", "site", "site-src"}
-)
 _MAX_PROJECT_MODULES = 10_000
 _MAX_SOURCE_DEPTH = 64
 
 
-def project_modules(libraries: Sequence[LeanLibrary]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def project_modules(
+    libraries: Sequence[LeanLibrary],
+    snapshot: IndexedSourceSnapshot,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Return the probe imports and exact repository-owned module names.
 
     A library's ``globs`` select its modules as Lake's ``Glob`` does: ``M`` is
     one module, ``M.*`` the module and its submodules, ``M.+`` its strict
-    submodules, found by walking the source tree like ``forEachModuleInDir``. A
-    library without globs builds its roots. Locality is an exact allowlist of
-    ``.lean`` files beneath the project libraries' source directories, not a
-    namespace prefix.
+    submodules. A library without globs builds its roots. Both selection and
+    locality come from the snapshot's exact source-file generation rather than
+    a second walk of the live tree.
     """
 
     modules: set[str] = set()
     local_modules: set[str] = set()
     for library in libraries:
-        local_modules.update(_source_modules(library))
+        sources = _source_modules(library, snapshot)
+        local_modules.update(sources)
         for glob in library.globs or library.roots:
             base, mode = _glob(glob, library)
-            directory = library.src_dir.joinpath(*base.split("."))
             if mode != "+":
-                if not directory.with_suffix(".lean").is_file():
+                if base not in sources:
                     raise SkeletonError([f"lean_lib {library.name}: module {base} has no source file"])
                 modules.add(base)
             if mode:
-                if not directory.is_dir():
-                    raise SkeletonError(
-                        [f"lean_lib {library.name}: glob {glob} names no source directory {base.replace('.', '/')}"]
-                    )
-                modules.update(f"{base}.{module}" for module in _submodules(directory, library))
+                descendants = sorted(module for module in sources if module.startswith(f"{base}."))
+                for module in descendants:
+                    if not all(_MODULE_COMPONENT.fullmatch(part) for part in module.split(".")):
+                        raise SkeletonError(
+                            [
+                                f"lean_lib {library.name}: cannot import {sources[module].as_posix()}; "
+                                "the impact probe supports plain module names only"
+                            ]
+                        )
+                modules.update(descendants)
     if not modules:
         raise SkeletonError(["the Lake configuration selects no modules"])
     return tuple(sorted(modules)), tuple(sorted(local_modules))
 
 
-def _source_modules(library: LeanLibrary) -> set[str]:
-    """Bounded, link-free module inventory beneath one project ``srcDir``."""
+def _source_modules(library: LeanLibrary, snapshot: IndexedSourceSnapshot) -> dict[str, Path]:
+    """Map source modules to captured repository-relative paths for one library."""
 
-    source = library.src_dir
-    if not source.is_dir() or source.is_symlink():
-        raise SkeletonError([f"lean_lib {library.name}: source directory is missing or symbolic: {source}"])
-    found: set[str] = set()
-    for directory, names, files in os.walk(source, followlinks=False):
-        current = Path(directory)
-        relative_directory = current.relative_to(source)
-        if len(relative_directory.parts) > _MAX_SOURCE_DEPTH:
+    try:
+        prefix = library.src_dir.relative_to(snapshot.index.root)
+    except ValueError as exc:
+        raise SkeletonError([f"lean_lib {library.name}: srcDir is outside the captured Lean root"]) from exc
+    found: dict[str, Path] = {}
+    for path, _data in snapshot.source_files:
+        try:
+            relative = path.relative_to(prefix) if prefix.parts else path
+        except ValueError:
+            continue
+        if len(relative.parts) - 1 > _MAX_SOURCE_DEPTH:
             raise SkeletonError(
                 [f"lean_lib {library.name}: source tree exceeds {_MAX_SOURCE_DEPTH} directory levels"]
             )
-        kept: list[str] = []
-        for name in sorted(names):
-            child = current / name
-            if name in _IGNORED_SOURCE_DIRECTORIES:
-                continue
-            if child.is_symlink() or os.path.lexists(child / ".git"):
-                continue
-            kept.append(name)
-        names[:] = kept
-        for name in sorted(files):
-            path = current / name
-            if path.suffix != ".lean" or path.is_symlink():
-                continue
-            relative = path.relative_to(source).with_suffix("")
-            module = ".".join(relative.parts)
-            if not module:
-                continue
-            found.add(module)
-            if len(found) > _MAX_PROJECT_MODULES:
-                raise SkeletonError(
-                    [f"lean_lib {library.name}: source tree exceeds {_MAX_PROJECT_MODULES} Lean modules"]
-                )
+        module = ".".join(relative.with_suffix("").parts)
+        if not module:
+            continue
+        found.setdefault(module, path)
+        if len(found) > _MAX_PROJECT_MODULES:
+            raise SkeletonError(
+                [f"lean_lib {library.name}: source tree exceeds {_MAX_PROJECT_MODULES} Lean modules"]
+            )
     return found
+
+
+def _module_source_paths(
+    libraries: Sequence[LeanLibrary], snapshot: IndexedSourceSnapshot
+) -> dict[str, str]:
+    """Map every captured project module to its repository-relative source path."""
+
+    paths: dict[str, str] = {}
+    for library in libraries:
+        for module, path in _source_modules(library, snapshot).items():
+            paths.setdefault(module, path.as_posix())
+    return paths
 
 
 def _glob(glob: str, library: LeanLibrary) -> tuple[str, str]:
@@ -279,36 +284,6 @@ def _glob(glob: str, library: LeanLibrary) -> tuple[str, str]:
             ]
         )
     return base, mode
-
-
-def _submodules(directory: Path, library: LeanLibrary) -> list[str]:
-    """Every ``.lean`` file below ``directory`` as a relative module name."""
-
-    found: list[str] = []
-    visited: set[Path] = set()
-
-    def walk(path: Path, prefix: tuple[str, ...]) -> None:
-        resolved = path.resolve()
-        if resolved in visited:
-            return
-        visited.add(resolved)
-        with os.scandir(path) as entries:
-            for entry in sorted(entries, key=lambda item: item.name):
-                if entry.is_dir():
-                    walk(Path(entry.path), (*prefix, entry.name))
-                elif Path(entry.name).suffix == ".lean":
-                    parts = (*prefix, Path(entry.name).stem)
-                    if not all(_MODULE_COMPONENT.fullmatch(part) for part in parts):
-                        raise SkeletonError(
-                            [
-                                f"lean_lib {library.name}: cannot import {entry.path}; the impact probe supports "
-                                "plain module names only"
-                            ]
-                        )
-                    found.append(".".join(parts))
-
-    walk(directory, ())
-    return found
 
 
 def _impact_template() -> str:
@@ -804,53 +779,52 @@ def revision_impact(
         raise ImpactError(f"{revised.id} names no lean: declaration; pass --declaration NAME")
 
     root = Path(lean_root).expanduser().resolve()
-    libraries = lean_libraries(root)
-    source_index = index_project(root)
-    modules, local_modules = project_modules(libraries)
-    output = skeleton.run_probe(
-        render_impact_probe(imports=modules, project_modules=local_modules),
-        root,
-        timeout=skeleton.DEFAULT_PROBE_TIMEOUT if timeout is None else timeout,
-        label="impact probe",
-    )
-    latest = load_runtime_graph(project_or_blueprint)
-    if latest.source_revision != source_revision:
-        raise ImpactError("the roadmap changed while the impact probe ran; rerun the command")
-    if index_project(root).source_digest != source_index.source_digest:
-        raise ImpactError("the Lean sources changed while the impact probe ran; rebuild and rerun the command")
+    with bind_project_source_snapshot(root) as (bound_sources, source_snapshot):
+        libraries = lean_libraries(root)
+        modules, local_modules = project_modules(libraries, source_snapshot)
+        output = skeleton.run_probe(
+            render_impact_probe(imports=modules, project_modules=local_modules),
+            root,
+            timeout=skeleton.DEFAULT_PROBE_TIMEOUT if timeout is None else timeout,
+            label="impact probe",
+        )
+        latest = load_runtime_graph(project_or_blueprint)
+        if latest.source_revision != source_revision:
+            raise ImpactError("the roadmap changed while the impact probe ran; rerun the command")
+        try:
+            bound_sources.verify()
+            latest_sources = bound_sources.capture()
+        except (OSError, TreeSnapshotError) as exc:
+            raise ImpactError(
+                "the Lean sources changed while the impact probe ran; rebuild and rerun the command"
+            ) from exc
+        if latest_sources.generation_revision != source_snapshot.generation_revision:
+            raise ImpactError("the Lean sources changed while the impact probe ran; rebuild and rerun the command")
     return compute_impact(
         parse_impact_output(output),
         tuple(articles.values()),
         revised,
         names,
         source_revision=source_revision,
-        lean_source_revision=source_index.source_digest,
-        locate=_locator(libraries, root, source_index),
+        lean_source_revision=source_snapshot.revision,
+        locate=_locator(libraries, source_snapshot),
     )
 
 
 def _locator(
     libraries: tuple[LeanLibrary, ...],
-    root: Path,
-    source_index: SourceIndex | None = None,
+    snapshot: IndexedSourceSnapshot,
 ) -> Locator:
-    """Locate a constant through the lexical source index, else by its module's file.
-
-    The index is built on first use, since a contained revision locates nothing.
-    """
-
-    index = source_index
+    """Locate a constant through one captured index, else by its captured module path."""
 
     def locate(record: ConstantRecord) -> tuple[str | None, int | None]:
-        nonlocal index
-        if index is None:
-            index = index_project(root)
-        module_path = path_of(record.module, libraries, root)
-        declaration = index.find(record.user_name or record.name)
+        module_path = module_paths.get(record.module)
+        declaration = snapshot.index.find(record.user_name or record.name)
         if declaration is not None and module_path in (None, declaration.path.as_posix()):
             return declaration.path.as_posix(), declaration.line
         return module_path, None
 
+    module_paths = _module_source_paths(libraries, snapshot)
     return locate
 
 

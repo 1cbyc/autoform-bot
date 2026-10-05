@@ -17,7 +17,15 @@ from pathlib import Path
 from . import status
 from .coverage import CoverageSummary, load_coverage
 from .graph import Graph, GraphValidationError, Node, load_graph
-from .lean import _DECLARATION, Declaration, SourceIndex, _without_lean_comments, declaration_names, index_project
+from .lean import (
+    _DECLARATION,
+    Declaration,
+    SourceIndex,
+    _without_lean_comments,
+    declaration_names,
+    index_failure_message,
+    snapshot_project_sources,
+)
 from .markdown import FENCE as _FENCE
 from .markdown import frontmatter_end as _frontmatter_end
 from .markdown import HEADING as _HEADING
@@ -379,10 +387,20 @@ def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
         ]
 
     findings: list[AuditFinding] = []
-    index = index_project(root)
+    try:
+        snapshot = snapshot_project_sources(root)
+    except OSError as error:
+        return [
+            AuditFinding(
+                ".",
+                "unreadable-lean-sources",
+                index_failure_message(error),
+            )
+        ]
+    index = snapshot.index
     spans = _source_spans(index)
     sizes: dict[str, int] = {}
-    sources: dict[Path, list[str] | None] = {}
+    sources = _captured_source_lines(snapshot.source_files)
     for node_id in sorted(graph.nodes):
         node = graph.nodes[node_id]
         article_path = _relative_path(node.path, graph.blueprint_dir)
@@ -412,7 +430,7 @@ def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
                 resolved.append(declaration)
 
         for declaration in resolved:
-            if _declared_deprecated(declaration, index.root, sources):
+            if _declared_deprecated(declaration, sources):
                 findings.append(
                     AuditFinding(
                         article_path,
@@ -439,7 +457,23 @@ def _lean_findings(graph: Graph, lean_root: str | Path) -> list[AuditFinding]:
     return findings
 
 
-def _declared_deprecated(declaration: Declaration, root: Path, sources: dict[Path, list[str] | None]) -> bool:
+def _captured_source_lines(
+    source_files: tuple[tuple[Path, bytes], ...],
+) -> dict[Path, list[str] | None]:
+    """Decode the already captured source generation for lexical checks."""
+
+    sources: dict[Path, list[str] | None] = {}
+    for path, data in source_files:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeError:
+            sources[path] = None
+        else:
+            sources[path] = _without_lean_comments(text).splitlines()
+    return sources
+
+
+def _declared_deprecated(declaration: Declaration, sources: dict[Path, list[str] | None]) -> bool:
     """Whether the source declaration carries the ``deprecated`` attribute lexically.
 
     Only ``@[...]`` lists before the keyword count: on the declaration's line,
@@ -447,14 +481,7 @@ def _declared_deprecated(declaration: Declaration, root: Path, sources: dict[Pat
     blanked first, so a commented-out attribute does not count.
     """
 
-    if declaration.path not in sources:
-        try:
-            text = (root / declaration.path).read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            sources[declaration.path] = None
-        else:
-            sources[declaration.path] = _without_lean_comments(text).splitlines()
-    lines = sources[declaration.path]
+    lines = sources.get(declaration.path)
     if lines is None or not 0 < declaration.line <= len(lines):
         return False
     line = lines[declaration.line - 1]
@@ -486,7 +513,7 @@ def _source_spans(index: SourceIndex) -> dict[str, int]:
     tails: dict[Path, int] = {}
     for path, lines in starts.items():
         lines.sort()
-        tails[path] = _line_count(index.root / path)
+        tails[path] = index.line_counts.get(path, 0)
 
     spans: dict[str, int] = {}
     for declaration in index.declarations.values():
@@ -495,13 +522,6 @@ def _source_spans(index: SourceIndex) -> dict[str, int]:
         end = lines[following] - 1 if following < len(lines) else tails[declaration.path]
         spans[declaration.name] = max(1, end - declaration.line + 1)
     return spans
-
-
-def _line_count(path: Path) -> int:
-    try:
-        return len(path.read_text(encoding="utf-8").splitlines())
-    except (OSError, UnicodeError):
-        return 0
 
 
 def _size_findings(graph: Graph, sizes: dict[str, int]) -> list[AuditFinding]:
