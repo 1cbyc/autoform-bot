@@ -81,23 +81,19 @@ class WorkFrontier:
         return json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
 
 
-def _phase(node: RuntimeNode) -> str | None:
-    if (
-        node.article_id is None
-        or node.source_sha256 is None
-        or not node.dispatchable
-        or node.assertions.not_ready
-        or node.mathlib
-    ):
+def _phase(node: RuntimeNode, blockers: tuple[str, ...]) -> str | None:
+    if blockers or node.status.proved:
         return None
-    if not node.status.stated:
-        return "statement" if node.status.can_state else None
-    if not node.status.proved:
-        return "proof" if node.status.can_prove else None
-    return None
+    return "proof" if node.status.stated else "statement"
 
 
 def _blockers(nodes: dict[str, RuntimeNode], node: RuntimeNode) -> tuple[str, ...]:
+    # Report each reason where `list_ready_work` enforces it: finished articles
+    # need no metadata, and an unfinished leaf needs it even when not ready.
+    if not node.dispatchable:
+        return ("roadmap:not-a-formalizable-leaf",)
+    if node.status.proved:
+        return () if node.status.stated else ("roadmap:proof-without-statement",)
     metadata_blockers: list[str] = []
     if node.article_id is None:
         metadata_blockers.append("roadmap:missing-article-id")
@@ -107,16 +103,8 @@ def _blockers(nodes: dict[str, RuntimeNode], node: RuntimeNode) -> tuple[str, ..
         return tuple(metadata_blockers)
     if node.assertions.not_ready:
         return ("roadmap:not-ready",)
-    if not node.dispatchable:
-        return ("roadmap:not-a-formalizable-leaf",)
-    if node.mathlib or node.status.proved:
-        return ()
-    if not node.status.stated:
-        return tuple(
-            dependency
-            for dependency in node.statement_dependencies
-            if (resolved := nodes.get(dependency)) is None or not resolved.status.stated
-        )
+    # Project CI rejects `sorry`, so a theorem's statement can only land with its
+    # proof: both phases wait for the proof prerequisites as well.
     blocked = [
         dependency
         for dependency in node.statement_dependencies
@@ -132,16 +120,17 @@ def _blockers(nodes: dict[str, RuntimeNode], node: RuntimeNode) -> tuple[str, ..
 
 
 def _item(nodes: dict[str, RuntimeNode], node: RuntimeNode) -> WorkItem:
+    blockers = _blockers(nodes, node)
     return WorkItem(
         node_id=node.id,
         article_id=node.article_id,
         title=node.title,
         article_path=node.article_path,
         article_revision=node.source_sha256,
-        phase=_phase(node),
+        phase=_phase(node, blockers),
         state=node.status.state,
         claim_target=node.article_id or node.id,
-        blockers=_blockers(nodes, node),
+        blockers=blockers,
         dependencies=node.dependencies,
         source_targets=node.source_targets,
         lean_targets=tuple(
@@ -167,7 +156,10 @@ def list_ready_work(
     )
     if missing:
         raise WorkError(
-            "formalizable leaves need durable article_id metadata: " + ", ".join(missing)
+            "formalizable leaves need durable article_id metadata: "
+            + ", ".join(missing)
+            + " (plan IDs with `autoform migrate article-ids <blueprint> --json`, then"
+            " add each article_id to its article's frontmatter)"
         )
     unversioned = tuple(
         node.id
@@ -204,8 +196,16 @@ def work_context(
         for node in runtime.nodes
         if node.id == selector or (node.article_id is not None and node.article_id == selector)
     ]
-    if len(matches) != 1:
-        raise WorkError(f"work selector does not identify one article: {selector!r}")
+    if not matches:
+        raise WorkError(
+            f"no article matches {selector!r}; pass a path-derived node id such as"
+            " chapter/article, without .md, or an article_id"
+        )
+    if len(matches) > 1:
+        raise WorkError(
+            f"{selector!r} matches more than one article: "
+            + ", ".join(node.id for node in matches)
+        )
     return runtime.source_revision, _item(nodes, matches[0])
 
 

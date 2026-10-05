@@ -68,9 +68,19 @@ under `## Depends on` and proof-only prerequisites under `## Proof depends on`.
 Assign durable `article_id` metadata to new articles; use
 `autoform migrate article-ids blueprint --json` to obtain deterministic IDs
 after creating the pages.
-Assert formalization or `mathlib: true` only after exact verification. For a
-large source, divide independent sections among available agents while
-retaining one owner for global coverage and dependency consistency.
+Assert formalization or `mathlib: true` only after exact verification. Before
+revising a formalizable leaf, acquire the `claim_target` that `autoform work
+context` reports for it, passing your own `--worker-id`; renew it while editing
+and release it once the committed revision is on the branch Formalize works
+from. A refused acquire means another agent owns the article: leave it and
+report it. Claims write refs to the board's remote, which is outward-facing, so
+make sure the request covers them. When a revision changes a statement, remove
+the `statement`, `proof`, and `lean` metadata the new text no longer matches.
+For a Lean revision requested in Human Review, record the decision in the
+article and remove the assertions it invalidates there and on every dependent
+whose Lean uses the changed declaration, so Formalize takes the work up from its
+frontier. For a large source, divide independent sections among available agents
+while retaining one owner for global coverage and dependency consistency.
 
 Reconcile every affected source and milestone page, the coverage contract,
 `blueprint/README.md`, and the repository `README.md`.

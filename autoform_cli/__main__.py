@@ -429,49 +429,76 @@ def _project(args: argparse.Namespace) -> int:
 
 
 def _work(args: argparse.Namespace) -> int:
+    # Only loading the roadmap can fail on the project's paths; printing the
+    # result stays outside, so an output error is not reported as one.
     try:
         if args.work_command == "list":
             frontier = list_ready_work(args.target, lean_root=args.lean_root)
-            if args.json:
-                print(frontier.to_json())
-                return 0
-            if not frontier.items:
-                print("No ready formalization work.")
-                return 0
-            for item in frontier.items:
-                durable = f" [{item.article_id}]" if item.article_id else ""
-                print(f"{item.phase}: {item.node_id}{durable} — {item.title}")
-            return 0
-
-        source_revision, item = work_context(
-            args.target,
-            args.selector,
-            lean_root=args.lean_root,
-        )
-        if args.json:
-            print(
-                json.dumps(
-                    {
-                        "schema": WORK_SCHEMA,
-                        "source_revision": source_revision,
-                        "item": item.as_dict(),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+        else:
+            source_revision, item = work_context(
+                args.target,
+                args.selector,
+                lean_root=args.lean_root,
             )
-            return 0
-        print(f"{item.title} ({item.node_id})")
-        print(f"State: {item.state}")
-        print(f"Phase: {item.phase or 'not ready'}")
-        print(f"Claim target: {item.claim_target}")
-        if item.blockers:
-            print("Blocked by: " + ", ".join(item.blockers))
-        print(f"Article: {item.article_path}")
-        return 0
-    except (GraphValidationError, RuntimeProjectionError, WorkError) as error:
-        print(f"error: {error}", file=sys.stderr)
+    except (GraphValidationError, RuntimeProjectionError) as error:
+        for issue in error.issues:
+            print(f"error: {_human_text(issue)}", file=sys.stderr)
         return 2
+    except WorkError as error:
+        print(f"error: {_human_text(error)}", file=sys.stderr)
+        return 2
+    except (OSError, RuntimeError, ValueError):
+        print("error: project, blueprint, or Lean root path cannot be read", file=sys.stderr)
+        return 2
+
+    if args.work_command == "list":
+        if args.json:
+            print(frontier.to_json())
+            return 0
+        if not frontier.items:
+            print("No ready formalization work.")
+            return 0
+        for item in frontier.items:
+            durable = f" [{item.article_id}]" if item.article_id else ""
+            print(_human_text(f"{item.phase}: {item.node_id}{durable} - {item.title}"))
+        return 0
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": WORK_SCHEMA,
+                    "source_revision": source_revision,
+                    "item": item.as_dict(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    if item.phase:
+        phase = item.phase
+    elif item.blockers:
+        phase = "not ready"
+    else:
+        phase = "none (already formalized)"
+    print(_human_text(f"{item.title} ({item.node_id})"))
+    print(f"State: {item.state}")
+    print(f"Phase: {phase}")
+    print(_human_text(f"Claim target: {item.claim_target}"))
+    if item.blockers:
+        print(_human_text("Blocked by: " + ", ".join(item.blockers)))
+    print(_human_text(f"Article: {item.article_path}"))
+    print(f"Article revision: {item.article_revision or 'unknown'}")
+    print(f"Graph source revision: {source_revision}")
+    if item.dependencies:
+        print(_human_text("Dependencies: " + ", ".join(item.dependencies)))
+    if item.source_targets:
+        print(_human_text("Sources: " + ", ".join(item.source_targets)))
+    for target in item.lean_targets:
+        location = f" ({target.source_file})" if target.source_file else ""
+        print(_human_text(f"Lean: {target.declaration}{location}"))
+    return 0
 
 
 def _print_project_inspection(result) -> None:

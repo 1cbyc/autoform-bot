@@ -6,11 +6,11 @@ publishes progress views, and prepares human or agent review. The plugin and
 CLI use the identifier `autoform`; the canonical repository is
 [`facebookresearch/autoform-bot`](https://github.com/facebookresearch/autoform-bot).
 
-The `main` branch provides repository setup, roadmap planning, publication,
-human and agent review, and shared Lean LSP/REPL tools. The historical
+The `main` branch provides repository setup, roadmap planning, Markdown-native
+formalization of ready roadmap leaves, publication, human and agent review, and
+shared Lean LSP/REPL tools. The historical
 `execution` branch and its custom worker/prover stack are deprecated and are
-not an installation target. New formalization execution work belongs on
-`main` as a Markdown-native workflow over the same blueprint.
+not an installation target.
 
 ## Prerequisites
 

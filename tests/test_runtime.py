@@ -163,6 +163,9 @@ def test_serialization_is_deterministic_relative_and_deeply_immutable(tmp_path: 
 
     assert json.loads(runtime.to_json()) == payload
     assert runtime.to_json() == load_runtime_graph(project).to_json()
+    base = next(node for node in payload["nodes"] if node["id"] == "chapter/section/base")
+    assert base["article_id"] == "af_000000000000000000000001"
+    assert base["source_sha256"] == runtime.get("chapter/section/base").source_sha256
     assert str(tmp_path) not in runtime.to_json()
     assert all(not Path(node.article_path).is_absolute() for node in runtime.nodes)
     assert isinstance(runtime.nodes, tuple)

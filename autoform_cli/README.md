@@ -32,6 +32,7 @@ Frontmatter records checked facts:
 
 ```markdown
 ---
+article_id: af_5b0e4d3c2a1f09e8d7c6b5a4
 declaration: theorem
 origin: cited
 statement: formalized
@@ -66,7 +67,8 @@ intended Lean artifact, for example `def`, `theorem`, `lemma`, `structure`, or
 `instance`. Container and exposition articles omit it. Autoform records this
 hint but does not constrain the set of Lean declaration commands. Declarations
 that introduce data rather than a proposition carry no separate proof
-obligation.
+obligation; leading modifiers such as `noncomputable` do not change that, and an
+`axiom` does not get this shortcut.
 
 `origin` records provenance for formalizable work: `cited` for a direct source
 target, `bridged` for a result introduced between source targets, and
@@ -87,6 +89,7 @@ An article asserts only facts a human or agent verified:
 | `not_ready: true` | Needs more blueprint work before it can be attempted. |
 | `lean: Ns.decl` | Declaration name(s) that discharge the article. |
 | `discussion: 42` | Issue number or URL where the article is being discussed. |
+| `article_id: af_...` | Durable identity, `af_` plus 24 lowercase hex digits; `autoform work` requires it on unfinished formalizable leaves. |
 
 Everything a reader thinks of as progress is *derived* from the DAG on every
 run, so it cannot go stale:
@@ -174,10 +177,11 @@ statement may name a Lean declaration that does not exist yet.
 available port unless `--port` is supplied, and adds a read-only live overlay
 from current author claims. Static content remains the
 same artifact deployed to GitHub Pages; only the loopback server exposes
-`/__autoform/live.json`. The overlay is ephemeral, uses the runtime's temporary
-path-derived node IDs, and is never written into the vault, publication
-manifest, or public site. Re-run render and the MkDocs build to refresh durable
-content; claim badges update while the local server is running.
+`/__autoform/live.json`. The overlay is ephemeral, matches claims taken on
+either an article's path-derived node ID or its `article_id`, reports in that
+JSON the `claim_target` each lease used, and is never written into the vault,
+publication manifest, or public site. Re-run render and the MkDocs build to
+refresh durable content; claim badges update while the local server is running.
 
 Validate structure, and optionally check that every `lean:` name really exists
 in the project's Lean sources:
@@ -492,13 +496,26 @@ autoform work context chapter/result . --lean-root . --json
 ```
 
 `work list` returns only formalizable leaves whose next statement or proof phase
-is unblocked. `work context` accepts the path-derived node ID or an assigned
-`article_id` and reports the exact article, dependencies, source targets, Lean
-targets, blockers, article and graph source revisions, and claim target. The claim target prefers
-durable `article_id` metadata. `work list` fails explicitly if an unfinished
-formalizable leaf lacks one; `work context` may still select that article by its
-path ID to report the migration blocker. Both commands are read-only projections
-of Markdown.
+is unblocked. Project CI rejects `sorry`, so a theorem's statement lands with
+its proof, and an article's statement phase also waits until its `## Proof
+depends on` prerequisites are proved. The derived `can_state` state and the
+site's Next up card do not apply this gate; dispatch from `work list`. `work
+context` accepts the path-derived node ID (see Articles and containment) or an
+assigned `article_id` and reports the exact article, dependencies, source
+targets, Lean targets, blockers, article and graph source revisions, and claim
+target. The article revision hashes that article's bytes alone. A Lean target's
+`source_file` is relative to `--lean-root`, and null without one or when the
+local scan does not find the declaration. The scan skips build output and nested
+checkouts, meaning any subdirectory with a `.git` entry, such as a worker's
+worktree or a submodule. Blockers are unmet dependency IDs or one of
+`roadmap:not-a-formalizable-leaf`, `roadmap:proof-without-statement`,
+`roadmap:missing-article-id`, `roadmap:missing-article-revision`, and
+`roadmap:not-ready`. The claim target prefers durable `article_id` metadata.
+`work list` fails explicitly if an unfinished formalizable leaf lacks one; plan
+the missing IDs with `autoform migrate article-ids` and add them to the
+frontmatter. `work context` may still select that article by its path ID to
+report the migration blocker. Both commands are read-only projections of
+Markdown.
 
 Plan durable article identity metadata without changing the blueprint:
 
@@ -517,10 +534,20 @@ Coordinate temporary cross-machine ownership without modifying the book:
 
 ```bash
 export AUTOFORM_WORKER_ID="agent-name"
-autoform claim acquire "chapter/main-result"
-autoform claim renew "chapter/main-result"
-autoform claim release "chapter/main-result"
+autoform claim acquire af_5b0e4d3c2a1f09e8d7c6b5a4
+autoform claim renew af_5b0e4d3c2a1f09e8d7c6b5a4
+autoform claim release af_5b0e4d3c2a1f09e8d7c6b5a4
 ```
+
+Claim an article by the `claim_target` that `work context` reports. The board
+hashes whatever string it is given, so a claim on an article's path ID and one
+on its `article_id` do not exclude each other. Each concurrent agent needs its
+own worker ID, because a second acquire by the same owner succeeds. Where shell
+state does not persist between commands, as in agent tool calls, pass it with
+`--worker-id` on every command instead of exporting `AUTOFORM_WORKER_ID` once.
+Leases expire after 1500 seconds unless `--ttl` sets another length. Renew well
+within that, and confirm a claim is still held with `renew`, not `acquire`,
+which also succeeds once a lease has expired or been released.
 
 Claims are fail-closed compare-and-swap leases under
 `refs/autoform-claims/` on the Git `origin`; pass `--repo` for another claim

@@ -194,6 +194,9 @@ def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
         "Developed with "
         "[AutoformBot](https://github.com/facebookresearch/autoform-bot)."
     ) in readme
+    assert ".claude/worktrees/" in (example / ".gitignore").read_text(
+        encoding="utf-8"
+    ).splitlines()
     assert (example / "src/CabannesThesis.lean").is_file()
     assert (example / "src/CabannesThesis/Basic.lean").is_file()
     toolchain = (example / "lean-toolchain").read_text(encoding="utf-8").strip()

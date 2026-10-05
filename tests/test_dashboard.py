@@ -32,6 +32,7 @@ def _runtime():
                 article_id="af_000000000000000000000001",
                 title="Main result",
             ),
+            SimpleNamespace(id="chapter/other", article_id=None, title="Other result"),
         ),
     )
 
@@ -48,6 +49,18 @@ def test_live_state_projects_only_current_author_claims() -> None:
                 "owner": "worker-a",
                 "expires_at": 123.0,
                 "note": "proof attempt 1",
+            },
+            {
+                "_key": author_claim_key("chapter/result"),
+                "_malformed": False,
+                "_expired": False,
+                "owner": "path-worker",
+            },
+            {
+                "_key": author_claim_key("chapter/other"),
+                "_malformed": False,
+                "_expired": False,
+                "owner": "worker-c",
             },
             {
                 "_key": "lake-build",
@@ -69,13 +82,27 @@ def test_live_state_projects_only_current_author_claims() -> None:
         "source_revision": "revision",
         "claims": [
             {
+                "node_id": "chapter/other",
+                "title": "Other result",
+                "owner": "worker-c",
+                "claim_target": "chapter/other",
+            },
+            {
                 "node_id": "chapter/result",
                 "article_id": "af_000000000000000000000001",
                 "title": "Main result",
                 "owner": "worker-a",
+                "claim_target": "af_000000000000000000000001",
                 "expires_at": 123.0,
                 "note": "proof attempt 1",
-            }
+            },
+            {
+                "node_id": "chapter/result",
+                "article_id": "af_000000000000000000000001",
+                "title": "Main result",
+                "owner": "path-worker",
+                "claim_target": "chapter/result",
+            },
         ],
     }
 
