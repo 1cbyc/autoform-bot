@@ -29,6 +29,7 @@ def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
         in readme
     )
     assert "git clone https://github.com/facebookresearch/autoform-bot.git" in readme
+    assert "`execution` branch" not in readme
     assert "VivienCabannes/autoform-bot" not in readme
 
 
