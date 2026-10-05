@@ -322,6 +322,7 @@ def test_creates_complete_supported_project(tmp_path: Path) -> None:
         "site/",
         "site-src/",
         "*.log",
+        ".claude/worktrees/",
     ]
     assert (target / "lean-toolchain").read_text(encoding="utf-8") == ("leanprover/lean4:v4.32.2\n")
     assert (target / "lakefile.toml").read_text(encoding="utf-8") == (

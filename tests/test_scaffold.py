@@ -637,6 +637,13 @@ def test_windows_cross_interface_gitignore_identity_ignores_ctime_only(
 
     assert not scaffold_module._append_gitignore_rules(destination, b"/.lake\n")
     assert destination.read_bytes() == b"/.lake\n"
+def test_scaffolded_gitignore_keeps_worker_worktrees_out_of_commits(tmp_path: Path) -> None:
+    """`git add -A` would record a nested worktree as a dangling gitlink."""
+
+    scaffold_project(tmp_path, title="Finite Flat")
+    ignored = (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
+
+    assert ".claude/worktrees/" in ignored
 
 
 def test_scaffolded_blueprint_tracks_authored_structure(tmp_path: Path) -> None:
