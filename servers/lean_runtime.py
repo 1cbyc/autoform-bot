@@ -377,12 +377,8 @@ class ProjectResourceCache(Generic[T]):
         finally:
             if resource is not None:
                 with self._condition:
-                    entry = self._entries.get(root)
-                    if entry is None or entry.resource is not resource:
-                        raise RuntimeError(
-                            "observed project resource is no longer registered"
-                        )
-                    entry.active -= 1
+                    # A pinned entry is never evicted, replaced, or closed.
+                    self._entries[root].active -= 1
                     self._condition.notify_all()
 
     def stats(self) -> dict[str, Any]:

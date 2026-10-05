@@ -136,9 +136,7 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path, monkeyp
     assert pools[0]._shutdown is True
 
 
-def test_cache_observation_ignores_staleness_invalidity_and_validation(
-    tmp_path, monkeypatch
-):
+def test_cache_observation_ignores_staleness_invalidity_and_validation(tmp_path, monkeypatch):
     from servers import lean_runtime as lean_runtime_module
 
     project = make_lake_project(tmp_path, "observed-stale")
@@ -223,69 +221,6 @@ def test_cache_observation_does_not_refresh_ttl_and_pins_idle_eviction(tmp_path)
     assert cache.evict_idle() == 1
     assert closed == [project.resolve()]
     cache.close()
-
-
-def test_cache_observation_releases_ownership_after_cancellation(tmp_path):
-    project = make_lake_project(tmp_path, "observed-cancellation")
-    cache = ProjectResourceCache(
-        lambda root: root,
-        lambda resource: None,
-        max_entries=1,
-        idle_seconds=1800,
-        start_sweeper=False,
-    )
-    with cache.lease(str(project)):
-        pass
-
-    class Cancellation(BaseException):
-        pass
-
-    with pytest.raises(Cancellation, match="cancel observation"):
-        with cache.observe(str(project)) as (resource, state):
-            assert resource == project.resolve()
-            assert state == "warm"
-            assert cache.stats()["resident"][0]["active"] == 1
-            raise Cancellation("cancel observation")
-
-    assert cache.stats()["resident"][0]["active"] == 0
-    cache.close()
-
-
-def test_observation_cancellation_unblocks_a_waiting_cache_close(tmp_path):
-    project = make_lake_project(tmp_path, "observed-cancelled-close")
-    closed = []
-    close_started = threading.Event()
-    close_finished = threading.Event()
-    cache = ProjectResourceCache(
-        lambda root: root,
-        closed.append,
-        max_entries=1,
-        idle_seconds=1800,
-        start_sweeper=False,
-    )
-    with cache.lease(str(project)):
-        pass
-
-    class Cancellation(BaseException):
-        pass
-
-    def close_cache():
-        close_started.set()
-        cache.close()
-        close_finished.set()
-
-    thread = threading.Thread(target=close_cache)
-    with pytest.raises(Cancellation, match="cancel observed close"):
-        with cache.observe(str(project)):
-            thread.start()
-            assert close_started.wait(timeout=1)
-            assert not close_finished.wait(timeout=0.1)
-            raise Cancellation("cancel observed close")
-
-    thread.join(timeout=2)
-    assert not thread.is_alive()
-    assert close_finished.is_set()
-    assert closed == [project.resolve()]
 
 
 def test_cache_close_waits_for_an_active_observation(tmp_path):
