@@ -444,14 +444,13 @@ class ImpactReport:
 
         A helper the revised article owns, such as a structure's generated
         constructor or recursor, is repaired under that article's claim, so it
-        does not count; any other helper, owned or not, does.
+        does not count; any other helper, owned or not, does, and so does a
+        revised declaration that belongs to another article or to none. The
+        revision is contained exactly when its only claim target is the
+        revised article's.
         """
 
-        return not (
-            self.statement_impacted
-            or self.proof_impacted
-            or any(set(helper.owners) != {self.article.id} for helper in self.helpers)
-        )
+        return self.claim_targets == (self.article.claim_target,)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -568,9 +567,7 @@ def compute_impact(
         path, line = locate(record) if locate is not None else (None, None)
         impact = "statement" if name in meaning else "proof"
         owners = _owners(record, records, named)
-        targets = tuple(
-            sorted({by_id[owner].claim_target for owner in owners if owner in by_id})
-        ) or (_helper_claim_key(name),)
+        targets = _claim_targets_for(name, owners, by_id)
         helpers.append(
             ImpactHelper(name, record.kind, impact, record.module, path, line, owners, targets)
         )
@@ -595,9 +592,13 @@ def compute_impact(
 
     # A helper is repaired under every owning article's claim; an unowned
     # helper contributes the key derived from its own name.
+    # A revised declaration no article names is claimed the same way.
     others = {item.claim_target for item in impacted} | {
         target for helper in helpers for target in helper.claim_targets
     }
+    for name in revised_names:
+        if name not in named:
+            others.update(_claim_targets_for(name, _owners(records[name], records, named), by_id))
     claim_targets = (revised.claim_target, *sorted(others - {revised.claim_target}))
     return ImpactReport(
         source_revision=source_revision,
@@ -629,6 +630,17 @@ def _helper_claim_key(name: str) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")[:48] or "declaration"
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
     return f"lean/{slug}-{digest}"
+
+
+def _claim_targets_for(
+    name: str,
+    owners: Iterable[str],
+    articles: Mapping[str, ImpactArticle],
+) -> tuple[str, ...]:
+    """Every owner's claim target, or a stable key when no article owns ``name``."""
+
+    targets = {articles[owner].claim_target for owner in owners if owner in articles}
+    return tuple(sorted(targets)) or (_helper_claim_key(name),)
 
 
 def _resolver(records: Mapping[str, ConstantRecord]) -> Callable[..., str | None]:

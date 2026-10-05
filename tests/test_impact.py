@@ -553,6 +553,72 @@ def test_revisions_touching_one_unowned_helper_contend_for_its_claim() -> None:
     assert json.loads(right.to_json())["helpers"][0]["claim_targets"] == [key]
 
 
+def test_a_revised_declaration_owned_by_another_article_claims_that_article() -> None:
+    records = _records(
+        _rec("A.R", "def"),
+        _rec("A.T", "inductive"),
+        _rec("A.T.aux", parent="A.T"),
+    )
+    articles = [
+        _article("r", "A.R", article_id="af_r"),
+        _article("t", "A.T", article_id="af_t"),
+    ]
+
+    report = _impact(records, articles, "r", ["A.T.aux"])
+
+    assert report.declarations == ("A.T.aux",)
+    assert report.helpers == ()
+    assert report.claim_targets == ("af_r", "af_t")
+    assert not report.contained
+
+
+def test_revisions_of_one_unowned_declaration_contend_for_its_claim() -> None:
+    records = _records(
+        _rec("A.R", "def"),
+        _rec("A.S", "def"),
+        _rec("A.loose", "def"),
+    )
+    articles = [
+        _article("r", "A.R", article_id="af_r"),
+        _article("s", "A.S", article_id="af_s"),
+    ]
+
+    from_r = _impact(records, articles, "r", ["A.loose"])
+    from_s = _impact(records, articles, "s", ["A.loose"])
+
+    key = _lean_key("A.loose")
+    assert from_r.claim_targets == ("af_r", key)
+    assert from_s.claim_targets == ("af_s", key)
+    assert not from_r.contained
+    assert not from_s.contained
+
+
+def test_declaration_override_claims_every_owner_of_the_revised_declaration() -> None:
+    records = _records(
+        _rec("A.R", "def"),
+        _rec("A.R.aux", parent="A.R"),
+        _rec("A.Shared", "inductive"),
+        _rec("A.Shared.aux", parent="A.Shared"),
+    )
+    articles = [
+        _article("r", "A.R", "A.Shared", article_id="af_r"),
+        _article("shared", "A.Shared", article_id="af_shared"),
+    ]
+
+    report = _impact(records, articles, "r", ["A.Shared.aux"])
+    own = _impact(records, articles, "r", ["A.R.aux"])
+
+    # The override replaces r's normal declarations, but the roadmap still
+    # says both articles own the revised declaration's nearest named parent.
+    assert report.declarations == ("A.Shared.aux",)
+    assert report.statement_impacted == ()
+    assert report.helpers == ()
+    assert report.claim_targets == ("af_r", "af_shared")
+    assert not report.contained
+    assert own.claim_targets == ("af_r",)
+    assert own.contained
+
+
 def test_an_unowned_helper_claim_key_is_ref_safe_for_any_name() -> None:
     names = ("_private.Demo.Extra.0.A.priv", "A.«weird name»", "«∀»", "A." + "long" * 20)
     records = _records(_rec("A.base", "def"), *(_rec(name, type_uses=("A.base",)) for name in names))
@@ -1017,8 +1083,9 @@ def test_cli_declaration_flag_replaces_the_article_s_names(tmp_path: Path, monke
     report = json.loads(output.out)
     assert report["article"] == {"id": "chapter/empty", "article_id": None, "claim_target": "chapter/empty"}
     assert report["declarations"] == ["Demo.gone"]
-    assert report["contained"] is True
-    assert report["claim_targets"] == ["chapter/empty"]
+    # No article names Demo.gone, so revising it claims its own key too.
+    assert report["contained"] is False
+    assert report["claim_targets"] == ["chapter/empty", _lean_key("Demo.gone")]
 
 
 def test_cli_text_escapes_terminal_control_characters(tmp_path: Path, monkeypatch, capsys) -> None:
