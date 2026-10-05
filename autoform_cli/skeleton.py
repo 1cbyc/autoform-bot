@@ -1365,8 +1365,14 @@ def _probe_modules(probe: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(modules))
 
 
+def _probe_purpose(label: str) -> str:
+    """What `lake build` must come before, as the freshness messages say it."""
+
+    return "extracting skeletons" if label == "skeleton probe" else f"running the {label}"
+
+
 def _check_artifacts_fresh(
-    lake: str, lean_root: Path, modules: tuple[str, ...], *, timeout: float
+    lake: str, lean_root: Path, modules: tuple[str, ...], *, timeout: float, label: str = "skeleton probe"
 ) -> None:
     """Ask Lake to prove that imported artifacts match their exact inputs.
 
@@ -1387,7 +1393,7 @@ def _check_artifacts_fresh(
         raise SkeletonError(
             [
                 "Lean build artifacts are stale; run "
-                f"`{build_command}` before extracting skeletons\n{detail}"
+                f"`{build_command}` before {_probe_purpose(label)}\n{detail}"
             ]
         )
     if result.returncode != 0:
@@ -1420,10 +1426,10 @@ def run_probe(
         raise SkeletonError(["lake is not on PATH; a built Lean project is required to extract skeletons"])
     if not (lean_root / "lake-manifest.json").is_file():
         raise SkeletonError(
-            ["lake-manifest.json is missing; run `lake build` before extracting skeletons"]
+            [f"lake-manifest.json is missing; run `lake build` before {_probe_purpose(label)}"]
         )
     modules = _probe_modules(probe)
-    _check_artifacts_fresh(lake, lean_root, modules, timeout=freshness_timeout)
+    _check_artifacts_fresh(lake, lean_root, modules, timeout=freshness_timeout, label=label)
     deadline = time.monotonic() + timeout
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
