@@ -591,16 +591,22 @@ statement-impacted and proof-impacted articles, unnamed helpers, missing
 Markdown dependency paths, deprecated declarations and their users, whether
 the change is contained, and the complete `claim_targets` set. Helpers shared
 by several articles contribute every owner's claim; an unowned helper gets a
-stable `lean/<slug>-<digest>` target. Project locality is an exact inventory of
-regular repository source modules, never a namespace-prefix guess.
+stable `lean/<slug>-<digest>` target. A revised declaration that no article
+names is claimed the same way, under every nearest owner's target or its own
+stable key. A revision is contained exactly when the selected article's target
+is its only claim target. Project locality is an exact inventory of regular
+repository source modules, never a namespace-prefix guess.
 
-The command snapshots and rereads both the roadmap and repository Lean sources
-around the probe. JSON uses `autoform-impact/v1` and binds its answer to the
-Markdown `source_revision`, the repository `lean_source_revision`, and a
-`build_revision` hash of the normalized Lean records. The probe imports project
-modules, so run it only in a trusted checkout or sandbox. It compares elaborated
-types and values; changes to notation, attributes, instance priority, or
-unreported generated declarations still require human review.
+The command snapshots and rereads the roadmap around the probe. It retains one
+bound Lean source generation, derives module inventory and locations from that
+generation's captured bytes, then recaptures through the same binding and
+refuses any content or source-identity change. JSON uses `autoform-impact/v1`
+and binds its answer to the Markdown `source_revision`, the repository
+`lean_source_revision`, and a `build_revision` hash of the normalized Lean
+records. The probe imports project modules, so run it only in a trusted checkout
+or sandbox. It compares elaborated types and values; changes to notation,
+attributes, instance priority, or unreported generated declarations still
+require human review.
 
 Plan durable article identity metadata without changing the blueprint:
 
@@ -684,6 +690,19 @@ values it does not recognize. With `--lean-root` it also fails on a `lean:` name
 absent from the sources, as `leanblueprint checkdecls` does for LaTeX
 blueprints. It validates structure and leaves mathematical correctness to the
 agent and the Lean kernel.
+
+Source-aware `--lean-root` inspection requires directory-descriptor traversal.
+Platforms without that capability, including Windows, fail closed instead of
+treating repeated pathname reads as one filesystem generation. Declaration
+locations and source revisions come from the same retained capture. Recognized
+skeleton packet/passages directories are identified by their bounded managed
+manifest before descendants are read; publication-output policy remains with
+the publication feature rather than this source layer.
+
+Automatically detected Git permalinks are emitted only for captured files whose
+bytes equal the blob at the stable detected commit. Dirty, untracked, missing,
+or concurrently checked-out files keep local declaration locations but receive
+no URL. An explicitly supplied ref remains a caller attestation.
 
 The Markdown files are the source of truth. Graphs and sites are derived views
 that may be regenerated at any time.

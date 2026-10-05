@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
+import autoform_cli.lean as lean_module
 from autoform_cli import __main__ as cli, claims, skeleton
+from autoform_cli._tree_snapshot import TreeChangedError
 from autoform_cli.impact import (
     IMPACT_MARKER,
     IMPACT_SCHEMA,
@@ -24,6 +26,7 @@ from autoform_cli.impact import (
     render_impact_probe,
     revision_impact,
 )
+from autoform_cli.lean import snapshot_project_sources
 from autoform_cli.runtime import load_runtime_graph
 from autoform_cli.skeleton import LeanLibrary, SkeletonError, lean_libraries
 from autoform_cli.work import work_context
@@ -553,6 +556,72 @@ def test_revisions_touching_one_unowned_helper_contend_for_its_claim() -> None:
     assert json.loads(right.to_json())["helpers"][0]["claim_targets"] == [key]
 
 
+def test_a_revised_declaration_owned_by_another_article_claims_that_article() -> None:
+    records = _records(
+        _rec("A.R", "def"),
+        _rec("A.T", "inductive"),
+        _rec("A.T.aux", parent="A.T"),
+    )
+    articles = [
+        _article("r", "A.R", article_id="af_r"),
+        _article("t", "A.T", article_id="af_t"),
+    ]
+
+    report = _impact(records, articles, "r", ["A.T.aux"])
+
+    assert report.declarations == ("A.T.aux",)
+    assert report.helpers == ()
+    assert report.claim_targets == ("af_r", "af_t")
+    assert not report.contained
+
+
+def test_revisions_of_one_unowned_declaration_contend_for_its_claim() -> None:
+    records = _records(
+        _rec("A.R", "def"),
+        _rec("A.S", "def"),
+        _rec("A.loose", "def"),
+    )
+    articles = [
+        _article("r", "A.R", article_id="af_r"),
+        _article("s", "A.S", article_id="af_s"),
+    ]
+
+    from_r = _impact(records, articles, "r", ["A.loose"])
+    from_s = _impact(records, articles, "s", ["A.loose"])
+
+    key = _lean_key("A.loose")
+    assert from_r.claim_targets == ("af_r", key)
+    assert from_s.claim_targets == ("af_s", key)
+    assert not from_r.contained
+    assert not from_s.contained
+
+
+def test_declaration_override_claims_every_owner_of_the_revised_declaration() -> None:
+    records = _records(
+        _rec("A.R", "def"),
+        _rec("A.R.aux", parent="A.R"),
+        _rec("A.Shared", "inductive"),
+        _rec("A.Shared.aux", parent="A.Shared"),
+    )
+    articles = [
+        _article("r", "A.R", "A.Shared", article_id="af_r"),
+        _article("shared", "A.Shared", article_id="af_shared"),
+    ]
+
+    report = _impact(records, articles, "r", ["A.Shared.aux"])
+    own = _impact(records, articles, "r", ["A.R.aux"])
+
+    # The override replaces r's normal declarations, but the roadmap still
+    # says both articles own the revised declaration's nearest named parent.
+    assert report.declarations == ("A.Shared.aux",)
+    assert report.statement_impacted == ()
+    assert report.helpers == ()
+    assert report.claim_targets == ("af_r", "af_shared")
+    assert not report.contained
+    assert own.claim_targets == ("af_r",)
+    assert own.contained
+
+
 def test_an_unowned_helper_claim_key_is_ref_safe_for_any_name() -> None:
     names = ("_private.Demo.Extra.0.A.priv", "A.«weird name»", "«∀»", "A." + "long" * 20)
     records = _records(_rec("A.base", "def"), *(_rec(name, type_uses=("A.base",)) for name in names))
@@ -754,11 +823,12 @@ def test_project_modules_follow_lake_globs(tmp_path: Path) -> None:
     )
     (tmp_path / "Demo" / "Sub" / "notes.md").write_text("", encoding="utf-8")
     _sources(tmp_path / ".lake" / "packages" / "dep", "Demo.External")
+    snapshot = snapshot_project_sources(tmp_path)
 
     # `M` is one module, `M.*` the module and its submodules, `M.+` only its
     # submodules. Locality is every repository-owned source module, independent
     # of target globs and namespace prefixes.
-    assert project_modules([_library(src, "Demo", "Demo.Sub.*", "Demo.Extra.+")]) == (
+    assert project_modules([_library(src, "Demo", "Demo.Sub.*", "Demo.Extra.+")], snapshot) == (
         ("Demo", "Demo.Extra.X", "Demo.Extra.Y.Z", "Demo.Sub", "Demo.Sub.A", "Demo.Sub.B.C"),
         (
             "Demo",
@@ -772,7 +842,7 @@ def test_project_modules_follow_lake_globs(tmp_path: Path) -> None:
         ),
     )
     # Without globs, Lake builds the roots.
-    assert project_modules([_library(src, roots=("Demo", "Other.Lone"))]) == (
+    assert project_modules([_library(src, roots=("Demo", "Other.Lone"))], snapshot) == (
         ("Demo", "Other.Lone"),
         (
             "Demo",
@@ -787,6 +857,17 @@ def test_project_modules_follow_lake_globs(tmp_path: Path) -> None:
     )
 
 
+def test_project_modules_select_from_captured_files_not_empty_directory_metadata(tmp_path: Path) -> None:
+    src = _sources(tmp_path, "Demo")
+    (tmp_path / "Demo").mkdir()
+    snapshot = snapshot_project_sources(tmp_path)
+
+    # An empty submodule directory and a missing one select the same captured
+    # modules. This keeps M.* usable with only M.lean without a live is_dir read.
+    (tmp_path / "Demo").rmdir()
+    assert project_modules([_library(src, "Demo.*")], snapshot) == (("Demo",), ("Demo",))
+
+
 @pytest.mark.parametrize(
     ("glob", "message"),
     [
@@ -794,7 +875,7 @@ def test_project_modules_follow_lake_globs(tmp_path: Path) -> None:
         ("Demo/Odd", "cannot read module glob 'Demo/Odd'"),
         ("Demo.Missing", "module Demo.Missing has no source file"),
         ("Demo.Missing.*", "module Demo.Missing has no source file"),
-        ("Demo.Missing.+", r"glob Demo\.Missing\.\+ names no source directory Demo/Missing"),
+        ("Demo.Missing.+", "the Lake configuration selects no modules"),
         ("Demo.Odd.+", r"cannot import .*bad-name\.lean"),
         ("Demo.Empty.+", "the Lake configuration selects no modules"),
     ],
@@ -803,9 +884,10 @@ def test_project_modules_fail_closed(tmp_path: Path, glob: str, message: str) ->
     src = _sources(tmp_path, "Demo", "Demo.Odd.Fine")
     (tmp_path / "Demo" / "Odd" / "bad-name.lean").write_text("", encoding="utf-8")
     (tmp_path / "Demo" / "Empty").mkdir()
+    snapshot = snapshot_project_sources(tmp_path)
 
     with pytest.raises(SkeletonError, match=message):
-        project_modules([_library(src, glob)])
+        project_modules([_library(src, glob)], snapshot)
 
 
 def test_lean_libraries_read_one_glob_or_an_array(tmp_path: Path) -> None:
@@ -1017,8 +1099,9 @@ def test_cli_declaration_flag_replaces_the_article_s_names(tmp_path: Path, monke
     report = json.loads(output.out)
     assert report["article"] == {"id": "chapter/empty", "article_id": None, "claim_target": "chapter/empty"}
     assert report["declarations"] == ["Demo.gone"]
-    assert report["contained"] is True
-    assert report["claim_targets"] == ["chapter/empty"]
+    # No article names Demo.gone, so revising it claims its own key too.
+    assert report["contained"] is False
+    assert report["claim_targets"] == ["chapter/empty", _lean_key("Demo.gone")]
 
 
 def test_cli_text_escapes_terminal_control_characters(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -1108,6 +1191,31 @@ def test_revision_impact_reports_an_article_nothing_uses_as_contained(tmp_path: 
     assert report.declarations == ("Demo.uses",)
     assert report.contained
     assert report.claim_targets == (_USES_ID,)
+
+
+def test_revision_impact_retries_an_initial_source_capture_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _blueprint_project(tmp_path, "Demo")
+    lean_root = _stub_lean_root(tmp_path)
+    _stub_probe(monkeypatch)
+    original_capture = lean_module.BoundProjectSources.capture
+    captures = 0
+
+    def changing_once(bound):
+        nonlocal captures
+        captures += 1
+        if captures == 1:
+            raise TreeChangedError("directory tree changed while it was captured")
+        return original_capture(bound)
+
+    monkeypatch.setattr(lean_module.BoundProjectSources, "capture", changing_once)
+    monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
+
+    report = revision_impact(project, "chapter/uses", lean_root=lean_root)
+
+    assert report.contained
+    assert captures == 3  # failed initial capture, retry, post-probe verification
 
 
 def test_helpers_are_located_by_source_name_in_their_module_s_file(tmp_path: Path, monkeypatch) -> None:
@@ -1215,6 +1323,30 @@ def test_revision_impact_refuses_lean_sources_that_change_during_the_probe(
         return output
 
     monkeypatch.setattr("autoform_cli.skeleton.run_probe", run_then_change)
+    with pytest.raises(
+        ImpactError,
+        match="^the Lean sources changed while the impact probe ran; rebuild and rerun the command$",
+    ):
+        revision_impact(project, "chapter/base", lean_root=lean_root)
+
+
+def test_revision_impact_refuses_byte_identical_source_replacement_during_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _blueprint_project(tmp_path, "Demo")
+    lean_root = _stub_lean_root(tmp_path)
+    _stub_probe(monkeypatch)
+    original = skeleton.run_probe
+
+    def run_then_replace(*args, **kwargs):
+        output = original(*args, **kwargs)
+        source = lean_root / "Demo.lean"
+        data = source.read_bytes()
+        source.rename(lean_root / "Demo.previous")
+        source.write_bytes(data)
+        return output
+
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", run_then_replace)
     with pytest.raises(
         ImpactError,
         match="^the Lean sources changed while the impact probe ran; rebuild and rerun the command$",

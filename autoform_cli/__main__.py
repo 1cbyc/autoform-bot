@@ -21,7 +21,7 @@ from .doctor import diagnose_project
 from .dashboard import publication_bound_live_state, serve_dashboard
 from .graph import GraphValidationError, load_graph
 from .impact import ImpactError, format_impact, revision_impact
-from .lean import build_linker, declaration_names
+from .lean import build_linker, declaration_names, index_failure_message
 from .project import ProjectCatalogError, inspect_project, load_release_catalog
 from .render import PublicationError, render_site
 from .runtime import RuntimeProjectionError, load_runtime_graph, resolve_runtime_paths
@@ -338,16 +338,23 @@ def _check(args: argparse.Namespace) -> int:
             print(f"error: {issue}")
         return 1
 
+    linker = None
+    if args.lean_root is not None:
+        try:
+            linker = build_linker(args.lean_root)
+        except OSError as error:
+            print(f"error: {index_failure_message(error)}")
+            return 1
+
     statuses = status.derive(graph)
     summary = " · ".join(f"{count} {state.label}" for state, count in status.summarize(statuses))
     print(f"OK: {len(graph.nodes)} articles, {graph.edge_count} dependencies")
     if summary:
         print(f"    {summary}")
 
-    if args.lean_root is None:
+    if linker is None:
         return 0
 
-    linker = build_linker(args.lean_root)
     missing = [
         f"{node.id}: declaration not found in {args.lean_root}: {name}"
         for node in graph.nodes.values()
