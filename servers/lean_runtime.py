@@ -357,6 +357,34 @@ class ProjectResourceCache(Generic[T]):
             if resource is not None:
                 self._release(root, resource)
 
+    @contextmanager
+    def observe(self, project_dir: str) -> Iterator[tuple[T | None, str]]:
+        """Borrow one atomic state snapshot without validating or refreshing it."""
+        root = resolve_lean_project_dir(project_dir)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("project resource cache is closed")
+            entry = self._entries.get(root)
+            if entry is None:
+                resource = None
+                state = "warming" if root in self._creating else "cold"
+            else:
+                entry.active += 1
+                resource = entry.resource
+                state = "warm"
+        try:
+            yield resource, state
+        finally:
+            if resource is not None:
+                with self._condition:
+                    entry = self._entries.get(root)
+                    if entry is None or entry.resource is not resource:
+                        raise RuntimeError(
+                            "observed project resource is no longer registered"
+                        )
+                    entry.active -= 1
+                    self._condition.notify_all()
+
     def stats(self) -> dict[str, Any]:
         with self._condition:
             now = self._clock()
@@ -716,8 +744,7 @@ class LeanRuntimeServices:
                 return format_repl_response(pool.run(code, timeout=effective_timeout))
         if method == "repl.status":
             project_dir = self._string_param(params, "project_dir")
-            with self.repl_projects.lease(project_dir, create=False) as pool:
-                state = "warm" if pool is not None else self.repl_projects.state(project_dir)
+            with self.repl_projects.observe(project_dir) as (pool, state):
                 return {
                     "state": state,
                     "capacity": (
