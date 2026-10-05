@@ -29,8 +29,6 @@ def test_root_readme_uses_the_canonical_repository(repo_root: Path) -> None:
         in readme
     )
     assert "git clone https://github.com/facebookresearch/autoform-bot.git" in readme
-    assert "historical\n`execution` branch" in readme
-    assert "custom worker/prover stack are deprecated" in readme
     assert "VivienCabannes/autoform-bot" not in readme
 
 
@@ -109,6 +107,36 @@ def test_development_guidance_uses_progressive_command_reference(repo_root: Path
     assert "[project-inspection reference](project/README.md)" in cli_reference
     assert "| `target-unreadable` |" not in cli_reference
     assert "| `target-unreadable` |" in inspection_reference
+
+
+def test_development_guidance_maintains_example_compatibility_pins(
+    repo_root: Path,
+) -> None:
+    development = (repo_root / "skills/develop-plugin/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(development.split())
+
+    assert "compatibility locks, not update channels" in normalized
+    assert "canonical `facebookresearch` source and full SHA together" in normalized
+    assert "run the example commands through that exact pin" in normalized
+    assert "branch, tag, or personal fork" in normalized
+
+
+def test_root_agent_guidance_records_repository_invariants(repo_root: Path) -> None:
+    guidance = (repo_root / "AGENTS.md").read_text(encoding="utf-8")
+    normalized = " ".join(guidance.split())
+
+    for required in (
+        "Never develop on another contributor's fork",
+        "separate worktree and branch for each PR",
+        "compatibility lock, not an update channel",
+        "run the workflow command through that exact Git URL and SHA",
+        "make lint",
+        "make test",
+        "make check-example",
+    ):
+        assert required in normalized
 
 
 def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:

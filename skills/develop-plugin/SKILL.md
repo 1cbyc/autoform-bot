@@ -7,23 +7,26 @@ description: >-
 
 # Develop Autoform from consumer nudges
 
-Treat Autoform as an example-based plugin installed in an
-independent formalization repository. Use the Cabannes thesis as an executable consumer example.
+Treat Autoform as an example-based plugin installed in independent Lean
+repositories. Use the Cabannes thesis only as an executable consumer.
 
 Inspect the worktree, state a consumer scenario, and observe installed behavior.
 Name a refactor's invariant.
 
-Treat user nudges during real work as product evidence. Distill reusable ones
-into the owning skill as a trigger, decision rule, and action.
-Ensure future agents need less steering.
-Preserve the insight, not the transcript or consumer choice.
-Add a focused test and acceptance assertion in `tests/test_skill_examples.py`.
+Distill consumer nudges into owning-skill decision rules and focused acceptance
+tests. Preserve reusable insight, not the transcript or one-off choice.
 
 Implement reusable plugin behavior. Keep Cabannes-specific facts in the example
 and references; demonstrate outcomes without special-casing them.
 
-Keep plugin and formalization roots distinct. Agents can infer routine details;
-keep shared agent entrypoints concise and link command/schema details as on-demand references.
+Keep plugin and formalization roots distinct. Keep shared agent entrypoints
+concise and link command/schema details as on-demand references.
+
+Treat bundled workflow SHAs as compatibility locks, not update channels. When
+the example needs newer behavior, update its canonical `facebookresearch`
+source and full SHA together, update mirror assertions, and run the example
+commands through that exact pin. Never substitute a branch, tag, or personal
+fork.
 
 Run focused checks, then normally run:
 
@@ -34,7 +37,6 @@ make check-example
 ```
 
 Run `lake build` when example Lean results change. Validate edited skills and
-the manifest with skill-creator and plugin-creator. Use cachebuster and reinstall
-only to test installed discovery in a new thread. Report outcome and checks.
+the manifest with skill-creator and plugin-creator. Report outcomes and checks.
 Treat rewritten private declaration safety as fail-closed evidence: correlate
 the official user name to its lexical declaration by source coordinates.
