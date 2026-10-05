@@ -160,11 +160,12 @@ def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tup
     followed, ending with the directory that holds the entry.  Lookups follow
     the kernel's rules: a relative target continues from the link's directory,
     an absolute one from ``/``, ``..`` is the parent of the directory reached
-    so far, a target ending in ``/`` or ``/.`` must be a directory, and one
-    lookup follows at most ``_MAX_SYMLINKS`` links.  Ancestors of ``root``
-    are identified by device and inode alone: inspection already trusts them
-    to lead to the same root, and entries coming and going in a home or
-    temporary directory are not a project change.
+    so far, a target ending in ``/`` or ``/.`` must be a directory, an empty
+    target names nothing, and one lookup follows at most ``_MAX_SYMLINKS``
+    links.  Ancestors of ``root`` are identified by device and inode alone:
+    inspection already trusts them to lead to the same root, and entries
+    coming and going in a home or temporary directory are not a project
+    change.
     """
 
     ancestors = set(root.parents)
@@ -192,6 +193,9 @@ def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tup
                 raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(root / relative))
             route.append(_node_identity(metadata))
             raw = os.readlink(candidate)
+            if not raw:
+                # Path("") reads as ".", but the kernel finds nothing there.
+                raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(candidate))
             target = Path(raw)
             # Path drops a trailing "/" or "/.", after which only a directory resolves.
             must_be_directory = ["."] if raw.endswith(("/", "/.")) else []

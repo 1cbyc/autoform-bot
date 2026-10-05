@@ -1436,7 +1436,7 @@ def test_file_replaced_by_fifo_between_stat_and_open_never_blocks(
 
     assert probe["switched"]
     # The swap lands in the descriptor-relative open wherever real runs use one.
-    assert probe["dir_fd"] == (os.open in os.supports_dir_fd)
+    assert probe["dir_fd"] == (os.open in os.supports_dir_fd and hasattr(os, "O_DIRECTORY"))
     assert not result["ok"]
     assert result["compatibility"]["status"] == "indeterminate"
     assert "unreadable-file" in {item["code"] for item in result["diagnostics"]}
@@ -1572,17 +1572,10 @@ def test_symlinked_lakefile_lean_takes_precedence_without_an_error(tmp_path: Pat
 @pytest.mark.parametrize("with_override", [False, True])
 def test_symlinked_lake_directory_is_followed_like_lake(tmp_path: Path, with_override: bool) -> None:
     root = _project(tmp_path)
-    (root / ".lake").mkdir()
     if with_override:
-        (root / ".lake/package-overrides.json").write_text(
-            json.dumps(
-                {
-                    "schemaVersion": "1.1.0",
-                    "packages": [{"name": "mathlib", "type": "path", "dir": "../mathlib4", "inherited": False}],
-                }
-            ),
-            encoding="utf-8",
-        )
+        _write_overrides(root, {"name": "mathlib", "type": "path", "dir": "../mathlib4", "inherited": False})
+    else:
+        (root / ".lake").mkdir()
     _move_behind_symlink(root, ".lake")
 
     result = inspect_project(root)
@@ -1927,16 +1920,7 @@ def test_directory_link_target_ending_in_a_slash_is_followed(tmp_path: Path, suf
     # Shell completion writes directory links as "../shared/.lake/", and the
     # kernel follows them like links without the slash.
     root = _project(tmp_path)
-    (root / ".lake").mkdir()
-    (root / ".lake/package-overrides.json").write_text(
-        json.dumps(
-            {
-                "schemaVersion": "1.1.0",
-                "packages": [{"name": "mathlib", "type": "path", "dir": "../mathlib4", "inherited": False}],
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_overrides(root, {"name": "mathlib", "type": "path", "dir": "../mathlib4", "inherited": False})
     target = _move_behind_symlink(root, ".lake")
     link = root / ".lake"
     link.unlink()
@@ -1948,6 +1932,32 @@ def test_directory_link_target_ending_in_a_slash_is_followed(tmp_path: Path, suf
     assert "unreadable-file" not in _codes(result)
     assert result.mathlib.source == ".lake/package-overrides.json"
     assert "mathlib-overridden" in _codes(result)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_link_through_a_link_with_an_empty_target_is_unreadable(tmp_path: Path) -> None:
+    # macOS creates a link with an empty target, and the kernel fails every
+    # lookup through it; Linux refuses to create one.
+    root = _project(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    try:
+        os.symlink("", elsewhere / "empty")
+    except OSError:
+        pytest.skip("this platform does not create links with an empty target")
+    (elsewhere / "real-toolchain").write_bytes((root / "lean-toolchain").read_bytes())
+    link = root / "lean-toolchain"
+    link.unlink()
+    link.symlink_to(elsewhere / "empty" / "real-toolchain")
+    with pytest.raises(FileNotFoundError):
+        link.read_bytes()
+
+    result = inspect_project(root)
+
+    assert [diagnostic.path for diagnostic in result.diagnostics if diagnostic.code == "unreadable-file"] == [
+        "lean-toolchain"
+    ]
+    assert "project-changed-during-inspection" not in _codes(result)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
