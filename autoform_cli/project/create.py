@@ -192,6 +192,9 @@ def create_project(
         stage_name = _create_stage(parent_descriptor)
         stage_descriptor = _open_directory(parent_descriptor, stage_name)
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
+        # A directory renamed into the stage name before the open is not the private, empty stage we made.
+        if stat.S_IMODE(os.fstat(stage_descriptor).st_mode) != 0o700 or _list_directory(stage_descriptor):
+            raise ProjectCreateError("project-create-failed", _FAILED_MESSAGE)
         _materialize_project(stage_descriptor, tree)
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
         # Templates may carry a root manifest; only a catalog release may publish one.

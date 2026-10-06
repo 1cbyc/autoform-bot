@@ -1297,6 +1297,38 @@ def test_stage_substitution_is_refused_before_writing(tmp_path: Path, monkeypatc
     assert not any(list(stage.iterdir()) for stage in stages)
 
 
+@pytest.mark.parametrize(("mode", "entries"), [(0o700, {"private.txt"}), (0o755, set())])
+def test_swapped_in_stage_directory_is_refused_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int, entries: set[str]
+) -> None:
+    target = tmp_path / "project"
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    for name in entries:
+        (decoy / name).write_text("private\n", encoding="utf-8")
+    decoy.chmod(mode)
+    original = create_module._open_directory
+
+    def swap_before_open(parent_descriptor: int, name: str) -> int:
+        if name.startswith(".autoform-new-") and decoy.exists():
+            (tmp_path / name).rename(tmp_path / "original-stage")
+            decoy.rename(tmp_path / name)
+        return original(parent_descriptor, name)
+
+    monkeypatch.setattr(create_module, "_open_directory", swap_before_open)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-create-failed"
+    assert ".autoform-new-* stage may remain" in raised.value.message
+    assert not target.exists()
+    (swapped,) = tmp_path.glob(".autoform-new-*")
+    assert stat.S_IMODE(swapped.stat().st_mode) == mode
+    assert {path.name for path in swapped.iterdir()} == entries
+    assert not list((tmp_path / "original-stage").iterdir())
+
+
 def test_failure_path_never_attempts_recursive_deletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
     original = create_module._materialize_project
