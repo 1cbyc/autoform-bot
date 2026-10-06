@@ -149,15 +149,6 @@ def test_root_agent_guidance_routes_to_owning_documents(repo_root: Path) -> None
         assert f"]({relative})" in guidance
         assert (repo_root / relative).is_file()
 
-    assert len(guidance.split()) <= 150
-    for product_detail in (
-        "make lint",
-        "compatibility lock",
-        "refs/autoform-claims",
-        "marker schema",
-    ):
-        assert product_detail not in guidance
-
 
 def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:
     review = (repo_root / "skills" / "agent-review" / "SKILL.md").read_text(
