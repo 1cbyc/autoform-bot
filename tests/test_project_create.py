@@ -192,9 +192,7 @@ def test_incomplete_local_templates_are_not_published(tmp_path: Path, monkeypatc
     _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
-def test_an_unlisted_pair_never_publishes_a_template_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_unlisted_pair_never_publishes_a_template_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     templates = tmp_path / "templates"
     shutil.copytree(create_module._TEMPLATES, templates)
     (templates / "lake-manifest.json").write_text('{"version": "1.1.0", "packages": []}\n', encoding="utf-8")
@@ -205,7 +203,9 @@ def test_an_unlisted_pair_never_publishes_a_template_manifest(
         create_project(target, package="Project", release_id=None, lean_toolchain="v4.30.0")
 
     assert raised.value.code == "project-create-validation-failed"
-    assert ".autoform-new-* stage may remain" in raised.value.message
+    assert raised.value.message == (
+        create_module._STAGED_MESSAGE + " An .autoform-new-* stage may remain; inspect it before removal."
+    )
     assert not target.exists()
     stages = list(tmp_path.glob(".autoform-new-*"))
     assert len(stages) == 1
@@ -1327,6 +1327,30 @@ def test_swapped_in_stage_directory_is_refused_before_writing(
     assert stat.S_IMODE(swapped.stat().st_mode) == mode
     assert {path.name for path in swapped.iterdir()} == entries
     assert not list((tmp_path / "original-stage").iterdir())
+
+
+def test_foreign_owned_stage_is_refused_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "project"
+    original = create_module._create_stage
+    euid = os.geteuid()
+
+    def foreign_stage(parent_descriptor: int) -> str:
+        name = original(parent_descriptor)
+        # From here on the stage looks like a directory another uid put in its place.
+        monkeypatch.setattr(create_module.os, "geteuid", lambda: euid + 1)
+        return name
+
+    monkeypatch.setattr(create_module, "_create_stage", foreign_stage)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-create-failed"
+    assert ".autoform-new-* stage may remain" in raised.value.message
+    assert not target.exists()
+    stages = list(tmp_path.glob(".autoform-new-*"))
+    assert len(stages) == 1
+    assert not list(stages[0].iterdir())
 
 
 def test_failure_path_never_attempts_recursive_deletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
