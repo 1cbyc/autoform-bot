@@ -116,6 +116,15 @@ Markdown DAG, builds Lean, rejects unfinished or unsafe proofs, and audits
 theorem axioms on pull requests, and `blueprint-pages.yml`, which validates the
 DAG and its `lean:` declarations, renders the blueprint, builds MkDocs, and
 deploys GitHub Pages. Pass `--autoform-ref` to pin them at an immutable commit.
+Alongside them it writes `.github/CODEOWNERS` with its rules commented out. It
+leaves the file out when the repository already has a `CODEOWNERS` or
+`docs/CODEOWNERS`, which the new file would hide; the two rules belong in that
+file instead. Until a maintainer names the owners, uncomments the rules, and
+requires code-owner review for the default branch, a pull request can change
+the `open_statements` policy or the CI in the same change as the work they
+check and merge without a code owner's approval. Say so when reporting the
+workflows, and do not guess owners: fill them in only with names the user
+gives.
 
 After it runs, fill in what only a human or a source can supply: the project
 description in `blueprint/README.md`, the coverage contract, and a verified

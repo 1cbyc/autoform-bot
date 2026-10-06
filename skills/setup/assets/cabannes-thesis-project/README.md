@@ -19,6 +19,9 @@ Developed with [AutoformBot](https://github.com/facebookresearch/autoform-bot).
   deterministic, path-free `publication.json` manifest.
 - `autoform-verify.yml` validates the DAG and Lean project on pull requests.
 - `blueprint-pages.yml` renders and deploys the blueprint with GitHub Pages.
+- `.github/CODEOWNERS` lists the CI and the roadmap's `open_statements` policy
+  for code-owner review, with its rules commented out until a maintainer names
+  the owners.
 
 The DAG deliberately shows a partial state: the Full Supervision support
 chapter is proved, Infimum Loss is ready to state, and the stronger

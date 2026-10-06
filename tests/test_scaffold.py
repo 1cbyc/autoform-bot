@@ -24,6 +24,7 @@ from autoform_cli.graph import load_graph
 from autoform_cli.scaffold import ScaffoldError, scaffold_project
 
 _EXPECTED = {
+    ".github/CODEOWNERS",
     ".github/autoform_audit.py",
     ".github/workflows/autoform-verify.yml",
     ".github/workflows/blueprint-pages.yml",
@@ -763,6 +764,71 @@ def test_a_ref_alone_restores_ci(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     verify = (tmp_path / ".github/workflows/autoform-verify.yml").read_text(encoding="utf-8")
     assert f"AUTOFORM_SOURCE: {json.dumps(scaffold_module.DEFAULT_AUTOFORM_SOURCE)}" in verify
     assert f'AUTOFORM_REF: "{"2" * 40}"' in verify
+
+
+def test_codeowners_names_no_owner_until_a_maintainer_does(tmp_path: Path) -> None:
+    """The tool cannot know who maintains a project, so it writes no active rule."""
+    scaffold_project(
+        tmp_path,
+        title="Finite Flat",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="1" * 40,
+    )
+    lines = (tmp_path / ".github/CODEOWNERS").read_text(encoding="utf-8").splitlines()
+
+    assert all(not line.strip() or line.startswith("#") for line in lines)
+    assert lines[-2:] == ["# /blueprint/roadmap/README.md @OWNER", "# /.github/ @OWNER"]
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("existing", ["CODEOWNERS", "docs/CODEOWNERS"])
+def test_codeowners_is_left_out_when_the_repository_keeps_one_elsewhere(
+    existing: str, force: bool, tmp_path: Path
+) -> None:
+    """GitHub reads only the first CODEOWNERS it finds, starting with .github/.
+
+    An all-comment .github/CODEOWNERS beside a populated root or docs/ file
+    would silently switch off every owner rule the repository already has.
+    """
+    (tmp_path / existing).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / existing).write_text("* @existing-owner\n", encoding="utf-8")
+
+    result = scaffold_project(
+        tmp_path,
+        title="Finite Flat",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="1" * 40,
+        force=force,
+    )
+
+    assert ".github/CODEOWNERS" in result.skipped
+    assert not (tmp_path / ".github/CODEOWNERS").exists()
+    assert (tmp_path / existing).read_text(encoding="utf-8") == "* @existing-owner\n"
+    assert (tmp_path / ".github/workflows/autoform-verify.yml").is_file()
+
+
+def test_cli_says_why_it_left_codeowners_out(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from autoform_cli.__main__ import main
+
+    (tmp_path / "CODEOWNERS").write_text("* @existing-owner\n", encoding="utf-8")
+    assert (
+        main(
+            [
+                "init",
+                str(tmp_path),
+                "--title",
+                "Finite Flat",
+                "--autoform-source",
+                "https://example.test/autoform.git",
+                "--autoform-ref",
+                "1" * 40,
+            ]
+        )
+        == 0
+    )
+
+    out = capsys.readouterr().out
+    assert "  = .github/CODEOWNERS (another CODEOWNERS exists, which this would hide)" in out
 
 
 @pytest.mark.parametrize("ref", ["main", "0f018613", "v1.0.0", "2" * 39, ("2" * 39) + "Z"])

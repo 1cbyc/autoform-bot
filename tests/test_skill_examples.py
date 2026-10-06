@@ -848,6 +848,9 @@ def test_example_workflows_match_the_scaffold_templates(repo_root: Path) -> None
     assert (
         repo_root / "autoform_cli/templates/github/autoform_audit.py"
     ).read_bytes() == (repo_root / _EXAMPLE / ".github/autoform_audit.py").read_bytes()
+    assert (
+        repo_root / "autoform_cli/templates/github/CODEOWNERS"
+    ).read_bytes() == (repo_root / _EXAMPLE / ".github/CODEOWNERS").read_bytes()
 
     for name in ("autoform-verify.yml", "blueprint-pages.yml"):
         expected = (template_dir / name).read_text(encoding="utf-8")

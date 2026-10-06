@@ -1,0 +1,23 @@
+# Code owners for this Autoform project.
+#
+# Two paths decide what CI checks, and a pull request can change them along
+# with the work under review:
+#
+#   /blueprint/roadmap/README.md  its open_statements setting decides whether
+#                                 a theorem may merge with a sorry proof
+#   /.github/                     the workflows, the audit script, and this file
+#
+# To use the rules, replace @OWNER with GitHub users, or visible teams, that
+# have write access to the repository, and uncomment them. GitHub then asks
+# those owners to review pull requests that change these paths. A merge waits
+# for their approval only once a branch protection rule or an active ruleset
+# for the default branch turns on "Require a pull request before merging",
+# "Require review from Code Owners", and "Dismiss stale pull request
+# approvals when new commits are pushed".
+#
+# GitHub reads only the first of .github/CODEOWNERS, CODEOWNERS and
+# docs/CODEOWNERS that exists. A project that keeps its rules in one of the
+# others should add these two lines there and delete this file.
+
+# /blueprint/roadmap/README.md @OWNER
+# /.github/ @OWNER

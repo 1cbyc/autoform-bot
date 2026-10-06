@@ -62,6 +62,7 @@ _REQUIRED_TEMPLATE_PATHS = frozenset(
         "blueprint/javascripts/mathjax.js",
         "blueprint/roadmap/README.md",
         "blueprint/sources/README.md",
+        "github/CODEOWNERS",
         "github/autoform_audit.py",
         "github/workflows/autoform-verify.yml",
         "github/workflows/blueprint-pages.yml",
@@ -1147,6 +1148,14 @@ def scaffold_project(
                 raise ScaffoldError(
                     [f"refusing to write outside the project through a link: {probe}"]
                 )
+        # GitHub reads only the first of .github/CODEOWNERS, CODEOWNERS and
+        # docs/CODEOWNERS that exists, so this all-comment file would switch
+        # off the owners a repository already keeps in one of the others.
+        if planned_file.relative == ".github/CODEOWNERS" and any(
+            (root / other).exists() for other in ("CODEOWNERS", "docs/CODEOWNERS")
+        ):
+            skipped.append(planned_file.relative)
+            continue
         if destination.exists() and not force:
             if planned_file.relative == ".gitignore":
                 if _append_gitignore_rules(destination, planned_file.content):

@@ -927,13 +927,37 @@ fails with `kernel replay of the root package failed: ...`, which names the
 first one; the workflow's scan for the kernel-check bypass option is only
 lexical.
 
-The replay does not cover build-time IO. A root module's initializer or
-`run_cmd` runs during `lake build`, and its initializers run again when the
-probe imports it, so it can rewrite the audit script, the workflow's inputs, or
-the blueprint before the audit reads them. Closing that needs a separate audit
-job that runs no project code, plus CODEOWNERS on `roadmap/README.md` and
-`.github/`; that is a governance decision for each project's maintainers, and
-the generated workflow does neither.
+The replay does not cover project code that runs during the audit. Lean runs
+project code while it builds and again when the probe imports the build: a
+root module's `run_cmd` or `#eval` runs during `lake build`, and the
+initializers of every module the probe imports, directly or not, run inside the
+probe's own `lean` process before its first command. That code can rewrite the
+audit script, the workflow's inputs, or the blueprint before the audit reads
+them, or end the probe with exit status 0, which the step takes as a pass. The
+probe's own commands are also elaborated against every module it imports, so
+an instance, macro, or elaborator from one of them can change what the checks
+compute without any IO: an ordinary instance can make the probe skip a
+declaration and still print its success line. Closing these needs a separate
+audit job that runs no project code and does not elaborate its checks against
+the project's modules; the generated workflow does not have one. The replay
+also covers only the root package: a dependency's declarations are imported as
+built, not replayed.
+
+`autoform init` writes `.github/CODEOWNERS` alongside the workflows, with its
+rules commented out. A pull request can change `blueprint/roadmap/README.md`,
+whose `open_statements` setting decides whether a theorem may land with a
+`sorry` proof, or the workflows and the audit script, in the same change as the
+work they check. To make those changes wait for a maintainer, replace `@OWNER`
+with GitHub users or visible teams that have write access to the repository,
+uncomment the rules, and turn on "Require a pull request before merging",
+"Require review from Code Owners", and "Dismiss stale pull request approvals
+when new commits are pushed" in a branch protection rule or an active ruleset
+for the default branch. Without the last setting, an approval also covers
+commits pushed after it. GitHub reads only the first of `.github/CODEOWNERS`,
+`CODEOWNERS`, and `docs/CODEOWNERS` that exists, so `init` leaves out
+`.github/CODEOWNERS` when either of the others exists; add the two rules there
+instead. These rules put changes to those files in front of a code owner; they
+do not stop project code from changing them on the runner during a build.
 
 The step runs `autoform work assumptions` from `AUTOFORM_REF`, and the earlier
 `autoform check` step validates the frontmatter with that same pin. Scaffolded
