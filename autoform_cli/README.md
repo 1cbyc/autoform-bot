@@ -954,12 +954,12 @@ the rules there, replace `@OWNER`, and uncomment them. Consider rules for the
 Lean build controls too: the Lake configuration, `lean-toolchain`, and
 `lake-manifest.json` decide what CI compiles.
 
-GitHub reads CODEOWNERS from a pull request's base branch, so the pull request
-that activates the rules still needs explicit maintainer review. Then require
-pull requests and code-owner review, dismiss stale approvals after new commits,
-and audit every branch-protection or ruleset bypass. These rules put changes in
-front of an owner; they do not stop project code from changing files on the CI
-runner.
+GitHub reads CODEOWNERS from a pull request's base branch, so new rules cannot
+protect their own activation unless equivalent coverage already exists there.
+Review that change explicitly. Then require pull requests and code-owner
+review, dismiss stale approvals after new commits, and audit every
+branch-protection or ruleset bypass. These rules put changes in front of an
+owner; they do not stop project code from changing files on the CI runner.
 
 The step runs `autoform work assumptions` from `AUTOFORM_REF`, and the earlier
 `autoform check` step validates the frontmatter with that same pin. Scaffolded

@@ -749,6 +749,23 @@ def test_no_ci_rather_than_a_guessed_pin(tmp_path: Path, monkeypatch: pytest.Mon
     assert (tmp_path / "mkdocs.yml").is_file()
 
 
+def test_unpinned_rerun_reports_the_inert_example_as_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from autoform_cli.__main__ import main
+
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda _templates=None: ("", ""))
+    args = ["init", str(tmp_path), "--title", "Finite Flat"]
+    assert main(args) == 0
+    capsys.readouterr()
+
+    assert main(args) == 0
+    output = capsys.readouterr().out
+
+    assert "= .github/CODEOWNERS.autoform.example (exists, left alone)" in output
+    assert "= .github/autoform_audit.py (no Autoform ref to pin)" in output
+
+
 def test_a_ref_alone_restores_ci(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The commit is the unguessable half; the repository has a sane default.
 
