@@ -18,12 +18,7 @@ import pytest
 from autoform_cli import scaffold as scaffold_module
 from autoform_cli.__main__ import main
 from autoform_cli.graph import load_graph
-from autoform_cli.project import (
-    ProjectCreateError,
-    create_project,
-    inspect_project,
-    load_release_catalog,
-)
+from autoform_cli.project import ProjectCreateError, create_project, inspect_project, load_release_catalog
 from autoform_cli.project import create as create_module
 from autoform_cli.scaffold import DEFAULT_AUTOFORM_SOURCE
 
@@ -98,19 +93,12 @@ def test_workflow_pin_resolution(
 
 @pytest.mark.parametrize(
     ("source", "revision"),
-    [
-        ("", ""),
-        ("https://user:secret@example.test/owner/autoform.git", "b" * 40),
-        (_SOURCE, "main"),
-        ("", "b" * 40),
-    ],
+    [("", ""), ("https://user:secret@example.test/owner/autoform.git", "b" * 40), (_SOURCE, "main"), ("", "b" * 40)],
 )
 def test_creation_omits_workflows_without_a_usable_checkout_pin(
     source: str, revision: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        scaffold_module, "plugin_pin", lambda _templates=None: (source, revision)
-    )
+    monkeypatch.setattr(scaffold_module, "plugin_pin", lambda _templates=None: (source, revision))
     target = tmp_path / "Project"
 
     result = create_project(target, package="Project", release_id=_RELEASE)
@@ -119,9 +107,7 @@ def test_creation_omits_workflows_without_a_usable_checkout_pin(
     assert not (target / ".github").exists()
 
 
-def test_an_explicit_source_never_inherits_the_checkout_commit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_explicit_source_never_inherits_the_checkout_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def forbidden(*_args, **_kwargs):
         raise AssertionError("an explicit source consulted the checkout pin")
 
@@ -145,21 +131,11 @@ def test_an_explicit_source_never_inherits_the_checkout_commit(
         ("", "1" * 12),
     ],
 )
-def test_creation_rejects_an_invalid_workflow_pin_before_writing(
-    source: str, revision: str, tmp_path: Path
-) -> None:
-    _refused(
-        tmp_path / "Project",
-        "project-workflow-pin-invalid",
-        autoform_source=source,
-        autoform_ref=revision,
-    )
+def test_creation_rejects_an_invalid_workflow_pin_before_writing(source: str, revision: str, tmp_path: Path) -> None:
+    _refused(tmp_path / "Project", "project-workflow-pin-invalid", autoform_source=source, autoform_ref=revision)
 
 
-@pytest.mark.parametrize(
-    "versions",
-    [{"release_id": _RELEASE}, {"release_id": None, "lean_toolchain": "v4.30.0"}],
-)
+@pytest.mark.parametrize("versions", [{"release_id": _RELEASE}, {"release_id": None, "lean_toolchain": "v4.30.0"}])
 def test_creation_with_an_explicit_pin_stays_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, versions: dict[str, str | None]
 ) -> None:
@@ -198,9 +174,7 @@ def test_creation_with_an_explicit_pin_stays_offline(
     assert result.workflows_pinned
 
 
-def test_unsafe_local_templates_use_the_project_error_contract(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unsafe_local_templates_use_the_project_error_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     templates = tmp_path / "templates"
     templates.mkdir()
     (templates / "escape").symlink_to(tmp_path / "missing")
@@ -209,9 +183,7 @@ def test_unsafe_local_templates_use_the_project_error_contract(
     _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
-def test_incomplete_local_templates_are_not_published(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_incomplete_local_templates_are_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     templates = tmp_path / "templates"
     shutil.copytree(create_module._TEMPLATES, templates)
     (templates / "theme/main.html").unlink()
@@ -233,11 +205,7 @@ def test_group_writable_installed_templates_publish_canonical_modes(
     monkeypatch.setattr(create_module, "_TEMPLATES", templates)
 
     result = create_project(
-        target,
-        package="Project",
-        release_id=_RELEASE,
-        autoform_source=_SOURCE,
-        autoform_ref="a" * 40,
+        target, package="Project", release_id=_RELEASE, autoform_source=_SOURCE, autoform_ref="a" * 40
     )
 
     modes = {relative: stat.S_IMODE((target / relative).stat().st_mode) for relative in result.written}
@@ -245,17 +213,13 @@ def test_group_writable_installed_templates_publish_canonical_modes(
     assert set(modes.values()) == {0o644}
 
 
-def test_missing_release_manifest_is_not_published(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_missing_release_manifest_is_not_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     release = load_release_catalog().recommended
     descriptor = create_module._load_creation_release_descriptor(release)
     monkeypatch.setattr(
         create_module,
         "_load_creation_release_descriptor",
-        lambda _release: replace(
-            descriptor, manifest_resource="missing-release-manifest.json"
-        ),
+        lambda _release: replace(descriptor, manifest_resource="missing-release-manifest.json"),
     )
 
     _refused(tmp_path / "Project", "project-create-validation-failed")
@@ -403,21 +367,13 @@ def test_release_metadata_must_cover_manifest_and_mathlib_production_roots(
 ) -> None:
     release = load_release_catalog().recommended
     descriptor = create_module._load_creation_release_descriptor(release)
-    changed = replace(
-        descriptor,
-        module_roots=tuple(root for root in descriptor.module_roots if root != missing),
-    )
-    monkeypatch.setattr(
-        create_module, "_load_creation_release_descriptor", lambda _release: changed
-    )
+    changed = replace(descriptor, module_roots=tuple(root for root in descriptor.module_roots if root != missing))
+    monkeypatch.setattr(create_module, "_load_creation_release_descriptor", lambda _release: changed)
 
     _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
-@pytest.mark.parametrize(
-    "corruption",
-    ["top-level-key", "revision", "credentials", "traversal", "inherited-type"],
-)
+@pytest.mark.parametrize("corruption", ["top-level-key", "revision", "credentials", "traversal", "inherited-type"])
 def test_release_bundle_rejects_non_generated_manifest_shapes(corruption: str) -> None:
     release = load_release_catalog().recommended
     descriptor = create_module._load_creation_release_descriptor(release)
@@ -435,9 +391,7 @@ def test_release_bundle_rejects_non_generated_manifest_shapes(corruption: str) -
         payload["packages"][1]["inherited"] = 1
 
     with pytest.raises(ProjectCreateError) as raised:
-        create_module._parse_release_bundle(
-            json.dumps(payload).encode(), release, descriptor.module_roots
-        )
+        create_module._parse_release_bundle(json.dumps(payload).encode(), release, descriptor.module_roots)
 
     assert raised.value.code == "project-create-validation-failed"
 
@@ -464,9 +418,7 @@ def test_open_parent_descriptor_rechecks_the_generated_module_filename_limit(
     name_limit = os.pathconf(tmp_path, "PC_NAME_MAX")
     suffix_bytes = len(create_module._LONGEST_LAKE_ARTIFACT_SUFFIX.encode("ascii"))
     package = "A" * (name_limit - suffix_bytes + 1)
-    monkeypatch.setattr(
-        create_module, "_validate_package", lambda _package, _parent: package
-    )
+    monkeypatch.setattr(create_module, "_validate_package", lambda _package, _parent: package)
 
     _refused(tmp_path / "project", "project-name-invalid", package=package)
 
@@ -530,9 +482,7 @@ def test_unlisted_pair_is_written_without_a_lock(tmp_path: Path) -> None:
 def test_unlisted_pair_threads_the_mathlib_revision(tmp_path: Path, toolchain: str, revision: str) -> None:
     target = tmp_path / "Project"
 
-    result = create_project(
-        target, package="Project", release_id=None, lean_toolchain=toolchain, mathlib_rev=revision
-    )
+    result = create_project(target, package="Project", release_id=None, lean_toolchain=toolchain, mathlib_rev=revision)
 
     assert result.release is None
     assert result.mathlib_rev == revision
@@ -720,21 +670,7 @@ def test_embedded_nul_target_uses_the_stable_error_contract(tmp_path: Path, caps
         create_project(target, package="Project", release_id=_RELEASE)
     assert raised.value.code == "project-target-invalid"
 
-    assert (
-        main(
-            [
-                "project",
-                "new",
-                target,
-                "--package",
-                "Project",
-                "--release",
-                _RELEASE,
-                "--json",
-            ]
-        )
-        == 1
-    )
+    assert main(["project", "new", target, "--package", "Project", "--release", _RELEASE, "--json"]) == 1
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "project-target-invalid"
 
 
@@ -807,9 +743,7 @@ def test_rejects_nonsticky_shared_parent(tmp_path: Path) -> None:
     assert raised.value.code == "project-parent-unsafe"
 
 
-def test_rechecks_parent_mode_on_the_open_descriptor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_rechecks_parent_mode_on_the_open_descriptor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     parent = tmp_path / "shared"
     parent.mkdir(mode=0o777)
     parent.chmod(0o777)
@@ -819,9 +753,7 @@ def test_rechecks_parent_mode_on_the_open_descriptor(
     assert "chmod g-w,o-w" in _refused(target, "project-parent-unsafe").message
 
 
-def test_sticky_shared_parent_requires_a_trusted_descriptor_owner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_sticky_shared_parent_requires_a_trusted_descriptor_owner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(create_module.os, "geteuid", lambda: 1000)
     mode = stat.S_IFDIR | stat.S_ISVTX | 0o777
 
@@ -836,9 +768,7 @@ def test_fresh_parent_binding_compares_owner_as_well_as_device_and_inode(
     descriptor = create_module._open_parent(tmp_path)
     expected = create_module._descriptor_identity(descriptor)
     monkeypatch.setattr(
-        create_module,
-        "_descriptor_identity",
-        lambda _descriptor: (expected[0], expected[1], expected[2] + 1),
+        create_module, "_descriptor_identity", lambda _descriptor: (expected[0], expected[1], expected[2] + 1)
     )
     try:
         with pytest.raises(ProjectCreateError) as raised:
@@ -852,9 +782,7 @@ def test_fresh_parent_binding_compares_owner_as_well_as_device_and_inode(
 def test_missing_directory_capability_uses_stable_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
     monkeypatch.setattr(
-        create_module.os,
-        "supports_dir_fd",
-        create_module.os.supports_dir_fd - {create_module.os.mkdir},
+        create_module.os, "supports_dir_fd", create_module.os.supports_dir_fd - {create_module.os.mkdir}
     )
 
     _refused(target, "project-create-safety-unavailable")
@@ -1100,10 +1028,7 @@ def test_publication_capability_error_remains_actionable(tmp_path: Path, monkeyp
     target = tmp_path / "project"
 
     def unavailable(*args):
-        raise ProjectCreateError(
-            "project-create-safety-unavailable",
-            "Atomic no-replace rename is unavailable.",
-        )
+        raise ProjectCreateError("project-create-safety-unavailable", "Atomic no-replace rename is unavailable.")
 
     monkeypatch.setattr(create_module, "_rename_noreplace", unavailable)
 
@@ -1116,9 +1041,7 @@ def test_publication_capability_error_remains_actionable(tmp_path: Path, monkeyp
     assert len(list(tmp_path.glob(".autoform-new-*"))) == 1
 
 
-def test_unsupported_rename_flag_uses_capability_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_unsupported_rename_flag_uses_capability_error(monkeypatch: pytest.MonkeyPatch) -> None:
     class FailingRename:
         argtypes = None
         restype = None
@@ -1158,8 +1081,7 @@ def test_late_target_race_remains_distinguishable(tmp_path: Path, monkeypatch: p
 
 
 @pytest.mark.skipif(
-    os.name != "posix" or not hasattr(os, "O_DIRECTORY"),
-    reason="atomic no-replace publication is POSIX-only",
+    os.name != "posix" or not hasattr(os, "O_DIRECTORY"), reason="atomic no-replace publication is POSIX-only"
 )
 def test_real_noreplace_syscall_preserves_a_late_existing_target(tmp_path: Path) -> None:
     source = tmp_path / "stage"
@@ -1253,8 +1175,7 @@ def test_postpublish_parent_recheck_failure_does_not_claim_a_rebind(
         calls += 1
         if calls == 2:
             raise ProjectCreateError(
-                "project-parent-unverifiable",
-                "The requested parent path could not be reverified safely.",
+                "project-parent-unverifiable", "The requested parent path could not be reverified safely."
             )
         return original(path, expected_identity)
 
@@ -1605,25 +1526,10 @@ def test_cli_omitted_workflows_hint_keeps_an_explicit_source(tmp_path: Path, cap
     )
 
 
-def test_cli_omitted_workflows_hint_cannot_become_a_multiline_diagnostic(
-    tmp_path: Path, capsys
-) -> None:
+def test_cli_omitted_workflows_hint_cannot_become_a_multiline_diagnostic(tmp_path: Path, capsys) -> None:
     target = tmp_path / "Project\nforged-warning"
 
-    assert (
-        main(
-            [
-                "project",
-                "new",
-                os.fspath(target),
-                "--package",
-                "Project",
-                "--release",
-                _RELEASE,
-            ]
-        )
-        == 0
-    )
+    assert main(["project", "new", os.fspath(target), "--package", "Project", "--release", _RELEASE]) == 0
 
     captured = capsys.readouterr()
     assert captured.err.count("\n") == 1
@@ -1633,21 +1539,7 @@ def test_cli_omitted_workflows_hint_cannot_become_a_multiline_diagnostic(
 
 def test_cli_json_is_stable_and_path_free(tmp_path: Path, capsys) -> None:
     target = tmp_path / "project"
-    assert (
-        main(
-            [
-                "project",
-                "new",
-                str(target),
-                "--package",
-                "Project",
-                "--release",
-                _RELEASE,
-                "--json",
-            ]
-        )
-        == 0
-    )
+    assert main(["project", "new", str(target), "--package", "Project", "--release", _RELEASE, "--json"]) == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert payload["ok"] is True
@@ -1656,21 +1548,7 @@ def test_cli_json_is_stable_and_path_free(tmp_path: Path, capsys) -> None:
     assert captured.err == ""
 
     duplicate = tmp_path / "project"
-    assert (
-        main(
-            [
-                "project",
-                "new",
-                str(duplicate),
-                "--package",
-                "Project",
-                "--release",
-                _RELEASE,
-                "--json",
-            ]
-        )
-        == 1
-    )
+    assert main(["project", "new", str(duplicate), "--package", "Project", "--release", _RELEASE, "--json"]) == 1
     failed = capsys.readouterr()
     assert json.loads(failed.out)["error"]["code"] == "project-target-exists"
     assert failed.err == ""
@@ -1679,11 +1557,7 @@ def test_cli_json_is_stable_and_path_free(tmp_path: Path, capsys) -> None:
 @pytest.mark.skipif(os.name != "posix", reason="project creation is POSIX-only")
 def test_cli_postcommit_output_is_ascii_and_backslash_safe(tmp_path: Path) -> None:
     target = tmp_path / "cr\N{LATIN SMALL LETTER E WITH ACUTE}ation\\line\nbreak"
-    environment = {
-        **os.environ,
-        "PYTHONIOENCODING": "ascii:strict",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
+    environment = {**os.environ, "PYTHONIOENCODING": "ascii:strict", "PYTHONDONTWRITEBYTECODE": "1"}
     completed = subprocess.run(
         [
             sys.executable,
@@ -1796,9 +1670,7 @@ def test_pair_matching_the_catalog_in_one_component_stays_unlisted(
 ) -> None:
     target = tmp_path / "Project"
 
-    result = create_project(
-        target, package="Project", release_id=None, lean_toolchain=toolchain, mathlib_rev=revision
-    )
+    result = create_project(target, package="Project", release_id=None, lean_toolchain=toolchain, mathlib_rev=revision)
 
     assert result.release is None
     assert [code for code, _message in result.warnings] == ["project-release-unlisted"]
@@ -1815,9 +1687,7 @@ def test_pair_matching_the_catalog_in_one_component_stays_unlisted(
         ({"release_id": None, "mathlib_rev": ""}, "project-version-invalid"),
     ],
 )
-def test_empty_version_options_are_not_defaults(
-    tmp_path: Path, versions: dict[str, str | None], code: str
-) -> None:
+def test_empty_version_options_are_not_defaults(tmp_path: Path, versions: dict[str, str | None], code: str) -> None:
     _refused(tmp_path / "Project", code, **versions)
 
 
@@ -1832,10 +1702,7 @@ def test_version_conflict_and_floor_messages_name_the_problem(tmp_path: Path) ->
     assert "leanprover/lean4:v4.26.0" in message
 
 
-@pytest.mark.parametrize(
-    "toolchain",
-    ["v4." + "1" * 4301 + ".0", "v4.1234567890.0", "v4.30.0-rc1234567890"],
-)
+@pytest.mark.parametrize("toolchain", ["v4." + "1" * 4301 + ".0", "v4.1234567890.0", "v4.30.0-rc1234567890"])
 def test_oversized_version_components_are_invalid_not_a_crash(tmp_path: Path, toolchain: str) -> None:
     error = _refused(
         tmp_path / "Project", "project-version-invalid", release_id=None, lean_toolchain=toolchain, mathlib_rev="master"
@@ -1904,9 +1771,7 @@ def test_unreadable_parent_is_inaccessible_not_a_symlink(tmp_path: Path) -> None
     [(0o600, "read and search permission"), (0o400, "read and search permission"), (0o500, "write permission")],
     ids=["unsearchable", "read-only-unsearchable", "unwritable"],
 )
-def test_parent_permission_failures_name_the_missing_permission(
-    tmp_path: Path, capsys, mode: int, needed: str
-) -> None:
+def test_parent_permission_failures_name_the_missing_permission(tmp_path: Path, capsys, mode: int, needed: str) -> None:
     parent = tmp_path / "parent"
     parent.mkdir(mode=0o700)
     target = os.fspath(parent / "Project")
@@ -1942,8 +1807,7 @@ def test_missing_or_non_directory_parent_is_a_stable_error(tmp_path: Path, relat
 
 
 @pytest.mark.parametrize(
-    ("component", "code"),
-    [("missing", "project-parent-missing"), ("overlong", "project-create-failed")],
+    ("component", "code"), [("missing", "project-parent-missing"), ("overlong", "project-create-failed")]
 )
 def test_open_parent_classifies_lookup_failures(tmp_path: Path, component: str, code: str) -> None:
     name = "p" * (os.pathconf(tmp_path, "PC_NAME_MAX") + 1) if component == "overlong" else component
@@ -1964,9 +1828,7 @@ def test_overlong_parent_component_is_a_stable_error(tmp_path: Path) -> None:
     assert raised.value.code == "project-parent-invalid"
 
 
-def test_symlinked_parent_at_open_is_reported_as_a_link(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_symlinked_parent_at_open_is_reported_as_a_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     real = tmp_path / "real"
     real.mkdir(mode=0o700)
     link = tmp_path / "link"
@@ -2127,12 +1989,7 @@ def test_cli_interrupt_reports_the_possible_stage(
     ids=["after-publication", "target-already-existed"],
 )
 def test_cli_interrupt_says_whether_the_target_appeared(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys,
-    existing: bool,
-    interrupted: str,
-    expected: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, existing: bool, interrupted: str, expected: str
 ) -> None:
     def interrupt(*_args, **_kwargs) -> None:
         raise KeyboardInterrupt
@@ -2178,8 +2035,7 @@ def test_cli_human_errors_go_to_stderr(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == (
-        "error[project-version-invalid]: "
-        "Choose a catalog release or a Lean toolchain and Mathlib revision, not both.\n"
+        "error[project-version-invalid]: Choose a catalog release or a Lean toolchain and Mathlib revision, not both.\n"
     )
 
 
