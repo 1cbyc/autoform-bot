@@ -1308,6 +1308,59 @@ def test_revision_impact_refuses_a_roadmap_that_changes_during_the_probe(
         revision_impact(project, "chapter/base", lean_root=lean_root)
 
 
+def test_revision_impact_refuses_project_controls_changed_during_library_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _blueprint_project(tmp_path, "Demo")
+    lean_root = _stub_lean_root(tmp_path)
+    calls = _stub_probe(monkeypatch)
+    original = lean_libraries
+
+    def read_then_change(root: Path):
+        libraries = original(root)
+        lakefile = root / "lakefile.toml"
+        lakefile.write_text(
+            lakefile.read_text(encoding="utf-8") + '\nmoreLeanArgs = ["-Dchanged=true"]\n',
+            encoding="utf-8",
+        )
+        return libraries
+
+    monkeypatch.setattr("autoform_cli.impact.lean_libraries", read_then_change)
+
+    with pytest.raises(
+        ImpactError,
+        match="^the Lake project controls changed while library inventory was read; rebuild and rerun the command$",
+    ):
+        revision_impact(project, "chapter/base", lean_root=lean_root)
+    assert calls == []
+
+
+def test_revision_impact_refuses_project_controls_changed_during_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _blueprint_project(tmp_path, "Demo")
+    lean_root = _stub_lean_root(tmp_path)
+    _stub_probe(monkeypatch)
+    original = skeleton.run_probe
+
+    def run_then_change(*args, **kwargs):
+        output = original(*args, **kwargs)
+        lakefile = lean_root / "lakefile.toml"
+        lakefile.write_text(
+            lakefile.read_text(encoding="utf-8") + '\nmoreLeanArgs = ["-Dchanged=true"]\n',
+            encoding="utf-8",
+        )
+        return output
+
+    monkeypatch.setattr("autoform_cli.skeleton.run_probe", run_then_change)
+
+    with pytest.raises(
+        ImpactError,
+        match="^the Lake project controls changed while the impact probe ran; rebuild and rerun the command$",
+    ):
+        revision_impact(project, "chapter/base", lean_root=lean_root)
+
+
 def test_revision_impact_refuses_lean_sources_that_change_during_the_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
