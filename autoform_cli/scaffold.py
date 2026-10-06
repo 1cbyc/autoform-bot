@@ -1150,9 +1150,13 @@ def scaffold_project(
                 )
         # GitHub reads only the first of .github/CODEOWNERS, CODEOWNERS and
         # docs/CODEOWNERS that exists, so this all-comment file would switch
-        # off the owners a repository already keeps in one of the others.
-        if planned_file.relative == ".github/CODEOWNERS" and any(
-            (root / other).exists() for other in ("CODEOWNERS", "docs/CODEOWNERS")
+        # off the owners a repository already keeps in one of the others. It
+        # would do the same in place of an existing .github/CODEOWNERS, so not
+        # even --force replaces one. A directory of either other name is not a
+        # CODEOWNERS file and holds no rules.
+        if planned_file.relative == ".github/CODEOWNERS" and (
+            destination.exists()
+            or any((root / other).is_file() for other in ("CODEOWNERS", "docs/CODEOWNERS"))
         ):
             skipped.append(planned_file.relative)
             continue

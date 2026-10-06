@@ -1,11 +1,16 @@
 # Code owners for this Autoform project.
 #
-# Two paths decide what CI checks, and a pull request can change them along
-# with the work under review:
+# Two Autoform control paths decide what CI accepts, and a pull request can
+# change them along with the work under review:
 #
 #   /blueprint/roadmap/README.md  its open_statements setting decides whether
 #                                 a theorem may merge with a sorry proof
 #   /.github/                     the workflows, the audit script, and this file
+#
+# The Lean project's own build controls decide what CI compiles: its Lake
+# configuration (lakefile.toml or lakefile.lean), lean-toolchain, and
+# lake-manifest.json. Add rules for them too if their changes should wait
+# for an owner.
 #
 # To use the rules, replace @OWNER with GitHub users, or visible teams, that
 # have write access to the repository, and uncomment them. GitHub then asks
@@ -13,7 +18,14 @@
 # for their approval only once a branch protection rule or an active ruleset
 # for the default branch turns on "Require a pull request before merging",
 # "Require review from Code Owners", and "Dismiss stale pull request
-# approvals when new commits are pushed".
+# approvals when new commits are pushed", and then only for those the rule
+# does not exempt. A branch protection rule exempts repository administrators
+# and custom roles with the "bypass branch protections" permission unless "Do
+# not allow bypassing the above settings" is on, and exempts anyone listed
+# under "Allow specified actors to bypass required pull requests"; a ruleset
+# exempts everyone on its bypass list. An administrator, or a custom role
+# with the "edit repository rules" permission, can also change or remove the
+# rule.
 #
 # GitHub reads only the first of .github/CODEOWNERS, CODEOWNERS and
 # docs/CODEOWNERS that exists. A project that keeps its rules in one of the

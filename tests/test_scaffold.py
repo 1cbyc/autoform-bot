@@ -807,6 +807,43 @@ def test_codeowners_is_left_out_when_the_repository_keeps_one_elsewhere(
     assert (tmp_path / ".github/workflows/autoform-verify.yml").is_file()
 
 
+@pytest.mark.parametrize("existing", ["/.github/ @maintainer\n", "# Owners are assigned per chapter.\n"])
+def test_force_keeps_an_existing_codeowners(existing: str, tmp_path: Path) -> None:
+    """The all-comment template in place of a maintainer's rules would switch them off."""
+    (tmp_path / ".github").mkdir()
+    (tmp_path / ".github/CODEOWNERS").write_text(existing, encoding="utf-8")
+    (tmp_path / ".github/autoform_audit.py").write_text("stale\n", encoding="utf-8")
+
+    result = scaffold_project(
+        tmp_path,
+        title="Finite Flat",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="1" * 40,
+        force=True,
+    )
+
+    assert ".github/CODEOWNERS" in result.skipped
+    assert (tmp_path / ".github/CODEOWNERS").read_text(encoding="utf-8") == existing
+    assert ".github/autoform_audit.py" in result.written
+    assert (tmp_path / ".github/autoform_audit.py").read_text(encoding="utf-8") != "stale\n"
+
+
+@pytest.mark.parametrize("existing", ["CODEOWNERS", "docs/CODEOWNERS"])
+def test_a_directory_named_codeowners_hides_nothing(existing: str, tmp_path: Path) -> None:
+    """GitHub reads owner rules from a file; a directory of that name holds none."""
+    (tmp_path / existing).mkdir(parents=True)
+
+    result = scaffold_project(
+        tmp_path,
+        title="Finite Flat",
+        autoform_source="https://example.test/autoform.git",
+        autoform_ref="1" * 40,
+    )
+
+    assert ".github/CODEOWNERS" in result.written
+    assert (tmp_path / ".github/CODEOWNERS").is_file()
+
+
 def test_cli_says_why_it_left_codeowners_out(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     from autoform_cli.__main__ import main
 

@@ -66,7 +66,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="",
         help="immutable ref the workflows pin (default: this checkout's HEAD commit)",
     )
-    init.add_argument("--force", action="store_true", help="overwrite files that already exist")
+    init.add_argument(
+        "--force", action="store_true", help="overwrite files that already exist, except .github/CODEOWNERS"
+    )
     init.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
     check = subparsers.add_parser("check", help="validate a Markdown blueprint")
