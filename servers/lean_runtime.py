@@ -339,23 +339,20 @@ class ProjectResourceCache(Generic[T]):
         self,
         project_dir: str,
         *,
-        create: bool = True,
         acquisition_timeout: float | None = None,
         creation_budget: float = 0.0,
-    ) -> Iterator[T | None]:
+    ) -> Iterator[T]:
         """Keep a project resource alive for the complete operation."""
         root = resolve_lean_project_dir(project_dir)
         resource = self._acquire(
             root,
-            create=create,
             acquisition_timeout=acquisition_timeout,
             creation_budget=creation_budget,
         )
         try:
             yield resource
         finally:
-            if resource is not None:
-                self._release(root, resource)
+            self._release(root, resource)
 
     @contextmanager
     def observe(self, project_dir: str) -> Iterator[tuple[T | None, str]]:
@@ -444,10 +441,9 @@ class ProjectResourceCache(Generic[T]):
         self,
         root: Path,
         *,
-        create: bool,
         acquisition_timeout: float | None,
         creation_budget: float,
-    ) -> T | None:
+    ) -> T:
         if acquisition_timeout is not None and acquisition_timeout <= 0:
             raise ProjectResourceBusyError(
                 "no response budget remains for a shared Lean project slot"
@@ -483,22 +479,14 @@ class ProjectResourceCache(Generic[T]):
                 )
                 if entry_is_stale:
                     assert entry is not None
+                    self._require_creation_budget(
+                        root,
+                        deadline=deadline,
+                        creation_budget=creation_budget,
+                    )
                     if entry.active:
-                        if not create:
-                            resource = None
-                            break
-                        self._require_creation_budget(
-                            root,
-                            deadline=deadline,
-                            creation_budget=creation_budget,
-                        )
                         wait = True
                     else:
-                        self._require_creation_budget(
-                            root,
-                            deadline=deadline,
-                            creation_budget=creation_budget,
-                        )
                         resources_to_close.append(self._entries.pop(root).resource)
                         self._condition.notify_all()
                         entry = None
@@ -511,10 +499,6 @@ class ProjectResourceCache(Generic[T]):
                     entry.active += 1
                     entry.last_used = self._clock()
                     resource = entry.resource
-                    break
-
-                if not wait and entry is None and not create:
-                    resource = None
                     break
 
                 if not wait and root in self._creating:
