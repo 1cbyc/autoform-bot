@@ -355,10 +355,14 @@ def _committed_scaffold_entries(
 
 
 def _git_blob_id(content: bytes, length: int) -> str | None:
-    algorithm = {40: hashlib.sha1, 64: hashlib.sha256}.get(length)
+    algorithm = {40: "sha1", 64: "sha256"}.get(length)
     if algorithm is None:
         return None
-    digest = algorithm(f"blob {len(content)}\0".encode("ascii"), usedforsecurity=False)
+    try:
+        digest = hashlib.new(algorithm, usedforsecurity=False)
+    except ValueError:
+        return None
+    digest.update(f"blob {len(content)}\0".encode("ascii"))
     digest.update(content)
     return digest.hexdigest()
 

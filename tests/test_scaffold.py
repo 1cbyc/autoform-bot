@@ -950,6 +950,19 @@ def test_an_installed_plugin_pins_from_the_marketplace_checkout(
     )
 
 
+def test_plugin_pin_is_empty_when_git_digests_are_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("unsupported hash type")
+
+    _fake_plugin_install(tmp_path, monkeypatch)
+    digests = SimpleNamespace(new=unavailable, sha1=unavailable, sha256=unavailable)
+    monkeypatch.setattr(scaffold_module, "hashlib", digests)
+
+    assert scaffold_module.plugin_pin() == ("", "")
+
+
 def test_plugin_pin_omits_a_local_commit_no_remote_tracking_ref_contains(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
