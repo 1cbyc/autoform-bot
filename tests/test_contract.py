@@ -167,7 +167,10 @@ _LOAD_FAULTS = {
         {"statement": "formalized", "lean": None},
         "{name}: statement: formalized needs the lean: declaration that formalizes it",
     ),
-    "proof without statement": ({"statement": None, "proof": True}, "{name}: proof: formalized needs statement: formalized"),
+    "proof without statement": (
+        {"statement": None, "proof": True},
+        "{name}: proof: formalized needs statement: formalized",
+    ),
 }
 
 

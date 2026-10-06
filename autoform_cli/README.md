@@ -610,7 +610,8 @@ worktree or a submodule. Blockers are unmet dependency IDs or one of
 `roadmap:missing-article-revision`, and `roadmap:not-ready`. The claim target
 prefers durable `article_id` metadata. `work list` fails explicitly if an
 unfinished formalizable leaf lacks one; plan the missing IDs with `autoform
-migrate article-ids` and add them to the frontmatter. `work context` may still select that article by its path ID to
+migrate article-ids` and add them to the frontmatter. `work context` may still
+select that article by its path ID to
 report the migration blocker. An item whose article records `statement:
 retracted` is a revision: it carries `revision` true in JSON, and the text of
 `work list` adds a `revision:` line and `work context` a `Revision:` line saying
