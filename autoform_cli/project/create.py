@@ -435,11 +435,10 @@ def _resolve_workflow_pin(source: str, ref: str, *, templates: tuple[tuple[str, 
         return given_source, given_ref
     # Looked up on the module so one replacement governs `init` and `project new`.
     pinned_source, pinned_ref = scaffold.plugin_pin(templates)
-    pinned_source = _normalize_autoform_source(pinned_source, allow_github_scp=True)
-    pinned_ref = pinned_ref.lower()
-    if pinned_source is None or _FULL_SHA.fullmatch(pinned_ref) is None:
-        return DEFAULT_AUTOFORM_SOURCE, given_ref
-    return pinned_source, given_ref or pinned_ref
+    safe_pinned_source = _normalize_autoform_source(pinned_source, allow_github_scp=True)
+    if safe_pinned_source is None or _FULL_SHA.fullmatch(pinned_ref.lower()) is None:
+        safe_pinned_source, pinned_ref = None, ""
+    return safe_pinned_source or DEFAULT_AUTOFORM_SOURCE, given_ref or pinned_ref.lower()
 
 
 def _validate_target(target: str | Path | None) -> Path:
@@ -838,17 +837,17 @@ def _valid_manifest_package(entry: object) -> bool:
 def _safe_https_git_url(value: str) -> bool:
     try:
         parsed = urlsplit(value)
-        return (
-            parsed.scheme == "https"
-            and bool(parsed.hostname)
-            and parsed.username is None
-            and parsed.password is None
-            and not parsed.query
-            and not parsed.fragment
-            and parsed.path not in {"", "/"}
-        )
     except ValueError:
         return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path not in {"", "/"}
+    )
 
 
 def _safe_relative(value: object) -> bool:
