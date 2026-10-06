@@ -57,6 +57,15 @@ State the intended result and proof sketch here.
 - [Chapter 2](../../sources/convexity.md#separation)
 ```
 
+An article's statement is its body from the end of the frontmatter to the first
+`##` heading, without the H1 line. A deeper heading does not end it, and neither
+does a `##` line inside a fenced code block or an HTML comment. `autoform audit`
+and the published theorem box both read that span. A fence closes only on a
+bare fence line; one that never closes is plain text on the page and hides no
+heading and no dependency link. A later bare fence line of the same character
+and at least the opener's length closes it here, though the page asks for the
+opener's exact length and indent, so close each fence with its own line.
+
 `## Depends on` lists what the article needs in order to be *stated*;
 `## Proof depends on` lists what only its *proof* needs. Both are graph edges.
 Links anywhere else are ordinary navigation or citations. Dependencies resolve
@@ -797,7 +806,8 @@ that may be regenerated at any time.
 
 `autoform audit` reports structured findings at blueprint-relative paths. It
 checks that formalizable articles are declaration-sized leaves with statement
-text and an explicit dependency section, that asserted Mathlib facts are
+text (prose in the statement, outside code blocks, HTML comments, and headings)
+and an explicit dependency section, that asserted Mathlib facts are
 internally consistent, and that cited work resolves to local source
 material without escaping the blueprint. Coverage files are checked for broken
 links and explicitly declared gaps. With `--lean-root`, local declaration names

@@ -388,6 +388,101 @@ def frontmatter_end(lines: list[str]) -> int:
     return len(lines)
 
 
+@dataclass(frozen=True, slots=True)
+class ArticleSection:
+    """One H2 section of an article."""
+
+    #: The heading's text with comments removed, as the graph loader reads it.
+    title: str
+    #: The heading line exactly as the author wrote it.
+    heading: str
+    #: The author's Markdown up to the next H2, without surrounding blank lines.
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArticleParts:
+    """An article body split at its published H2 headings.
+
+    ``statement`` is everything between the frontmatter and the first H2, with
+    the H1 title line removed. It is the author's Markdown, untouched apart from
+    surrounding blank lines, so a caller that publishes it publishes what was
+    written and indentation keeps its meaning.
+    """
+
+    statement: str
+    sections: tuple[ArticleSection, ...]
+
+
+def article_parts(text: str) -> ArticleParts:
+    """Split an article into its statement and its H2 sections.
+
+    This is the one definition of where a statement ends, for the audit and
+    for the published page alike. A heading counts only where :func:`content`
+    leaves it visible, so ``## Proof`` inside a fenced block, an indented code
+    block, or an HTML comment ends nothing, and a heading below level two
+    belongs to whatever it sits in. A comment that never closes hides
+    every heading after it; the audit then reports the sections it cannot see.
+    """
+
+    lines = text.splitlines()
+    body = lines[frontmatter_end(lines) :]
+    # An indented code line needs no masking: four leading spaces already
+    # keep it from matching HEADING.
+    masked = mask_fences_and_comments(body)
+
+    title = next((index for index, line in enumerate(masked) if _heading_level(line) == 1), None)
+    starts = [index for index, line in enumerate(masked) if _heading_level(line) == 2]
+    breaks = sorted([*starts, *(() if title is None else (title,))])
+
+    # The statement is whatever no section holds: the text before the first
+    # heading and the text under the title. A title written below a section
+    # ends that section, so the statement beneath it is not lost into it.
+    statement = body[: breaks[0]] if breaks else body
+    sections: list[ArticleSection] = []
+    for start, stop in zip(breaks, [*breaks[1:], len(body)]):
+        if start == title:
+            statement = [*statement, *_open_comment(body[start]), *body[start + 1 : stop]]
+        else:
+            sections.append(
+                ArticleSection(
+                    title=HEADING.match(masked[start]).group(2).strip(),
+                    heading=body[start],
+                    body=_trim(body[start + 1 : stop]),
+                )
+            )
+    return ArticleParts(statement=_trim(statement), sections=tuple(sections))
+
+
+def _open_comment(title_line: str) -> list[str]:
+    """Return the comment a title line leaves open, so the statement keeps it.
+
+    The title line is dropped from the statement. A comment begun on it and
+    closed further down would otherwise lose its opener, and the text it hides
+    would read as prose.
+    """
+
+    if not strip_line_comments(title_line, False)[1]:
+        return []
+    return [title_line[title_line.rfind("<!--") :]]
+
+
+def _trim(lines: list[str]) -> str:
+    """Join ``lines`` without the blank ones at either end."""
+
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[start:end])
+
+
+def _heading_level(line: str) -> int:
+    heading = HEADING.match(line)
+    return len(heading.group(1)) if heading else 0
+
+
 def site_converter() -> pymarkdown.Markdown:
     """Return a converter configured exactly as the generated site is."""
 
@@ -483,11 +578,41 @@ def local_target_issue(
     return None
 
 
-def _mask_fences_and_comments(lines: list[str], hidden: set[int]) -> list[str]:
+def mask_fences_and_comments(lines: list[str]) -> list[str]:
+    """Return ``lines`` with fenced blocks and HTML comments blanked.
+
+    This is how the graph, the audit and the page agree on which headings and
+    links an article has. The site draws a fence without a closing line as
+    plain text, with the headings and links after it in view, so such a fence
+    hides nothing here.
+    """
+
+    return _mask_fences_and_comments(lines, set(), unclosed_fence_is_text=True)
+
+
+def _mask_fences_and_comments(
+    lines: list[str], hidden: set[int], *, unclosed_fence_is_text: bool = False
+) -> list[str]:
     masked: list[str] = []
     fence: tuple[str, int] | None = None
     in_comment = False
-    for index, raw in enumerate(lines):
+    # Where the open fence began and the comment state there, to go back to
+    # when the fence turns out to have no closing line.
+    opened: tuple[int, bool] = (0, False)
+    # Per fence character, the shortest opener known to find no closing line.
+    # A later one at least as long cannot close either.
+    unclosed: dict[str, int] = {}
+    index = 0
+    while index < len(lines) or (fence is not None and unclosed_fence_is_text):
+        if index == len(lines):
+            # Read on from the fence's first line as text.
+            unclosed[fence[0]] = fence[1]
+            index, in_comment = opened
+            del masked[index:]
+            hidden.difference_update(range(index, len(lines)))
+            fence = None
+            continue
+        raw = lines[index]
         if fence is not None:
             # A fence closes on the raw line: `<!--` inside a code block is
             # literal text, not the start of a comment. The closing delimiter
@@ -499,21 +624,25 @@ def _mask_fences_and_comments(lines: list[str], hidden: set[int]) -> list[str]:
                     fence = None
             hidden.add(index)
             masked.append("")
+            index += 1
             continue
         opened_in_comment = in_comment
         line, in_comment = strip_line_comments(raw, in_comment)
         match = FENCE.match(line)
-        if match is not None:
+        if match is not None and len(match.group(1)) < unclosed.get(match.group(1)[0], len(line) + 1):
             marker = match.group(1)
             fence = (marker[0], len(marker))
+            opened = (index, opened_in_comment)
             hidden.add(index)
             masked.append("")
+            index += 1
             continue
         # A line shows nothing either because the author left it empty or
         # because a comment covers it. Only the second belongs to a construct.
         if not line.strip() and (opened_in_comment or raw.strip()):
             hidden.add(index)
         masked.append(line)
+        index += 1
     return masked
 
 
@@ -584,6 +713,9 @@ __all__ = [
     "LINK",
     "SITE_EXTENSIONS",
     "SITE_EXTENSION_CONFIGS",
+    "ArticleParts",
+    "ArticleSection",
+    "article_parts",
     "Content",
     "content",
     "content_lines",
@@ -593,6 +725,7 @@ __all__ = [
     "markdown_anchors",
     "PublishedTable",
     "markdown_links",
+    "mask_fences_and_comments",
     "published_tables",
     "render_html",
     "render_tree",

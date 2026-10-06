@@ -26,10 +26,9 @@ from .lean import (
     index_failure_message,
     snapshot_project_sources,
 )
-from .markdown import FENCE as _FENCE
-from .markdown import frontmatter_end as _frontmatter_end
+from .markdown import article_parts as _article_parts
+from .markdown import content_lines as _content_lines
 from .markdown import HEADING as _HEADING
-from .markdown import HTML_COMMENT as _HTML_COMMENT
 from .markdown import local_target_issue as _local_target_issue
 from .markdown import markdown_links as _markdown_links
 
@@ -181,7 +180,7 @@ def audit_graph(
                     AuditFinding(
                         article_path,
                         "missing-statement-text",
-                        "formalizable article has no statement text between its H1 and first H2 section",
+                        "formalizable article has no statement text before its first H2 section",
                     )
                 )
             if not article.has_depends_section:
@@ -260,42 +259,14 @@ def _read_article(path: Path) -> _ArticleShape:
     except (OSError, UnicodeError):
         return _ArticleShape(False, False)
 
-    lines = text.splitlines()
-    start = _frontmatter_end(lines)
-    body = _HTML_COMMENT.sub("", "\n".join(lines[start:]))
-    seen_h1 = False
-    before_first_h2 = True
-    statement_text = False
-    has_depends_section = False
-    fence: tuple[str, int] | None = None
-
-    for line in body.splitlines():
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        if fence is not None:
-            continue
-
-        heading = _HEADING.match(line)
-        if heading:
-            level = len(heading.group(1))
-            title = heading.group(2).strip().casefold()
-            if level == 1:
-                seen_h1 = True
-            elif level == 2:
-                before_first_h2 = False
-                if title == "depends on":
-                    has_depends_section = True
-            continue
-        if seen_h1 and before_first_h2 and line.strip():
-            statement_text = True
-
-    return _ArticleShape(statement_text, has_depends_section)
+    parts = _article_parts(text)
+    return _ArticleShape(
+        # A subheading names what follows; alone it states nothing.
+        statement_text=any(
+            line.strip() and not _HEADING.match(line) for line in _content_lines(parts.statement)
+        ),
+        has_depends_section=any(section.title.casefold() == "depends on" for section in parts.sections),
+    )
 
 
 def _source_findings(graph: Graph, node: Node, article_path: str) -> list[AuditFinding]:

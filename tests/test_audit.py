@@ -689,3 +689,117 @@ def test_an_explicit_attr_list_anchor_resolves(tmp_path: Path) -> None:
     codes = {finding.code for finding in audit_blueprint(blueprint).findings}
 
     assert "source-anchor-not-found" not in codes
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "",
+        "<!-- the statement goes here -->",
+        "```lean\ntheorem draft : True := trivial\n```",
+        "    theorem draft : True := trivial",
+        "### Setting",
+    ],
+)
+def test_audit_requires_statement_prose_outside_code_comments_and_headings(tmp_path: Path, prose: str) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "chapter/result.md", prose=prose, declaration="theorem")
+
+    codes = {code for code, _reason in _finding_map(blueprint)["roadmap/chapter/result.md"]}
+
+    assert codes == {"missing-statement-text"}
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "### Setting\n\nLet $X$ be a set.",
+        "Let $X$ be a set.\n\n```lean\ntheorem draft : True := trivial\n```",
+    ],
+)
+def test_audit_accepts_a_statement_with_subheadings_or_code(tmp_path: Path, prose: str) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "chapter/result.md", prose=prose, declaration="theorem")
+
+    assert audit_blueprint(blueprint).clean
+
+
+def test_audit_counts_statement_prose_written_above_the_title(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    path = _article(blueprint, "chapter/result.md", prose="", declaration="theorem")
+    path.write_text(
+        "---\ndeclaration: theorem\n---\n\nLet $X$ be a set.\n\n# Result\n\n## Depends on\n\nNone.\n",
+        encoding="utf-8",
+    )
+
+    assert audit_blueprint(blueprint).clean
+
+
+def test_audit_ignores_a_depends_heading_that_is_not_published(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(
+        blueprint,
+        "chapter/result.md",
+        prose="A statement.\n\n```\n## Depends on\n```",
+        depends=False,
+        declaration="theorem",
+    )
+
+    codes = {code for code, _reason in _finding_map(blueprint)["roadmap/chapter/result.md"]}
+
+    assert codes == {"missing-depends-section"}
+
+
+def test_missing_statement_text_names_the_span_the_audit_reads(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "chapter/result.md", prose="", declaration="theorem")
+
+    assert _finding_map(blueprint)["roadmap/chapter/result.md"] == [
+        ("missing-statement-text", "formalizable article has no statement text before its first H2 section")
+    ]
+
+
+def test_audit_reads_the_depends_heading_without_regard_to_case(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(
+        blueprint,
+        "chapter/result.md",
+        prose="A statement.\n\n## DEPENDS ON\n\nNone.",
+        depends=False,
+        declaration="theorem",
+    )
+
+    assert audit_blueprint(blueprint).clean
+
+
+def test_audit_reports_a_depends_section_lost_behind_an_unclosed_comment(tmp_path: Path) -> None:
+    # The site shows the sections after an unclosed comment inside the theorem
+    # box, so the audit must not call the article complete.
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "chapter/result.md", prose="A statement.\n\n<!-- todo", declaration="theorem")
+
+    codes = {code for code, _reason in _finding_map(blueprint)["roadmap/chapter/result.md"]}
+
+    assert codes == {"missing-depends-section"}
+
+
+def test_audit_does_not_read_a_comment_begun_on_the_title_line_as_prose(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    path = _article(blueprint, "chapter/result.md", prose="", declaration="theorem")
+    path.write_text(
+        "---\ndeclaration: theorem\n---\n\n# Result <!-- TODO:\nwrite the statement -->\n\n"
+        "## Depends on\n\nNone.\n",
+        encoding="utf-8",
+    )
+
+    codes = {code for code, _reason in _finding_map(blueprint)["roadmap/chapter/result.md"]}
+
+    assert codes == {"missing-statement-text"}
