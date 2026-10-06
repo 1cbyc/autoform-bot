@@ -14,10 +14,10 @@ from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote, urlsplit
 
 from .graph import Graph, load_graph
-from .lean import declaration_names, index_project
+from .lean import declaration_names, index_failure_message, index_project
 from .status import derive, is_definition
 
-RUNTIME_SCHEMA = "autoform-runtime/v1"
+RUNTIME_SCHEMA = "autoform-runtime/v3"
 RUNTIME_AUTHORITY = "markdown-articles"
 
 
@@ -42,6 +42,7 @@ class RuntimeAssertions:
     """Authored facts copied from article frontmatter."""
 
     statement_formalized: bool
+    statement_retracted: bool
     proof_formalized: bool
     not_ready: bool
 
@@ -50,6 +51,7 @@ class RuntimeAssertions:
             "not_ready": self.not_ready,
             "proof_formalized": self.proof_formalized,
             "statement_formalized": self.statement_formalized,
+            "statement_retracted": self.statement_retracted,
         }
 
 
@@ -64,9 +66,12 @@ class RuntimeStatus:
     proved: bool
     fully_proved: bool
     defined: bool
+    assumes: tuple[str, ...]
+    waiting_on: tuple[str, ...]
 
-    def as_dict(self) -> dict[str, bool | str]:
+    def as_dict(self) -> dict[str, bool | str | list[str]]:
         return {
+            "assumes": list(self.assumes),
             "can_prove": self.can_prove,
             "can_state": self.can_state,
             "defined": self.defined,
@@ -74,6 +79,7 @@ class RuntimeStatus:
             "proved": self.proved,
             "state": self.state,
             "stated": self.stated,
+            "waiting_on": list(self.waiting_on),
         }
 
 
@@ -96,6 +102,8 @@ class RuntimeNode:
     """One immutable article record exposed to runtime consumers."""
 
     id: str
+    article_id: str | None
+    source_sha256: str | None
     title: str
     article_path: str
     parent: str | None
@@ -117,6 +125,7 @@ class RuntimeNode:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            "article_id": self.article_id,
             "article_path": self.article_path,
             "assertions": self.assertions.as_dict(),
             "declaration": self.declaration,
@@ -133,6 +142,7 @@ class RuntimeNode:
             "parent": self.parent,
             "proof_dependencies": list(self.proof_dependencies),
             "source_targets": list(self.source_targets),
+            "source_sha256": self.source_sha256,
             "statement_dependencies": list(self.statement_dependencies),
             "status": self.status.as_dict(),
             "title": self.title,
@@ -153,6 +163,7 @@ class RuntimeGraph:
     dispatchable_count: int
     dependency_count: int
     maximum_depth: int
+    open_statements: bool = False
 
     def get(self, node_id: str) -> RuntimeNode | None:
         """Return a node without exposing mutable lookup state."""
@@ -171,6 +182,7 @@ class RuntimeGraph:
             "formalizable_count": self.formalizable_count,
             "maximum_depth": self.maximum_depth,
             "nodes": [node.as_dict() for node in self.nodes],
+            "open_statements": self.open_statements,
             "schema": self.schema,
             "source_revision": self.source_revision,
         }
@@ -306,19 +318,16 @@ def build_runtime_graph(
         root = Path(lean_root).expanduser().resolve()
         if not root.is_dir():
             raise RuntimeProjectionError(["Lean root does not exist or is not a directory"])
-        lean_index = index_project(root)
+        try:
+            lean_index = index_project(root)
+        except OSError as error:
+            raise RuntimeProjectionError([index_failure_message(error)]) from error
 
     parents = {node.parent for node in graph.nodes.values() if node.parent is not None}
     runtime_nodes: list[RuntimeNode] = []
     for node_id in sorted(graph.nodes):
         node = graph.nodes[node_id]
         node_status = statuses[node_id]
-        can_state = all(statuses[dependency].stated for dependency in node.statement_dependencies)
-        can_prove = (
-            node_status.stated
-            and can_state
-            and all(statuses[dependency].proved for dependency in node.proof_dependencies)
-        )
         lean_targets: list[RuntimeLeanTarget] = []
         for name in declaration_names(node.lean or ""):
             declaration = lean_index.find(name) if lean_index is not None else None
@@ -326,10 +335,11 @@ def build_runtime_graph(
             if source_file is not None and not _is_portable_relative_path(source_file):
                 raise RuntimeProjectionError([f"{node.id}: Lean source file escapes the Lean root"])
             lean_targets.append(RuntimeLeanTarget(name, source_file))
-
         runtime_nodes.append(
             RuntimeNode(
                 id=node.id,
+                article_id=node.article_id,
+                source_sha256=node.source_sha256,
                 title=node.title,
                 article_path=article_paths[node.id],
                 parent=node.parent,
@@ -342,17 +352,20 @@ def build_runtime_graph(
                 dependencies=node.dependencies,
                 assertions=RuntimeAssertions(
                     statement_formalized=node.statement_formalized,
+                    statement_retracted=node.statement_retracted,
                     proof_formalized=node.proof_formalized,
                     not_ready=node.not_ready,
                 ),
                 status=RuntimeStatus(
                     state=node_status.key,
-                    can_state=can_state,
-                    can_prove=can_prove,
+                    can_state=node_status.can_state,
+                    can_prove=node_status.can_prove,
                     stated=node_status.stated,
                     proved=node_status.proved,
                     fully_proved=node_status.fully_proved,
                     defined=is_definition(node) and node_status.stated,
+                    assumes=node_status.assumes,
+                    waiting_on=node_status.waiting_on,
                 ),
                 origin=node.origin,
                 source_targets=node.sources,
@@ -375,6 +388,7 @@ def build_runtime_graph(
         dispatchable_count=sum(node.dispatchable for node in nodes),
         dependency_count=sum(len(node.dependencies) for node in nodes),
         maximum_depth=max((node.depth for node in nodes), default=0),
+        open_statements=graph.open_statements,
     )
     _validate_runtime(runtime)
     return runtime

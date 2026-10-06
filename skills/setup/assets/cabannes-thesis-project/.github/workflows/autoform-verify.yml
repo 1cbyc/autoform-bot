@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 env:
-  AUTOFORM_SOURCE: "https://github.com/VivienCabannes/autoform-bot.git"
-  AUTOFORM_REF: "43097b2c07e68df899d6b8bca7849d091c294754"
+  AUTOFORM_SOURCE: "https://github.com/facebookresearch/autoform-bot.git"
+  AUTOFORM_REF: "c994d83f9fab1f40d69b2f279d4c62ca937a0186"
 
 concurrency:
   group: autoform-verify-${{ github.ref }}
@@ -91,11 +91,23 @@ jobs:
           set -euo pipefail
           archive="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-root-build.XXXXXX.tgz")"
           probe="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-axiom-probe.XXXXXX.lean")"
-          trap 'rm -f "$archive" "$probe"' EXIT
+          contract="$(mktemp "${RUNNER_TEMP:-/tmp}/autoform-assumptions.XXXXXX.json")"
+          trap 'rm -f "$archive" "$probe" "$contract"' EXIT
           # Lake resolves both manifest languages and package/custom buildDir.
           # `lake pack` archives only the root package's actual build directory,
           # leaving dependency package artifacts outside the audit boundary.
           lake pack "$archive"
-          python3 .github/autoform_audit.py \
-            "$AUTOFORM_ROOT_PACKAGE" "$archive" "$probe"
+          # roadmap/README.md may opt in to open statements (theorems whose proof
+          # is still sorry). Only then does the audit accept sorry, and only in
+          # the statements the Markdown declares open.
+          policy="$(python3 .github/autoform_audit.py --policy blueprint)"
+          if [ "$policy" = "allowed" ]; then
+            uvx --from "git+${AUTOFORM_SOURCE}@${AUTOFORM_REF}" \
+              autoform work assumptions blueprint --json > "$contract"
+            python3 .github/autoform_audit.py --open-statements "$contract" \
+              "$AUTOFORM_ROOT_PACKAGE" "$archive" "$probe"
+          else
+            python3 .github/autoform_audit.py \
+              "$AUTOFORM_ROOT_PACKAGE" "$archive" "$probe"
+          fi
           lake env lean "$probe"

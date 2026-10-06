@@ -22,7 +22,7 @@ from urllib.parse import quote, unquote, urlsplit
 from . import graph_pages, graph_views, mermaid, status
 from .coverage import COVERAGE_DISPOSITIONS, CoverageSummary, load_coverage
 from .graph import Graph, Node, load_graph
-from .lean import SourceLinker, build_linker, declaration_names
+from .lean import SourceLinker, build_linker, declaration_names, index_failure_message
 from .status import is_definition
 
 _HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
@@ -279,7 +279,10 @@ def render_site(
     # <repo>/docs/blueprint would otherwise be described as <repo>/blueprint,
     # and every generated permalink would 404.
     repo_root = Path(lean_root).expanduser().resolve() if lean_root is not None else blueprint.parent
-    linker = build_linker(repo_root, repository_url=repository_url, ref=ref)
+    try:
+        linker = build_linker(repo_root, repository_url=repository_url, ref=ref)
+    except OSError as error:
+        raise PublicationError([index_failure_message(error)]) from error
     numbers = _number_nodes(graph)
     used_by = _reverse_edges(graph)
     sources_base = _sources_base(blueprint, repo_root, linker)
@@ -715,12 +718,6 @@ def _book_page_order(blueprint: Path, destination: Path, graph: Graph) -> list[P
     return ordered
 
 
-
-
-
-
-
-
 def _append_book_navigation(pages: list[Path]) -> None:
     """Add previous/next links to the bottom of Blueprint pages, never global nav."""
     if len(pages) < 2:
@@ -777,26 +774,6 @@ def _book_navigation_link(
     )
 
 
-def _inject_after_title(text: str, block: str) -> str:
-    """Place a generated overview immediately after the document's first H1."""
-    lines = text.splitlines()
-    fence: tuple[str, int] | None = None
-    for index, line in enumerate(lines):
-        fence_match = _FENCE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = (marker[0], len(marker))
-            elif marker[0] == fence[0] and len(marker) >= fence[1]:
-                fence = None
-            continue
-        heading = _HEADING.match(line) if fence is None else None
-        if heading is not None and len(heading.group(1)) == 1:
-            merged = [*lines[: index + 1], "", block.rstrip(), "", *lines[index + 1 :]]
-            return "\n".join(merged) + ("\n" if text.endswith("\n") else "")
-    return text.rstrip() + "\n\n" + block.rstrip() + "\n"
-
-
 def _inject_after_lead(text: str, block: str) -> str:
     """Place chapter metadata after its opening prose and before the first section."""
     lines = text.splitlines()
@@ -821,7 +798,6 @@ def _inject_after_lead(text: str, block: str) -> str:
             merged = [*lines[:index], "", block.rstrip(), "", *lines[index:]]
             return "\n".join(merged) + ("\n" if text.endswith("\n") else "")
     return text.rstrip() + "\n\n" + block.rstrip() + "\n"
-
 
 
 def _next_target(
@@ -866,9 +842,9 @@ def _next_target(
             f'<a href="{html.escape(statement, quote=True)}">{title}</a>' if statement else title
         )
         why = (
-            "Every prerequisite is proved, so the proof can be written now."
+            "Its prerequisites are ready, so the proof can be written now."
             if node_status.key == "can_prove"
-            else "Every prerequisite is stated, so this can be written down."
+            else "Its prerequisites are ready, so the statement can be written down."
         )
         actions = [f'<a href="{html.escape(graph_href, quote=True)}">Dependencies</a>']
         if chapter_page is not None:
@@ -897,7 +873,6 @@ def _next_target(
             "</div>"
         )
     return ""
-
 
 
 STRUCTURE_PAGE = "structure.md"
@@ -1332,21 +1307,8 @@ def _render_overview_summary(
         '<div class="bp-progress-kicker">Formalization progress</div>'
         f'<div class="bp-progress-total">{item_summary}</div>'
         f'<div class="bp-progress-states">{states}</div>'
-        f""
         "</div>"
     )
-
-
-
-def _status_phrase(node_statuses: Iterable[status.NodeStatus]) -> str:
-    counts = {state.key: 0 for state in status.STATES}
-    for node_status in node_statuses:
-        counts[node_status.key] += 1
-    return " · ".join(f"{counts[state.key]} {state.label}" for state in status.STATES if counts[state.key])
-
-
-def _markdown_table_cell(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("|", "\\|").replace("[", "\\[").replace("]", "\\]")
 
 
 def _first_h1(text: str) -> str | None:
@@ -1376,17 +1338,6 @@ def _document_body(text: str) -> str:
             continue
         kept.append(line)
     return "\n".join(kept).strip()
-
-
-def _shift_headings(text: str, levels: int) -> str:
-    def shift(line: str) -> str:
-        heading = _HEADING.match(line)
-        if heading is None:
-            return line
-        level = min(len(heading.group(1)) + levels, 6)
-        return f"{'#' * level} {heading.group(2)}"
-
-    return _outside_fences(text, shift)
 
 
 def _anchor(node_id: str, group: str) -> str:
@@ -1716,6 +1667,13 @@ def _render_environment(
     context_link = _graph_context_link(node, page=page, destination=destination)
     source_link = _vault_source_link(node, repo_root=repo_root, linker=linker)
     meta_rows = implementation_rows
+    if node_status.key == "conditional":
+        # A conditional proof must never read as finished, so the open
+        # statements it rests on are named on the statement itself.
+        assumed = _node_references(
+            node_status.assumes, graph=graph, statuses=statuses, numbers=numbers, links=links
+        )
+        meta_rows.append(("Assumes", f"{assumed} (open statements without a recorded Lean proof)"))
     if node.discussion:
         meta_rows.append(("Discussion", _discussion_link(node.discussion, linker)))
     meta = _render_rows(meta_rows, css_class="bp-meta")
@@ -1863,15 +1821,7 @@ def _dependency_disclosure(
     rows: list[tuple[str, str]] = []
 
     def references(node_ids: list[str] | tuple[str, ...]) -> str:
-        rendered = []
-        for other_id in node_ids:
-            other = graph.nodes[other_id]
-            label = html.escape(f"{numbers[other_id]} ({other.title})")
-            rendered.append(
-                f'<a class="bp-ref bp-ref-{statuses[other_id].key}" '
-                f'href="{html.escape(links[other_id], quote=True)}">{label}</a>'
-            )
-        return " · ".join(rendered)
+        return _node_references(node_ids, graph=graph, statuses=statuses, numbers=numbers, links=links)
 
     if node.statement_dependencies:
         rows.append(("Statement uses", references(node.statement_dependencies)))
@@ -1885,6 +1835,26 @@ def _dependency_disclosure(
 
     body = _render_rows(rows, css_class="bp-dependency-body")
     return f'<details class="bp-dependencies"><summary>Dependencies</summary>{body}</details>'
+
+
+def _node_references(
+    node_ids: list[str] | tuple[str, ...],
+    *,
+    graph: Graph,
+    statuses: dict[str, status.NodeStatus],
+    numbers: dict[str, str],
+    links: dict[str, str],
+) -> str:
+    """Link each node by number and title, coloured by its derived state."""
+    rendered = []
+    for other_id in node_ids:
+        other = graph.nodes[other_id]
+        label = html.escape(f"{numbers[other_id]} ({other.title})")
+        rendered.append(
+            f'<a class="bp-ref bp-ref-{statuses[other_id].key}" '
+            f'href="{html.escape(links[other_id], quote=True)}">{label}</a>'
+        )
+    return " · ".join(rendered)
 
 
 def _render_rows(rows: list[tuple[str, str]], *, css_class: str) -> str:
