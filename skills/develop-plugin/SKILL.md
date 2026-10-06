@@ -10,15 +10,6 @@ repository. State a consumer scenario and invariant. Treat user nudges as
 product evidence; preserve insight, not the transcript, in a focused test so
 future agents need less steering.
 
-Before repairing or restacking a proposal, identify the concrete behavior or
-maintenance burden it improves. Review the premise before implementation:
-fixing review blockers does not imply it should merge. Optimize for repository
-quality, not lines or PRs landed. Closing, deleting, or replacing a proposal is
-successful when it removes duplication, obsolete machinery, self-validating
-plans, or work without consumer value. Preserve reusable insight. Remove
-inferior artifacts only when the task authorizes it; otherwise recommend
-closure or replacement.
-
 Keep Cabannes-specific facts in examples. Keep plugin and formalization roots
 distinct. Agents can infer routine details; keep shared agent entrypoints concise
 and link details as on-demand references.

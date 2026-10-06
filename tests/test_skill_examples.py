@@ -137,31 +137,22 @@ def test_development_guidance_routes_repository_contracts(repo_root: Path) -> No
 
 def test_root_agent_guidance_routes_to_owning_documents(repo_root: Path) -> None:
     guidance = (repo_root / "AGENTS.md").read_text(encoding="utf-8")
-    development = (repo_root / "skills/develop-plugin/SKILL.md").read_text(
-        encoding="utf-8"
-    )
 
     for relative in ("CONTRIBUTING.md", "skills/develop-plugin/SKILL.md"):
         assert f"]({relative})" in guidance
         assert (repo_root / relative).is_file()
 
     normalized_guidance = " ".join(guidance.split()).lower()
-    normalized_development = " ".join(development.split()).lower()
     assert "identify the concrete user outcome or maintenance burden" in normalized_guidance
-    assert "identify the concrete behavior or maintenance burden" in normalized_development
     assert "review blockers does not prove that the proposal belongs" in normalized_guidance
-    assert "fixing review blockers does not imply it should merge" in normalized_development
     assert "validate their own planning state" in normalized_guidance
-    assert "self-validating plans" in normalized_development
     assert "only when authorized" in normalized_guidance
-    assert "only when the task authorizes it" in normalized_development
-    for normalized in (normalized_guidance, normalized_development):
-        assert "repository quality" in normalized
-        assert "line count" in normalized or "lines" in normalized
-        assert "pr count" in normalized or "prs" in normalized
-        assert all(word in normalized for word in ("closing", "deleting", "replacing"))
-        assert "otherwise recommend" in normalized
-        assert "success" in normalized
+    assert "repository quality" in normalized_guidance
+    assert "line count" in normalized_guidance
+    assert "pr count" in normalized_guidance
+    assert all(word in normalized_guidance for word in ("closing", "deleting", "replacing"))
+    assert "otherwise recommend" in normalized_guidance
+    assert "success" in normalized_guidance
 
 
 def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:
@@ -605,7 +596,7 @@ def test_each_skill_points_to_its_thesis_example(repo_root: Path) -> None:
         assert required in develop_plugin
     assert re.search(r"consumer\s+scenario", develop_plugin)
     assert "Agents can infer routine details" in develop_plugin
-    assert len(develop_plugin.split()) <= 300
+    assert len(develop_plugin.split()) <= 220
     assert "$setup" in setup_metadata
     assert "$roadmap" in roadmap_metadata
     assert "one invocation" in roadmap_metadata
