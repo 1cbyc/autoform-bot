@@ -60,9 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="",
         help="immutable ref the workflows pin (default: this checkout's HEAD commit)",
     )
-    init.add_argument(
-        "--force", action="store_true", help="overwrite files that already exist, except .github/CODEOWNERS"
-    )
+    init.add_argument("--force", action="store_true", help="overwrite files that already exist")
     init.add_argument("--json", action="store_true", help="write stable machine-readable output")
 
     check = subparsers.add_parser("check", help="validate a Markdown blueprint")
@@ -354,12 +352,7 @@ def _init(args: argparse.Namespace) -> int:
     for path in result.written:
         print(f"  + {path}")
     for path in result.skipped:
-        if result.unpinned and ".github" in path:
-            note = "no Autoform ref to pin"
-        elif path == ".github/CODEOWNERS" and not (target / path).exists():
-            note = "another CODEOWNERS exists, which this would hide"
-        else:
-            note = "exists, left alone"
+        note = "no Autoform ref to pin" if result.unpinned and ".github" in path else "exists, left alone"
         print(f"  = {path} ({note})")
     print("Next: describe the project in blueprint/README.md, then add chapters "
           "as roadmap/<chapter>/README.md.")

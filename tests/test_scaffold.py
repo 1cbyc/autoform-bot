@@ -24,7 +24,7 @@ from autoform_cli.graph import load_graph
 from autoform_cli.scaffold import ScaffoldError, scaffold_project
 
 _EXPECTED = {
-    ".github/CODEOWNERS",
+    ".github/CODEOWNERS.autoform.example",
     ".github/autoform_audit.py",
     ".github/workflows/autoform-verify.yml",
     ".github/workflows/blueprint-pages.yml",
@@ -741,6 +741,7 @@ def test_no_ci_rather_than_a_guessed_pin(tmp_path: Path, monkeypatch: pytest.Mon
     assert not (tmp_path / ".github/workflows/autoform-verify.yml").exists()
     assert not (tmp_path / ".github/workflows/blueprint-pages.yml").exists()
     assert not (tmp_path / ".github/autoform_audit.py").exists()
+    assert (tmp_path / ".github/CODEOWNERS.autoform.example").is_file()
     assert ".github/autoform_audit.py" in result.skipped
     assert ".github/workflows/autoform-verify.yml" in result.skipped
     # Everything a project needs to be authored still lands.
@@ -766,53 +767,26 @@ def test_a_ref_alone_restores_ci(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert f'AUTOFORM_REF: "{"2" * 40}"' in verify
 
 
-def test_codeowners_names_no_owner_until_a_maintainer_does(tmp_path: Path) -> None:
-    """The tool cannot know who maintains a project, so it writes no active rule."""
+def test_codeowners_example_names_no_owner_until_a_maintainer_does(tmp_path: Path) -> None:
+    """The tool cannot know who maintains a project, so its example is inert."""
     scaffold_project(
         tmp_path,
         title="Finite Flat",
         autoform_source="https://example.test/autoform.git",
         autoform_ref="1" * 40,
     )
-    lines = (tmp_path / ".github/CODEOWNERS").read_text(encoding="utf-8").splitlines()
+    example = tmp_path / ".github/CODEOWNERS.autoform.example"
+    lines = example.read_text(encoding="utf-8").splitlines()
 
     assert all(not line.strip() or line.startswith("#") for line in lines)
     assert lines[-2:] == ["# /blueprint/roadmap/README.md @OWNER", "# /.github/ @OWNER"]
+    assert not (tmp_path / ".github/CODEOWNERS").exists()
 
 
-@pytest.mark.parametrize("force", [False, True])
-@pytest.mark.parametrize("existing", ["CODEOWNERS", "docs/CODEOWNERS"])
-def test_codeowners_is_left_out_when_the_repository_keeps_one_elsewhere(
-    existing: str, force: bool, tmp_path: Path
-) -> None:
-    """GitHub reads only the first CODEOWNERS it finds, starting with .github/.
-
-    An all-comment .github/CODEOWNERS beside a populated root or docs/ file
-    would silently switch off every owner rule the repository already has.
-    """
+@pytest.mark.parametrize("existing", [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"])
+def test_codeowners_example_never_touches_active_rules(existing: str, tmp_path: Path) -> None:
     (tmp_path / existing).parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / existing).write_text("* @existing-owner\n", encoding="utf-8")
-
-    result = scaffold_project(
-        tmp_path,
-        title="Finite Flat",
-        autoform_source="https://example.test/autoform.git",
-        autoform_ref="1" * 40,
-        force=force,
-    )
-
-    assert ".github/CODEOWNERS" in result.skipped
-    assert not (tmp_path / ".github/CODEOWNERS").exists()
-    assert (tmp_path / existing).read_text(encoding="utf-8") == "* @existing-owner\n"
-    assert (tmp_path / ".github/workflows/autoform-verify.yml").is_file()
-
-
-@pytest.mark.parametrize("existing", ["/.github/ @maintainer\n", "# Owners are assigned per chapter.\n"])
-def test_force_keeps_an_existing_codeowners(existing: str, tmp_path: Path) -> None:
-    """The all-comment template in place of a maintainer's rules would switch them off."""
-    (tmp_path / ".github").mkdir()
-    (tmp_path / ".github/CODEOWNERS").write_text(existing, encoding="utf-8")
-    (tmp_path / ".github/autoform_audit.py").write_text("stale\n", encoding="utf-8")
 
     result = scaffold_project(
         tmp_path,
@@ -822,50 +796,8 @@ def test_force_keeps_an_existing_codeowners(existing: str, tmp_path: Path) -> No
         force=True,
     )
 
-    assert ".github/CODEOWNERS" in result.skipped
-    assert (tmp_path / ".github/CODEOWNERS").read_text(encoding="utf-8") == existing
-    assert ".github/autoform_audit.py" in result.written
-    assert (tmp_path / ".github/autoform_audit.py").read_text(encoding="utf-8") != "stale\n"
-
-
-@pytest.mark.parametrize("existing", ["CODEOWNERS", "docs/CODEOWNERS"])
-def test_a_directory_named_codeowners_hides_nothing(existing: str, tmp_path: Path) -> None:
-    """GitHub reads owner rules from a file; a directory of that name holds none."""
-    (tmp_path / existing).mkdir(parents=True)
-
-    result = scaffold_project(
-        tmp_path,
-        title="Finite Flat",
-        autoform_source="https://example.test/autoform.git",
-        autoform_ref="1" * 40,
-    )
-
-    assert ".github/CODEOWNERS" in result.written
-    assert (tmp_path / ".github/CODEOWNERS").is_file()
-
-
-def test_cli_says_why_it_left_codeowners_out(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    from autoform_cli.__main__ import main
-
-    (tmp_path / "CODEOWNERS").write_text("* @existing-owner\n", encoding="utf-8")
-    assert (
-        main(
-            [
-                "init",
-                str(tmp_path),
-                "--title",
-                "Finite Flat",
-                "--autoform-source",
-                "https://example.test/autoform.git",
-                "--autoform-ref",
-                "1" * 40,
-            ]
-        )
-        == 0
-    )
-
-    out = capsys.readouterr().out
-    assert "  = .github/CODEOWNERS (another CODEOWNERS exists, which this would hide)" in out
+    assert ".github/CODEOWNERS.autoform.example" in result.written
+    assert (tmp_path / existing).read_text(encoding="utf-8") == "* @existing-owner\n"
 
 
 @pytest.mark.parametrize("ref", ["main", "0f018613", "v1.0.0", "2" * 39, ("2" * 39) + "Z"])
@@ -963,7 +895,8 @@ def test_an_unsafe_plugin_pin_fails_closed_without_persisting_credentials(
     result = scaffold_module.scaffold_project(tmp_path, title="Finite Flat")
 
     assert result.unpinned is True
-    assert not (tmp_path / ".github").exists()
+    assert (tmp_path / ".github/CODEOWNERS.autoform.example").is_file()
+    assert not (tmp_path / ".github/autoform_audit.py").exists()
     assert secret_source not in "\n".join(
         path.read_text(encoding="utf-8")
         for path in tmp_path.rglob("*")

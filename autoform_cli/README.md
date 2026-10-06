@@ -149,8 +149,7 @@ autoform init . --title "Finite Flat Group Schemes" \
 ```
 
 Pass `--autoform-ref <sha>` to pin the generated workflows at an immutable
-commit, `--force` to overwrite existing files other than `.github/CODEOWNERS`,
-and `--json` for machine-readable output.
+commit, `--force` to overwrite, and `--json` for machine-readable output.
 An existing root `.gitignore` must be a bounded single-link regular file;
 missing Autoform rules are appended through one retained descriptor. If an
 append cannot be fully reverified, the error says it may be partial and the
@@ -939,53 +938,28 @@ fails with `kernel replay of the root package failed: ...`, which names the
 first one; the workflow's scan for the kernel-check bypass option is only
 lexical.
 
-The replay does not cover project code that runs during the audit. Lean runs
-project code while it builds and again when the probe imports the build: a
-root module's `run_cmd` or `#eval` runs during `lake build`, and the
-initializers of every module the probe imports, directly or not, run inside the
-probe's own `lean` process before its first command. That code can rewrite the
-audit script, the workflow's inputs, or the blueprint before the audit reads
-them, or end the probe with exit status 0, which the step takes as a pass. The
-replay can run such code as well: the kernel checks `Lean.reduceBool c` by
-running the code Lean compiled for `c`, so a root theorem proved that way runs a
-dependency's `implemented_by` implementation inside the probe, before the axiom
-check that would refuse the theorem for depending on `Lean.trustCompiler`. The
-probe's own commands are also elaborated against every module it imports, so
-an instance, macro, or elaborator from one of them can change what the checks
-compute without any IO: an ordinary instance can make the probe skip a
-declaration and still print its success line. Closing these needs a separate
-audit job that runs no project code and does not elaborate its checks against
-the project's modules; the generated workflow does not have one. The replay
-also covers only the root package: a dependency's declarations are imported as
-built, not replayed.
+The replay does not cover build-time IO. A root module's initializer or
+`run_cmd` runs during `lake build`, and its initializers run again when the
+probe imports it, so it can rewrite the audit script, the workflow's inputs, or
+the blueprint before the audit reads them. Closing that needs a separate audit
+job that runs no project code; the generated workflow does not have one.
 
-`autoform init` writes `.github/CODEOWNERS` alongside the workflows, with its
-rules commented out. Its two rules cover Autoform's control paths: a pull
-request can change `blueprint/roadmap/README.md`, whose `open_statements`
-setting decides whether a theorem may land with a `sorry` proof, or the
-workflows and the audit script, in the same change as the work they check. The
-Lean project's own build controls, its Lake configuration, `lean-toolchain`,
-and `lake-manifest.json`, decide what CI compiles; a project that wants their
-changes reviewed too adds rules for them. To make those changes wait for a
-maintainer, replace `@OWNER` with GitHub users or visible teams that have write
-access to the repository, uncomment the rules, and turn on "Require a pull
-request before merging", "Require review from Code Owners", and "Dismiss stale
-pull request approvals when new commits are pushed" in a branch protection rule
-or an active ruleset for the default branch. Without the last setting, an
-approval also covers commits pushed after it. The settings bind only those the
-rule does not exempt: a branch protection rule exempts repository
-administrators and custom roles with the "bypass branch protections"
-permission unless "Do not allow bypassing the above settings" is on, and
-exempts anyone listed under "Allow specified actors to bypass required pull
-requests"; a ruleset exempts everyone on its bypass list. An administrator, or
-a custom role with the "edit repository rules" permission, can also change or
-remove the rule. GitHub reads only the first of `.github/CODEOWNERS`,
-`CODEOWNERS`, and `docs/CODEOWNERS` that exists, so `init` leaves out
-`.github/CODEOWNERS` when a `CODEOWNERS` or `docs/CODEOWNERS` file exists; add
-the two rules there instead. Not even `init --force` replaces an existing
-`.github/CODEOWNERS`. These rules put changes to those files in front of a code
-owner; they do not stop project code from changing them on the runner during a
-build.
+`autoform init` writes `.github/CODEOWNERS.autoform.example`. GitHub ignores
+that filename, so the example cannot mask or replace a repository's active
+owners. Its two suggested rules cover Autoform's control paths: the roadmap's
+`open_statements` policy and `.github/` CI. To activate them, find the first
+existing CODEOWNERS file in GitHub's order (`.github/CODEOWNERS`, `CODEOWNERS`,
+then `docs/CODEOWNERS`), or choose `.github/CODEOWNERS` when none exists; copy
+the rules there, replace `@OWNER`, and uncomment them. Consider rules for the
+Lean build controls too: the Lake configuration, `lean-toolchain`, and
+`lake-manifest.json` decide what CI compiles.
+
+GitHub reads CODEOWNERS from a pull request's base branch, so the pull request
+that activates the rules still needs explicit maintainer review. Then require
+pull requests and code-owner review, dismiss stale approvals after new commits,
+and audit every branch-protection or ruleset bypass. These rules put changes in
+front of an owner; they do not stop project code from changing files on the CI
+runner.
 
 The step runs `autoform work assumptions` from `AUTOFORM_REF`, and the earlier
 `autoform check` step validates the frontmatter with that same pin. Scaffolded

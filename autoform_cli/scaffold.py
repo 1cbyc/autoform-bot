@@ -62,7 +62,7 @@ _REQUIRED_TEMPLATE_PATHS = frozenset(
         "blueprint/javascripts/mathjax.js",
         "blueprint/roadmap/README.md",
         "blueprint/sources/README.md",
-        "github/CODEOWNERS",
+        "github/CODEOWNERS.autoform.example",
         "github/autoform_audit.py",
         "github/workflows/autoform-verify.yml",
         "github/workflows/blueprint-pages.yml",
@@ -71,7 +71,6 @@ _REQUIRED_TEMPLATE_PATHS = frozenset(
         "theme/main.html",
     }
 )
-
 #: Where `claude plugin install` records the marketplace each plugin came from.
 _PLUGIN_REGISTRY = Path.home() / ".claude" / "plugins" / "known_marketplaces.json"
 
@@ -774,7 +773,11 @@ def _scaffold_plan(
     skipped: list[str] = []
     for relative, template_content, template_mode in templates:
         destination = _destination(relative)
-        if not autoform_ref and relative.startswith("github/"):
+        if (
+            not autoform_ref
+            and relative.startswith("github/")
+            and relative != "github/CODEOWNERS.autoform.example"
+        ):
             skipped.append(destination)
             continue
         if Path(relative).suffix in {".js", ".html"} or relative.endswith("gitignore"):
@@ -1087,18 +1090,6 @@ def scaffold_project(
                 raise ScaffoldError(
                     [f"refusing to write outside the project through a link: {probe}"]
                 )
-        # GitHub reads only the first of .github/CODEOWNERS, CODEOWNERS and
-        # docs/CODEOWNERS that exists, so this all-comment file would switch
-        # off the owners a repository already keeps in one of the others. It
-        # would do the same in place of an existing .github/CODEOWNERS, so not
-        # even --force replaces one. A directory of either other name is not a
-        # CODEOWNERS file and holds no rules.
-        if planned_file.relative == ".github/CODEOWNERS" and (
-            destination.exists()
-            or any((root / other).is_file() for other in ("CODEOWNERS", "docs/CODEOWNERS"))
-        ):
-            skipped.append(planned_file.relative)
-            continue
         if destination.exists() and not force:
             if planned_file.relative == ".gitignore":
                 if _append_gitignore_rules(destination, planned_file.content):
