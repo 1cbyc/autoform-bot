@@ -750,6 +750,32 @@ def test_nondirectory_lake_path_fails_closed_without_hiding_the_manifest(tmp_pat
     )
 
 
+def test_windows_style_missing_child_of_nondirectory_lake_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _project(tmp_path)
+    (root / ".lake").write_text("not a directory\n", encoding="utf-8")
+    override = root / ".lake/package-overrides.json"
+    real_stat = project_snapshot.os.stat
+
+    def windows_stat(path, *args, **kwargs):
+        if Path(path) == override and kwargs.get("follow_symlinks", True) is False:
+            raise FileNotFoundError(path)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(project_snapshot.os, "stat", windows_stat)
+
+    result = inspect_project(root)
+
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert any(
+        diagnostic.code == "unreadable-file"
+        and diagnostic.path == ".lake/package-overrides.json"
+        for diagnostic in result.diagnostics
+    )
+
+
 def test_lakefile_lean_cannot_confirm_an_inherited_mathlib(tmp_path: Path) -> None:
     root = _project(tmp_path, lakefile=None, manifest=(_mathlib(inherited=True),))
     (root / "lakefile.lean").write_text("import Lake\n", encoding="utf-8")
@@ -1562,6 +1588,47 @@ def test_symlinked_decision_files_are_followed_like_lake(tmp_path: Path, relativ
     assert result.ok, result.diagnostics
     assert result.compatibility.status == "supported"
     assert result.compatibility.release == "lean-v4.32.2-mathlib-v4.32.2"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX path-buffer semantics")
+def test_expanded_symlink_path_over_kernel_limit_is_unreadable(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "d").mkdir()
+    actual_lake = root / "actual-lake"
+    actual_lake.mkdir()
+    (actual_lake / "package-overrides.json").write_text(
+        json.dumps({"schemaVersion": "1.1.0", "packages": []}),
+        encoding="utf-8",
+    )
+    limit = os.pathconf(root, "PC_PATH_MAX")
+    pending_bytes = len(os.fsencode("/package-overrides.json"))
+    repeat = max(
+        1,
+        (limit - pending_bytes - len(actual_lake.name) + 8) // len("d/../") + 1,
+    )
+    raw_target = ("d/../" * repeat) + actual_lake.name
+    while len(os.fsencode(raw_target)) >= limit:
+        raw_target = raw_target.removeprefix("d/../")
+    expanded = os.path.join(raw_target, "package-overrides.json")
+    assert len(os.fsencode(expanded)) >= limit
+    link = root / ".lake"
+    link.symlink_to(raw_target, target_is_directory=True)
+
+    with pytest.raises(OSError) as native:
+        os.stat(link / "package-overrides.json")
+    assert native.value.errno == errno.ENAMETOOLONG
+
+    captured = project_snapshot._capture_file(root, ".lake/package-overrides.json")
+    result = inspect_project(root)
+
+    assert captured.state == "unreadable"
+    assert not result.ok
+    assert result.compatibility.status == "indeterminate"
+    assert any(
+        diagnostic.code == "unreadable-file"
+        and diagnostic.path == ".lake/package-overrides.json"
+        for diagnostic in result.diagnostics
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
