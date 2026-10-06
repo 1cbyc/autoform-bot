@@ -118,35 +118,37 @@ def test_development_guidance_uses_progressive_command_reference(repo_root: Path
     assert "| `target-unreadable` |" in inspection_reference
 
 
-def test_development_guidance_maintains_example_compatibility_pins(
-    repo_root: Path,
-) -> None:
-    development = (repo_root / "skills/develop-plugin/SKILL.md").read_text(
-        encoding="utf-8"
-    )
-    normalized = " ".join(development.split())
+def test_development_guidance_routes_repository_contracts(repo_root: Path) -> None:
+    skill_path = repo_root / "skills/develop-plugin/SKILL.md"
+    contracts_path = skill_path.parent / "references/repository-contracts.md"
+    skill = skill_path.read_text(encoding="utf-8")
+    contracts = contracts_path.read_text(encoding="utf-8")
+    normalized = " ".join(contracts.split())
 
-    assert "compatibility locks, not update channels" in normalized
-    assert "stay valid as `main` advances but grow feature-stale" in normalized
-    assert "canonical `facebookresearch` source and full SHA together" in normalized
-    assert "run the example commands through that exact pin" in normalized
-    assert "branch, tag, or personal fork" in normalized
+    assert "[repository contracts](references/repository-contracts.md)" in skill
+    assert "`refs/autoform-claims/*` is shared cross-machine coordination state" in normalized
+    assert "dashboard and publication overlay local-only" in normalized
+    assert "root `.gitignore` is a scaffold input, not a bundled-example mirror" in normalized
+    assert "GitHub Actions and Autoform workflow refs use full commit SHAs" in normalized
+    assert "Lean and Mathlib use tested matching release tags" in normalized
+    assert "do not follow the Autoform full-SHA rule" in normalized
 
 
-def test_root_agent_guidance_records_repository_invariants(repo_root: Path) -> None:
+def test_root_agent_guidance_routes_to_owning_documents(repo_root: Path) -> None:
     guidance = (repo_root / "AGENTS.md").read_text(encoding="utf-8")
-    normalized = " ".join(guidance.split())
 
-    for required in (
-        "Never develop on another contributor's fork",
-        "separate worktree and branch for each PR",
-        "compatibility lock, not an update channel",
-        "run the workflow command through that exact Git URL and SHA",
+    for relative in ("CONTRIBUTING.md", "skills/develop-plugin/SKILL.md"):
+        assert f"]({relative})" in guidance
+        assert (repo_root / relative).is_file()
+
+    assert len(guidance.split()) <= 150
+    for product_detail in (
         "make lint",
-        "make test",
-        "make check-example",
+        "compatibility lock",
+        "refs/autoform-claims",
+        "marker schema",
     ):
-        assert required in normalized
+        assert product_detail not in guidance
 
 
 def test_agent_review_treats_skeleton_hashes_as_advisory(repo_root: Path) -> None:
