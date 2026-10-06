@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from .. import scaffold
+from ..claims import _reject_json_constant, _strict_json_object
 from ..graph import _parse_node
 from ..scaffold import (
     DEFAULT_AUTOFORM_SOURCE,
@@ -462,8 +463,6 @@ def _validate_target(target: str | Path | None) -> Path:
         raw = selected.absolute()
     except (OSError, RuntimeError, TypeError, ValueError):
         raise ProjectCreateError("project-target-invalid", "The project target cannot be resolved safely.") from None
-    if raw.name in {"", ".", ".."}:
-        raise ProjectCreateError("project-target-invalid", "The project target must name a new directory.")
     try:
         metadata = raw.parent.stat()
     except OSError as error:
@@ -514,11 +513,10 @@ def _open_parent(parent: Path) -> int:
             "project-create-safety-unavailable",
             "This platform cannot create the project with the required path safety.",
         )
-    absolute = parent.absolute()
     try:
-        descriptor = _open_directory(None, absolute.anchor)
+        descriptor = _open_directory(None, parent.anchor)
         try:
-            for part in absolute.parts[1:]:
+            for part in parent.parts[1:]:
                 try:
                     child = _open_directory(descriptor, part)
                 except NotADirectoryError:
@@ -648,8 +646,6 @@ def _list_directory(directory_descriptor: int) -> set[str]:
 
 def _descriptor_identity(descriptor: int) -> tuple[int, int, int]:
     metadata = os.fstat(descriptor)
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise OSError(errno.ENOTDIR, "staging path is not a directory")
     return metadata.st_dev, metadata.st_ino, metadata.st_uid
 
 
@@ -659,11 +655,7 @@ def _entry_matches_descriptor(parent_descriptor: int, name: str, descriptor: int
         metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except (OSError, UnicodeError):
         return False
-    return (
-        stat.S_ISDIR(metadata.st_mode)
-        and metadata.st_uid == os.geteuid()
-        and (metadata.st_dev, metadata.st_ino, metadata.st_uid) == expected
-    )
+    return metadata.st_uid == os.geteuid() and (metadata.st_dev, metadata.st_ino, metadata.st_uid) == expected
 
 
 def _require_stage_identity(parent_descriptor: int, name: str, stage_descriptor: int) -> None:
@@ -780,10 +772,7 @@ def _parse_release_bundle(
     manifest_bytes: bytes, release: SupportedRelease, module_roots: tuple[str, ...]
 ) -> _ReleaseBundle:
     invalid = ProjectCreateError("project-create-validation-failed", _MANIFEST_MESSAGE)
-    try:
-        payload = _load_strict_json(manifest_bytes)
-    except (OSError, TypeError, UnicodeError, ValueError, RecursionError, MemoryError):
-        raise invalid from None
+    payload = _load_strict_json(manifest_bytes)
     if (
         type(payload) is not dict
         or set(payload) != _MANIFEST_FIELDS
@@ -881,15 +870,7 @@ def _safe_relative(value: object) -> bool:
 def _load_strict_json(data: bytes) -> object:
     """Parse JSON, rejecting duplicate keys and NaN or Infinity."""
 
-    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        if len({key for key, _ in pairs}) != len(pairs):
-            raise ValueError("duplicate JSON key")
-        return dict(pairs)
-
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"invalid JSON constant: {value}")
-
-    return json.loads(data, object_pairs_hook=reject_duplicates, parse_constant=reject_constant)
+    return json.loads(data, object_pairs_hook=_strict_json_object, parse_constant=_reject_json_constant)
 
 
 def _lake_manifest(package: str, bundle: _ReleaseBundle) -> bytes:

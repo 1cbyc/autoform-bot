@@ -275,6 +275,7 @@ def test_an_unlisted_pair_never_publishes_a_template_manifest(
         create_project(target, package="Project", release_id=None, lean_toolchain="v4.30.0")
 
     assert raised.value.code == "project-create-validation-failed"
+    assert ".autoform-new-* stage may remain" in raised.value.message
     assert not target.exists()
     stages = list(tmp_path.glob(".autoform-new-*"))
     assert len(stages) == 1
@@ -994,27 +995,6 @@ def test_injected_build_failure_preserves_the_empty_stage(tmp_path: Path, monkey
     stages = list(tmp_path.glob(".autoform-new-*"))
     assert len(stages) == 1
     assert not list(stages[0].iterdir())
-
-
-def test_injected_validation_failure_preserves_stage_for_safe_recovery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = tmp_path / "project"
-    original = create_module._materialize_project
-
-    def fail(*args, **kwargs):
-        original(*args, **kwargs)
-        raise ProjectCreateError("project-create-validation-failed", "invalid")
-
-    monkeypatch.setattr(create_module, "_materialize_project", fail)
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-    assert raised.value.code == "project-create-validation-failed"
-    assert ".autoform-new-* stage may remain" in raised.value.message
-    assert not target.exists()
-    stages = list(tmp_path.glob(".autoform-new-*"))
-    assert len(stages) == 1
-    assert (stages[0] / "lean-toolchain").is_file()
 
 
 def test_invalid_planned_roadmap_is_never_published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
