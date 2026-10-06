@@ -262,6 +262,25 @@ def test_incomplete_local_templates_are_not_published(
     assert not list(tmp_path.glob(".autoform-new-*"))
 
 
+def test_an_unlisted_pair_never_publishes_a_template_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = tmp_path / "templates"
+    shutil.copytree(create_module._TEMPLATES, templates)
+    (templates / "lake-manifest.json").write_text('{"version": "1.1.0", "packages": []}\n', encoding="utf-8")
+    target = tmp_path / "Project"
+    monkeypatch.setattr(create_module, "_TEMPLATES", templates)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=None, lean_toolchain="v4.30.0")
+
+    assert raised.value.code == "project-create-validation-failed"
+    assert not target.exists()
+    stages = list(tmp_path.glob(".autoform-new-*"))
+    assert len(stages) == 1
+    assert (stages[0] / "lake-manifest.json").is_file()
+
+
 def test_group_writable_installed_templates_publish_canonical_modes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -447,6 +466,30 @@ def test_every_release_has_creation_contracts() -> None:
             "Qq",
             "Std",
         }
+
+
+@pytest.mark.parametrize("resource", ["manifest\ue000.json", "manifest\U0001f600.json"])
+def test_release_metadata_names_its_manifest_below_the_surrogate_range(
+    monkeypatch: pytest.MonkeyPatch, resource: str
+) -> None:
+    release = load_release_catalog().recommended
+    name = f"creation-release-{release.id}.json"
+    payload = json.loads(create_module.files("autoform_cli.project").joinpath(name).read_bytes())
+    payload["lake_manifest"] = resource
+
+    class Resources:
+        def joinpath(self, _name: str) -> Resources:
+            return self
+
+        def read_bytes(self) -> bytes:
+            return json.dumps(payload).encode()
+
+    monkeypatch.setattr(create_module, "files", lambda _package: Resources())
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_module._load_creation_release_descriptor(release)
+
+    assert raised.value.code == "project-create-validation-failed"
 
 
 @pytest.mark.parametrize("missing", ["Aesop", "Archive", "Counterexamples"])

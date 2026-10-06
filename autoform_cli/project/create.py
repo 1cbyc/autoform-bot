@@ -193,6 +193,11 @@ def create_project(
         os.fchmod(stage_descriptor, 0o755)
         os.fsync(stage_descriptor)
         _verify_project_tree(stage_descriptor, tree)
+        # Templates may carry a root manifest; only a catalog release may publish one.
+        if ("lake-manifest.json" in tree) != (release_bundle is not None):
+            raise ProjectCreateError(
+                "project-create-validation-failed", "The staged project did not satisfy Autoform's project contracts."
+            )
         # Reopen the requested parent path with O_NOFOLLOW at the last possible
         # moment, and publish through it only if it still names the directory
         # we locked and staged in. A mismatch leaves the complete stage untouched.
@@ -760,6 +765,7 @@ def _load_creation_release_descriptor(release: SupportedRelease) -> _CreationRel
         or type(resource) is not str
         or not resource.endswith(".json")
         or not _safe_relative(resource)
+        or any(ord(character) >= 0xD800 for character in resource)
         or "/" in resource
         or type(roots) is not list
         or not roots
