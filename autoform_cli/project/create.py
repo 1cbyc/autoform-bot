@@ -191,14 +191,16 @@ def create_project(
         stage_name = _create_stage(parent_descriptor)
         stage_descriptor = _open_directory(parent_descriptor, stage_name)
         _materialize_project(stage_descriptor, tree)
-        os.fchmod(stage_descriptor, 0o755)
-        os.fsync(stage_descriptor)
-        _verify_project_tree(stage_descriptor, tree)
-        # Templates may carry a root manifest; only a catalog release may publish one.
+        # Templates may carry a root manifest; only a catalog release may
+        # publish one. Refuse while the populated recovery stage is still
+        # private to this user.
         if ("lake-manifest.json" in tree) != (release_bundle is not None):
             raise ProjectCreateError(
                 "project-create-validation-failed", "The staged project did not satisfy Autoform's project contracts."
             )
+        os.fchmod(stage_descriptor, 0o755)
+        os.fsync(stage_descriptor)
+        _verify_project_tree(stage_descriptor, tree)
         # Reopen the requested parent path with O_NOFOLLOW at the last possible
         # moment, and publish through it only if it still names the directory
         # we locked and staged in. A mismatch leaves the complete stage untouched.
