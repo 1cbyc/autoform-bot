@@ -1009,8 +1009,8 @@ Markdown (step 6); Formalize carries out the Lean side (steps 1 to 5).
      deprecated, `sorry`'d X, show "conditional, assumes R" although R's text
      now describes X', and keep X out of `deprecated_unused`, so R could never
      record its proof. The claim set is every article whose frontmatter or
-     Lean changes: R, the statement-impacted articles, and, in that case, the
-     proof-impacted ones.
+     Lean changes: R, the statement-impacted articles, the unused statement
+     dependencies, and, in that case, the proof-impacted ones.
    - **In place**, only when X and X' cannot coexist, for example an instance
      or a structure change: the claim set is every `claim_targets` entry.
      Repair every impacted declaration in one commit whose default build
@@ -1029,6 +1029,12 @@ Markdown (step 6); Formalize carries out the Lean side (steps 1 to 5).
      uses it. When neither applies, the
      revision is blocked: release the claims and report it. Record what
      happened under `## Execution notes` of each touched article.
+
+   An unused statement dependency, which rules out the contained route, is
+   re-reviewed under X's new meaning like a statement-impacted article: it
+   keeps `statement` only after an Agent Review of its source faithfulness;
+   otherwise it records `statement: retracted`, loses `proof`, and keeps
+   `lean:`.
 3. Claim the route's claim set with one `autoform claim acquire`. When it is
    refused, release everything and report the held claim as the blocker. After
    acquiring, re-run `work impact`; if the set grew, release and start over
