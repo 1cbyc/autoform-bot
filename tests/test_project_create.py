@@ -1221,6 +1221,8 @@ def test_workspace_substitution_fails_before_publication(tmp_path: Path, monkeyp
     assert raised.value.code == "project-create-failed"
     assert not target.exists()
     assert any(path.name == "FOREIGN" for path in tmp_path.rglob("FOREIGN"))
+    # The renamed stage is refused before its chmod, so the written tree stays private.
+    assert stat.S_IMODE(next(tmp_path.glob(".autoform-new-*-owned")).stat().st_mode) == 0o700
 
 
 def test_stage_path_substitution_never_writes_to_symlink_target(

@@ -193,6 +193,7 @@ def create_project(
         stage_descriptor = _open_directory(parent_descriptor, stage_name)
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
         _materialize_project(stage_descriptor, tree)
+        _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
         # Templates may carry a root manifest; only a catalog release may publish one.
         # Refuse it before the chmod, while the populated stage is still private.
         if release_bundle is None and "lake-manifest.json" in tree:
