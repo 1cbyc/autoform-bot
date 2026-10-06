@@ -1062,11 +1062,10 @@ Markdown (step 6); Formalize carries out the Lean side (steps 1 to 5).
    records the decision and retracts the article: it replaces `statement:
    formalized` with `statement: retracted`, removes `proof: formalized`, and
    keeps `lean:`, which `work impact` needs, so the article returns to the
-   frontier as a revision; an article without `lean:` just loses `statement`
-   and `proof`. It retracts only that article and the dependents whose
-   Markdown text the revision rewrites; the Lean-side impact decides every
-   other dependent. Roadmap edits only Markdown: it releases its claims and
-   leaves the Lean revision to Formalize.
+   frontier as a revision. It retracts only that article and the dependents
+   whose Markdown text the revision rewrites; the Lean-side impact decides
+   every other dependent. Roadmap edits only Markdown: it releases its claims
+   and leaves the Lean revision to Formalize.
 
 ## Local runtime doctor
 
