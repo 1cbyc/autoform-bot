@@ -12,6 +12,8 @@ from autoform_cli.markdown import (
     article_parts,
     content,
     content_lines,
+    has_substance,
+    is_placeholder,
     link_targets,
     local_target_issue,
     markdown_anchors,
@@ -20,6 +22,7 @@ from autoform_cli.markdown import (
     PublishedTable,
     published_tables,
     rendered_visible_text,
+    visible_prose,
 )
 
 #: Heading forms whose published anchors are easy to get subtly wrong, paired
@@ -517,3 +520,91 @@ def test_a_title_below_a_section_ends_that_section() -> None:
         ArticleSection("Depends on", "## Depends on", "- [Base](base.md)"),
         ArticleSection("Sources", "## Sources", ""),
     )
+
+
+@pytest.mark.parametrize(
+    "visible",
+    [
+        "TODO",
+        "tbd.",
+        "**TODO.**",
+        "todo tbd",
+        "TODO: state it",
+        "TBD - pick one",
+        "Pending \u2013 later",
+        "TODO -",
+        "TODO\u2014later",
+        "TODO -- later",
+        "TODO--later",
+    ],
+)
+def test_is_placeholder_accepts_bare_and_marker_placeholders(visible: str) -> None:
+    assert is_placeholder(visible)
+
+
+@pytest.mark.parametrize(
+    "visible",
+    [
+        "",
+        "Pending Mathlib PR 1234",
+        "TODO state it",
+        "Let x be a todo list.",
+        "TODO-lists form a monoid.",
+        "Unknown-variance case: the sample mean is normal.",
+    ],
+)
+def test_is_placeholder_leaves_sentences_alone(visible: str) -> None:
+    assert not is_placeholder(visible)
+
+
+def test_a_dash_joining_two_words_does_not_mark_a_placeholder() -> None:
+    assert not is_placeholder("Unknown\u2013known duality holds for every pair.")
+    assert not is_placeholder("Unknown-variance case.")
+    for marker in ("TODO \u2013 later", "TODO\u2013 later", "TBD\u2014write this", "Unknown: x", "TODO - x"):
+        assert is_placeholder(marker), marker
+
+
+@pytest.mark.parametrize(("visible", "expected"), [("", False), ("...", False), ("**_~", False), ("x", True)])
+def test_has_substance_needs_a_word_character(visible: str, expected: bool) -> None:
+    assert has_substance(visible) is expected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "### Setting\n\nLet x.",
+        "Setting\n=======\n\nLet x.",
+        "> ### Quoted\n> Let x.",
+        "```lean\ntheorem t : True\n```\n\nLet x.",
+        "```mermaid\ngraph TD\n```\n\nLet x.",
+        "    indented code\n\nLet x.",
+        "<!-- note -->Let x.",
+    ],
+)
+def test_visible_prose_leaves_out_headings_code_blocks_and_diagrams(source: str) -> None:
+    assert visible_prose(source) == "Let x."
+
+
+def test_visible_prose_keeps_inline_code_and_drops_hidden_text() -> None:
+    assert visible_prose("Use `Nat.add_zero`.") == "Use Nat.add_zero."
+    assert visible_prose("<span hidden>secret</span> shown") == "shown"
+
+
+def test_visible_text_survives_markup_nested_thousands_deep() -> None:
+    source = "<span>" * 3000 + "x"
+
+    assert rendered_visible_text(source) == "x"
+    assert visible_prose(source) == "x"
+
+
+def test_a_statement_the_renderer_gives_up_on_does_not_spoil_the_next_one() -> None:
+    import autoform_cli.markdown as markdown_module
+
+    # A list nested this deep exhausts the renderer. The failure must stay
+    # with that text and not leave the shared converter half-finished.
+    with pytest.raises(RecursionError):
+        markdown_module.render_html("- " * 500 + "x")
+    assert visible_prose("- " * 500 + "x") == ""
+
+    assert visible_prose("[ ](missing.md)") == ""
+    assert visible_prose("**Let** x.") == "Let x."

@@ -94,6 +94,14 @@ _NON_VISIBLE_TAGS = frozenset({"script", "style", "template", "noscript", "head"
 #: Runs of whitespace, which HTML collapses when it draws them.
 _WHITESPACE = re.compile(r"\s+")
 
+#: Words that name the absence of a decision.
+_PLACEHOLDER_WORDS = frozenset({"pending", "placeholder", "todo", "tbd", "unknown"})
+#: Punctuation that turns a leading placeholder into a marker, as in ``TODO:``.
+#: A single hyphen needs space after it, so ``Unknown-variance`` stays a word.
+_MARKER_PUNCTUATION = re.compile(r"^\s*(?:[:\u2014]|--|[-\u2013]\s)")
+#: Elements that label or illustrate prose without being prose.
+_NON_PROSE_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6", "pre"})
+
 
 @dataclass(frozen=True, slots=True)
 class Content:
@@ -219,7 +227,13 @@ def render_html(text: str) -> str:
 
     converter = _converter()
     converter.reset()
-    return converter.convert(text)
+    try:
+        return converter.convert(text)
+    except Exception:
+        # A conversion that fails midway leaves the converter unable to render
+        # the next document, and ``reset`` does not repair it.
+        _converter.cache_clear()
+        raise
 
 
 def render_tree(text: str) -> object | None:
@@ -257,6 +271,59 @@ def rendered_visible_text(value: str) -> str:
         # vouch for, so report no visible text rather than guess.
         return ""
     return _collapse("".join(_visible_parts(tree, hidden=False)))
+
+
+def visible_prose(value: str) -> str:
+    """Return the prose a reader sees once ``value`` is published.
+
+    Headings, code blocks and diagrams are left out: a heading names what
+    follows and a block of code illustrates it, but neither says it. Inline
+    code stays, because a sentence may name a declaration.
+    """
+
+    tree = render_tree(value)
+    if tree is None:
+        return ""
+    for element in tree.iter():
+        if _local_name(element) in _NON_PROSE_TAGS or "mermaid" in element.get("class", "").split():
+            element.set("hidden", "")
+    return _collapse("".join(_visible_parts(tree, hidden=False)))
+
+
+def has_substance(visible: str) -> bool:
+    """Whether anything a reader could act on survives emphasis and punctuation."""
+
+    return bool(re.search(r"\w", re.sub(r"[*_~\\]", "", visible)))
+
+
+def is_placeholder(visible: str) -> bool:
+    """Whether the text only announces that a decision is still outstanding.
+
+    Two shapes are rejected. Text whose every word is a placeholder, however
+    decorated -- ``TBD``, ``**TODO.**`` -- and text that opens with one used as
+    a marker, where punctuation separates it from the rest: ``TODO: choose a
+    milestone``.
+
+    A status word that merely begins a sentence is left alone, because it is
+    usually carrying real information: "Pending Mathlib PR 1234" and "Unknown
+    provenance, excluded by agreement" both name something a reader can check.
+    Rejecting those pushed authors toward vaguer wording to satisfy the checker.
+
+    The gap this leaves is a marker written without punctuation, as in "TODO
+    choose a milestone". That reads as prose to any rule cheap enough to trust,
+    so it is left to human review rather than guessed at.
+    """
+
+    stripped = re.sub(r"[*_~\\]", "", visible)
+    words = re.findall(r"\w+", stripped.casefold())
+    if not words:
+        return False
+    if all(word in _PLACEHOLDER_WORDS for word in words):
+        return True
+    if words[0] not in _PLACEHOLDER_WORDS:
+        return False
+    _, _, remainder = stripped.casefold().partition(words[0])
+    return _MARKER_PUNCTUATION.match(remainder) is not None
 
 
 def published_tables(text: str) -> list[PublishedTable]:
@@ -359,21 +426,29 @@ def _collapse(text: str) -> str:
 def _visible_parts(element: object, hidden: bool) -> list[str]:
     """Walk a parsed tree, collecting only the text a browser would draw."""
 
-    if not isinstance(element.tag, str):
-        # A comment or processing instruction. Its text is markup, not content,
-        # and a reader never sees it. Any tail text belongs to the parent, which
-        # collects it below.
-        return []
-    concealed = _conceals(element, hidden)
     parts: list[str] = []
-    if not concealed and element.text:
-        parts.append(element.text)
-    for child in element:
-        parts.extend(_visible_parts(child, concealed))
-        # Tail text sits in this element, not the child, so it is hidden only
-        # when this element is.
-        if not concealed and child.tail:
-            parts.append(child.tail)
+    # An explicit stack, so markup nested a thousand elements deep cannot
+    # exhaust the interpreter's own.
+    pending: list[tuple[object, bool]] = [(element, hidden)]
+    while pending:
+        item, inherited = pending.pop()
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item.tag, str):
+            # A comment or processing instruction. Its text is markup, not
+            # content, and a reader never sees it. Any tail text belongs to the
+            # parent, which queued it below.
+            continue
+        concealed = _conceals(item, inherited)
+        if not concealed and item.text:
+            parts.append(item.text)
+        for child in reversed(item):
+            # Tail text sits in this element, not the child, so it is hidden
+            # only when this element is.
+            if not concealed and child.tail:
+                pending.append((child.tail, False))
+            pending.append((child, concealed))
     return parts
 
 
@@ -720,6 +795,8 @@ __all__ = [
     "content",
     "content_lines",
     "frontmatter_end",
+    "has_substance",
+    "is_placeholder",
     "link_targets",
     "local_target_issue",
     "markdown_anchors",
@@ -732,4 +809,5 @@ __all__ = [
     "rendered_visible_text",
     "site_converter",
     "strip_line_comments",
+    "visible_prose",
 ]

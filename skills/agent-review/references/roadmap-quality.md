@@ -39,6 +39,8 @@ scope against the sources, then inspect the fine DAG and its coarse roadmap.
 
 - Titles, paths, source links, and proof sketches let a contributor understand
   the intended change without reconstructing the plan from unrelated pages.
+- Each statement uses standard notation, gives context for each symbol, says
+  what the result is for, and contains no proof steps.
 - Frontmatter asserts only verified facts. Readiness and completion remain
   derived from the DAG.
 - Uncertainty, Mathlib candidates, and unresolved source questions are explicit.

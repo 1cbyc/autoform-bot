@@ -754,16 +754,6 @@ def test_audit_ignores_a_depends_heading_that_is_not_published(tmp_path: Path) -
     assert codes == {"missing-depends-section"}
 
 
-def test_missing_statement_text_names_the_span_the_audit_reads(tmp_path: Path) -> None:
-    blueprint = tmp_path / "blueprint"
-    _coverage(blueprint)
-    _article(blueprint, "chapter/result.md", prose="", declaration="theorem")
-
-    assert _finding_map(blueprint)["roadmap/chapter/result.md"] == [
-        ("missing-statement-text", "formalizable article has no statement text before its first H2 section")
-    ]
-
-
 def test_audit_reads_the_depends_heading_without_regard_to_case(tmp_path: Path) -> None:
     blueprint = tmp_path / "blueprint"
     _coverage(blueprint)
@@ -803,3 +793,116 @@ def test_audit_does_not_read_a_comment_begun_on_the_title_line_as_prose(tmp_path
     codes = {code for code, _reason in _finding_map(blueprint)["roadmap/chapter/result.md"]}
 
     assert codes == {"missing-statement-text"}
+
+
+def _statement_codes(tmp_path: Path, prose: str) -> set[str]:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "chapter/result.md", prose=prose, declaration="theorem")
+    return {code for code, _reason in _finding_map(blueprint).get("roadmap/chapter/result.md", [])}
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "TODO",
+        "TODO: state it",
+        "##### Setting\n\nTODO",
+        "Setting\n=======\n\nTODO",
+        "> ### Setting\n> TODO",
+        "```lean\ntheorem draft : True := trivial\n```\n\nTODO",
+        "```mermaid\ngraph TD\n```\n\nTODO",
+        "TODO: tighten the bound.\n\nFor every $n$, $n + 0 = n$.",
+        "<!-- For every $n$, $n + 0 = n$. -->\nTBD",
+        "Unknown: whether $P = NP$.",
+    ],
+)
+def test_audit_reports_a_placeholder_statement(tmp_path: Path, prose: str) -> None:
+    assert _statement_codes(tmp_path, prose) == {"placeholder-statement-text"}
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "<span hidden>For every $n$, $n + 0 = n$.</span>",
+        "---",
+        "[ ](missing.md)",
+        "![diagram](diagram.png)",
+        "...",
+    ],
+)
+def test_audit_reports_a_statement_that_shows_a_reader_nothing(tmp_path: Path, prose: str) -> None:
+    assert _statement_codes(tmp_path, prose) == {"empty-statement-text"}
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "Pending Mathlib PR 1234, this is `Nat.add_zero`.",
+        "TODO state it",
+        "$$\nn + 0 = n\n$$",
+        "`Nat.add_zero`",
+        "<div>\n\n    For all n.\n\n</div>",
+        "TODO-lists form a monoid.",
+        "Unknown-variance case: the sample mean is normal.",
+    ],
+)
+def test_audit_accepts_a_statement_that_says_something(tmp_path: Path, prose: str) -> None:
+    assert _statement_codes(tmp_path, prose) == set()
+
+
+def test_audit_reads_a_comment_opener_in_inline_code_as_the_site_does(tmp_path: Path) -> None:
+    # The site prints the code span and the sentence, so the statement is not
+    # a placeholder. Splitting the article still takes ``<!--`` for a comment,
+    # a separate fault, and not one in the statement.
+    assert "placeholder-statement-text" not in _statement_codes(tmp_path, "TODO `<!--` real statement here")
+
+
+def test_audit_reports_one_statement_finding_at_a_time(tmp_path: Path) -> None:
+    # Nothing published at all is "missing", never also "empty".
+    assert _statement_codes(tmp_path, "<!-- TODO -->") == {"missing-statement-text"}
+
+
+def test_a_statement_the_site_publishes_from_a_fence_that_never_closes_is_not_missing(tmp_path: Path) -> None:
+    assert _statement_codes(tmp_path, "```\nFor all n, P(n) holds.") == set()
+    assert _statement_codes(tmp_path, "```\nTODO") == {"placeholder-statement-text"}
+
+
+def test_statement_findings_say_what_is_wrong(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "chapter/none.md", prose="", declaration="theorem")
+    _article(blueprint, "chapter/todo.md", prose="TODO", declaration="theorem")
+    _article(blueprint, "chapter/rule.md", prose="---", declaration="theorem")
+
+    findings = _finding_map(blueprint)
+
+    assert findings["roadmap/chapter/none.md"] == [
+        ("missing-statement-text", "formalizable article has no statement text before its first H2 section")
+    ]
+    assert findings["roadmap/chapter/todo.md"] == [
+        (
+            "placeholder-statement-text",
+            "formalizable article's statement is a placeholder, or opens with one used as a marker",
+        )
+    ]
+    assert findings["roadmap/chapter/rule.md"] == [
+        ("empty-statement-text", "formalizable article's statement has no prose with a letter or digit")
+    ]
+
+
+def test_audit_leaves_a_placeholder_alone_outside_formalizable_articles(tmp_path: Path) -> None:
+    blueprint = tmp_path / "blueprint"
+    _coverage(blueprint)
+    _article(blueprint, "chapter/README.md", prose="TODO")
+    _article(blueprint, "chapter/result.md", declaration="theorem")
+
+    assert "roadmap/chapter/README.md" not in _finding_map(blueprint)
+
+
+def test_bundled_example_has_no_statement_text_finding(repo_root: Path) -> None:
+    blueprint = repo_root / "skills" / "setup" / "assets" / "cabannes-thesis-project" / "blueprint"
+
+    codes = {finding.code for finding in audit_blueprint(blueprint).findings}
+
+    assert not codes & {"missing-statement-text", "empty-statement-text", "placeholder-statement-text"}

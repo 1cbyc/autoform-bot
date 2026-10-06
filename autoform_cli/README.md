@@ -849,6 +849,30 @@ The audit API also accepts an already compiled graph. Formalize may use its
 findings while working the Markdown frontier, but the audit itself never
 enqueues work, stamps articles, or creates another graph artifact.
 
+### Statement text
+
+A formalizable article must state its result in prose a reader sees. At most
+one of three findings reports a statement that does not, checked in this order:
+
+- `missing-statement-text`: the statement has no prose outside code blocks, HTML
+  comments, and headings.
+- `empty-statement-text`: the published prose has no letter or digit, as with a
+  hidden element, a horizontal rule, an image, or a link with no text.
+- `placeholder-statement-text`: every word is one of `pending`, `placeholder`,
+  `todo`, `tbd`, `unknown`, or the statement opens with one of them followed by
+  a colon or a dash, as in `TODO: state it`. A single hyphen or en dash counts
+  only with a space after it, so `Unknown-variance` is a word.
+
+The prose is read as the site publishes it, without headings, code blocks, and
+diagrams; inline code and mathematics count. A status word that begins a
+sentence passes ("Pending Mathlib PR 1234 ..."), and so does a marker written
+without punctuation; both are left to review. A real statement that opens
+`Unknown: ...` or `Pending: ...` is reported and needs rewording, and so does
+one written in symbols alone, such as `⊥ ≠ ⊤.`, which has no letter or digit.
+A reference-style link is read
+without its definition when that sits in a later section. Coverage evidence is
+held to the same placeholder rule.
+
 ## Open statements
 
 By default a project runs the strict policy: CI rejects every `sorry`, so a

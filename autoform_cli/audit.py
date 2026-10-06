@@ -28,9 +28,12 @@ from .lean import (
 )
 from .markdown import article_parts as _article_parts
 from .markdown import content_lines as _content_lines
+from .markdown import has_substance as _has_substance
 from .markdown import HEADING as _HEADING
+from .markdown import is_placeholder as _is_placeholder
 from .markdown import local_target_issue as _local_target_issue
 from .markdown import markdown_links as _markdown_links
+from .markdown import visible_prose as _visible_prose
 
 #: More siblings than this at one level is a table of contents, not a chapter.
 _MAX_DIRECT_CHILDREN = 24
@@ -175,14 +178,9 @@ def audit_graph(
                         "formalizable article has contained articles; declaration-sized articles must be leaves",
                     )
                 )
-            if not article.statement_text:
-                findings.append(
-                    AuditFinding(
-                        article_path,
-                        "missing-statement-text",
-                        "formalizable article has no statement text before its first H2 section",
-                    )
-                )
+            statement_finding = _statement_finding(article.statement)
+            if statement_finding is not None:
+                findings.append(AuditFinding(article_path, *statement_finding))
             if not article.has_depends_section:
                 findings.append(
                     AuditFinding(
@@ -249,7 +247,7 @@ def audit_graph(
 
 @dataclass(frozen=True, slots=True)
 class _ArticleShape:
-    statement_text: bool
+    statement: str
     has_depends_section: bool
 
 
@@ -257,16 +255,34 @@ def _read_article(path: Path) -> _ArticleShape:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
-        return _ArticleShape(False, False)
+        return _ArticleShape(statement="", has_depends_section=False)
 
     parts = _article_parts(text)
     return _ArticleShape(
-        # A subheading names what follows; alone it states nothing.
-        statement_text=any(
-            line.strip() and not _HEADING.match(line) for line in _content_lines(parts.statement)
-        ),
+        statement=parts.statement,
         has_depends_section=any(section.title.casefold() == "depends on" for section in parts.sections),
     )
+
+
+def _statement_finding(statement: str) -> tuple[str, str] | None:
+    """Return the code and reason for what is wrong with a statement's text, if anything.
+
+    The text is judged as the site publishes it, so a hidden element, an image
+    or a bare rule states nothing however much source it takes.
+    """
+
+    prose = _visible_prose(statement)
+    if not _has_substance(prose):
+        # A subheading names what follows; alone it states nothing.
+        if not any(line.strip() and not _HEADING.match(line) for line in _content_lines(statement)):
+            return "missing-statement-text", "formalizable article has no statement text before its first H2 section"
+        return "empty-statement-text", "formalizable article's statement has no prose with a letter or digit"
+    if _is_placeholder(prose):
+        return (
+            "placeholder-statement-text",
+            "formalizable article's statement is a placeholder, or opens with one used as a marker",
+        )
+    return None
 
 
 def _source_findings(graph: Graph, node: Node, article_path: str) -> list[AuditFinding]:
