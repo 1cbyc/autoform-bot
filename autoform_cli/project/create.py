@@ -67,6 +67,7 @@ _UNSAFE_PARENT_MESSAGE = (
 _FAILED_MESSAGE = "Project creation failed; no project was created."
 _EXISTS_MESSAGE = "The target already exists; project new never overwrites it."
 _CONTRACTS_MESSAGE = "The generated project did not satisfy Autoform's project contracts."
+_STAGED_MESSAGE = "The staged project did not satisfy Autoform's project contracts."
 _DESCRIPTOR_MESSAGE = "The bundled project-creation release metadata is invalid."
 _MANIFEST_MESSAGE = "The bundled release manifest is invalid."
 _NO_RENAME_MESSAGE = "This platform cannot atomically publish a new project without replacement."
@@ -192,14 +193,13 @@ def create_project(
         stage_descriptor = _open_directory(parent_descriptor, stage_name)
         _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
         _materialize_project(stage_descriptor, tree)
+        # Templates may carry a root manifest; only a catalog release may publish one.
+        # Refuse it before the chmod, while the populated stage is still private.
+        if release_bundle is None and "lake-manifest.json" in tree:
+            raise ProjectCreateError("project-create-validation-failed", _STAGED_MESSAGE)
         os.fchmod(stage_descriptor, 0o755)
         os.fsync(stage_descriptor)
         _verify_project_tree(stage_descriptor, tree)
-        # Templates may carry a root manifest; only a catalog release may publish one.
-        if ("lake-manifest.json" in tree) != (release_bundle is not None):
-            raise ProjectCreateError(
-                "project-create-validation-failed", "The staged project did not satisfy Autoform's project contracts."
-            )
         # Reopen the requested parent path with O_NOFOLLOW at the last possible
         # moment, and publish through it only if it still names the directory
         # we locked and staged in. A mismatch leaves the complete stage untouched.
@@ -990,9 +990,7 @@ def _verify_project_tree(root_descriptor: int, tree: dict[str, object]) -> None:
 
 
 def _validate_roadmap_plan(plan: tuple[_ScaffoldFile, ...]) -> None:
-    invalid = ProjectCreateError(
-        "project-create-validation-failed", "The staged project did not satisfy Autoform's project contracts."
-    )
+    invalid = ProjectCreateError("project-create-validation-failed", _STAGED_MESSAGE)
     roadmap = [
         item for item in plan if item.relative.startswith("blueprint/roadmap/") and item.relative.endswith(".md")
     ]

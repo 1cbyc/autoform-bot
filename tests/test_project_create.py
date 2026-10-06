@@ -210,6 +210,7 @@ def test_an_unlisted_pair_never_publishes_a_template_manifest(
     stages = list(tmp_path.glob(".autoform-new-*"))
     assert len(stages) == 1
     assert (stages[0] / "lake-manifest.json").is_file()
+    assert stat.S_IMODE(stages[0].stat().st_mode) == 0o700
 
 
 def test_group_writable_installed_templates_publish_canonical_modes(
