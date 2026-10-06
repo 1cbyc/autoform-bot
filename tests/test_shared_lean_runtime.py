@@ -87,7 +87,7 @@ class FakeLsp:
         return not self.closed
 
 
-def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path, monkeypatch):
+def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path):
     project = make_lake_project(tmp_path, "shared")
     pools = []
 
@@ -101,11 +101,6 @@ def test_runtime_reuses_one_project_pool_and_status_stays_lazy(tmp_path, monkeyp
         repl_factory=create_pool,
         lsp_factory=FakeLsp,
         start_sweepers=False,
-    )
-    monkeypatch.setattr(
-        services.repl_projects,
-        "state",
-        lambda project_dir: pytest.fail("status performed a second cache lookup"),
     )
     try:
         cold = services.dispatch("repl.status", {"project_dir": str(project)})
@@ -583,7 +578,8 @@ def test_project_startup_that_misses_its_budget_is_discarded(tmp_path):
             pytest.fail("late project startup must never execute a tool request")
 
     assert closed == [project.resolve()]
-    assert cache.state(str(project)) == "cold"
+    with cache.observe(str(project)) as (resource, state):
+        assert resource is None and state == "cold"
     cache.close()
 
 

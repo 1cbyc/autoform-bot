@@ -400,16 +400,6 @@ class ProjectResourceCache(Generic[T]):
                 "creating": sorted(str(root) for root in self._creating),
             }
 
-    def state(self, project_dir: str) -> str:
-        """Return ``cold``, ``warming``, or ``warm`` without creating state."""
-        root = resolve_lean_project_dir(project_dir)
-        with self._condition:
-            if root in self._entries:
-                return "warm"
-            if root in self._creating:
-                return "warming"
-            return "cold"
-
     def invalidate(self, project_dir: str, resource: T) -> None:
         """Arrange to replace a failed resource after its active calls finish."""
         root = resolve_lean_project_dir(project_dir)
