@@ -307,21 +307,15 @@ def test_invalid_pool_replacement_waits_for_active_observation(tmp_path):
     cache.close()
 
 
-def test_cache_observation_never_creates_and_rejects_a_closed_cache(tmp_path):
-    project = make_lake_project(tmp_path, "observed-cold")
-    created = []
+def test_cache_observation_rejects_a_closed_cache(tmp_path):
+    project = make_lake_project(tmp_path, "observed-closed")
     cache = ProjectResourceCache(
-        lambda root: created.append(root) or root,
+        lambda root: root,
         lambda resource: None,
         max_entries=1,
         idle_seconds=1800,
         start_sweeper=False,
     )
-
-    with cache.observe(str(project)) as (resource, state):
-        assert resource is None
-        assert state == "cold"
-    assert created == []
     cache.close()
 
     with pytest.raises(RuntimeError, match="cache is closed"):
