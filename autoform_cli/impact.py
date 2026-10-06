@@ -745,6 +745,17 @@ def _users_through_internal(
 # --------------------------------------------------------------------------- #
 
 
+def _project_controls(root: Path) -> tuple[tuple[str, tuple[int, str] | None], ...]:
+    """Read the Lake inputs that select the environment as one stable snapshot."""
+
+    try:
+        return skeleton._project_control_snapshot(root)
+    except SkeletonError as exc:
+        raise ImpactError(
+            "the Lake project controls could not be read consistently; rebuild and rerun the command"
+        ) from exc
+
+
 def revision_impact(
     project_or_blueprint: str | Path,
     selector: str,
@@ -779,8 +790,14 @@ def revision_impact(
         raise ImpactError(f"{revised.id} names no lean: declaration; pass --declaration NAME")
 
     root = Path(lean_root).expanduser().resolve()
+    controls = _project_controls(root)
     with bind_project_source_snapshot(root) as (bound_sources, source_snapshot):
         libraries = lean_libraries(root)
+        if _project_controls(root) != controls:
+            raise ImpactError(
+                "the Lake project controls changed while library inventory was read; "
+                "rebuild and rerun the command"
+            )
         modules, local_modules = project_modules(libraries, source_snapshot)
         output = skeleton.run_probe(
             render_impact_probe(imports=modules, project_modules=local_modules),
@@ -791,6 +808,10 @@ def revision_impact(
         latest = load_runtime_graph(project_or_blueprint)
         if latest.source_revision != source_revision:
             raise ImpactError("the roadmap changed while the impact probe ran; rerun the command")
+        if _project_controls(root) != controls:
+            raise ImpactError(
+                "the Lake project controls changed while the impact probe ran; rebuild and rerun the command"
+            )
         try:
             bound_sources.verify()
             latest_sources = bound_sources.capture()
