@@ -192,10 +192,14 @@ def test_incomplete_local_templates_are_not_published(tmp_path: Path, monkeypatc
     _refused(tmp_path / "Project", "project-create-validation-failed")
 
 
-def test_an_unlisted_pair_never_publishes_a_template_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("relative", ["lake-manifest.json", "lake-manifest.json/note.md"], ids=["file", "directory"])
+def test_an_unlisted_pair_never_publishes_a_template_manifest(
+    relative: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     templates = tmp_path / "templates"
     shutil.copytree(create_module._TEMPLATES, templates)
-    (templates / "lake-manifest.json").write_text('{"version": "1.1.0", "packages": []}\n', encoding="utf-8")
+    (templates / relative).parent.mkdir(exist_ok=True)
+    (templates / relative).write_text('{"version": "1.1.0", "packages": []}\n', encoding="utf-8")
     target = tmp_path / "Project"
     monkeypatch.setattr(create_module, "_TEMPLATES", templates)
 
@@ -209,7 +213,7 @@ def test_an_unlisted_pair_never_publishes_a_template_manifest(tmp_path: Path, mo
     assert not target.exists()
     stages = list(tmp_path.glob(".autoform-new-*"))
     assert len(stages) == 1
-    assert (stages[0] / "lake-manifest.json").is_file()
+    assert (stages[0] / relative).is_file()
     assert stat.S_IMODE(stages[0].stat().st_mode) == 0o700
 
 
@@ -1203,8 +1207,19 @@ def test_postpublish_parent_recheck_failure_does_not_claim_a_rebind(
     assert inspect_project(target).ok
 
 
-def test_workspace_substitution_fails_before_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("template_manifest", [False, True], ids=["catalog-release", "unlisted-template-manifest"])
+def test_workspace_substitution_fails_before_publication(
+    template_manifest: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     target = tmp_path / "project"
+    versions: dict[str, str | None] = {"release_id": _RELEASE}
+    if template_manifest:
+        # The identity check runs before the manifest refusal, so the code stays main's.
+        templates = tmp_path / "templates"
+        shutil.copytree(create_module._TEMPLATES, templates)
+        (templates / "lake-manifest.json").write_text('{"version": "1.1.0", "packages": []}\n', encoding="utf-8")
+        monkeypatch.setattr(create_module, "_TEMPLATES", templates)
+        versions = {"release_id": None, "lean_toolchain": "v4.30.0"}
     original = create_module._materialize_project
 
     def substitute(*args, **kwargs) -> None:
@@ -1217,7 +1232,7 @@ def test_workspace_substitution_fails_before_publication(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(create_module, "_materialize_project", substitute)
     with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
+        create_project(target, package="Project", **versions)
     assert raised.value.code == "project-create-failed"
     assert not target.exists()
     assert any(path.name == "FOREIGN" for path in tmp_path.rglob("FOREIGN"))
@@ -1297,7 +1312,9 @@ def test_stage_substitution_is_refused_before_writing(tmp_path: Path, monkeypatc
     assert not any(list(stage.iterdir()) for stage in stages)
 
 
-@pytest.mark.parametrize(("mode", "entries"), [(0o700, {"private.txt"}), (0o755, set())])
+@pytest.mark.parametrize(
+    ("mode", "entries"), [(0o700, {"private.txt"}), (0o755, set())], ids=["nonempty-0700", "empty-0755"]
+)
 def test_swapped_in_stage_directory_is_refused_before_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int, entries: set[str]
 ) -> None:
