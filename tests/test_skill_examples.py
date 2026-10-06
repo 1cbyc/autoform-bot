@@ -191,12 +191,6 @@ def test_setup_guidance_uses_the_offline_atomic_project_creator(repo_root: Path)
             assert (repo_root / reference).is_file(), (
                 f"{document.relative_to(repo_root)} references missing helper {reference}"
             )
-    for document in sorted(setup_root.rglob("*.md")):
-        text = document.read_text(encoding="utf-8")
-        for reference in re.findall(r"(?<![A-Za-z0-9_])scripts/[A-Za-z0-9_./-]+", text):
-            assert (repo_root / reference).is_file(), (
-                f"{document.relative_to(repo_root)} references missing helper {reference}"
-            )
 
 
 def test_setup_asset_is_a_repo_shaped_thesis_vault(repo_root: Path) -> None:
