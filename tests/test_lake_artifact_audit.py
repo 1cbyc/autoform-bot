@@ -1300,6 +1300,36 @@ def test_strict_probe_refuses_a_helper_name_an_imported_module_declares(
     assert "kernel trust clean" not in output
 
 
+def test_both_probes_refuse_a_target_that_names_one_of_their_own_helpers(
+    helper: ModuleType, open_projects: dict[str, tuple[Path, Path]]
+) -> None:
+    # The probe declares its helpers itself, so the build never compiled them.
+    # A lean: name that matched one once passed as a clean declaration outside
+    # the root package.
+    strict_helpers = ["autoformAuditNameOf", "autoformAuditReadTargets"]
+    open_helpers = [
+        "autoformOpenAuditNameOf",
+        "autoformOpenAuditReadArticles",
+        "autoformOpenAuditBlockOf",
+        "autoformOpenAuditEdges",
+        "autoformOpenAuditOpenHits",
+        "autoformOpenAuditReachesFailed",
+        "autoformOpenAuditNameList",
+    ]
+    for audited, names in (
+        (_strict_audit(helper, open_projects["strict"], [_article("helper", strict_helpers)]), strict_helpers),
+        (_audit(helper, open_projects["open"], _contract(_OPEN_ARTICLE, _article("helper", open_helpers))), open_helpers),
+    ):
+        output = audited.stdout + audited.stderr
+        assert audited.returncode != 0, output
+        for name in names:
+            assert (
+                f"{name} [helper] is not a declaration of the Lean build; "
+                "fix the article's lean: name or build the module that declares it"
+            ) in output
+        assert "kernel trust clean" not in output
+
+
 def test_open_probe_checks_the_axioms_of_a_target_outside_the_root_package(
     helper: ModuleType, open_projects: dict[str, tuple[Path, Path]]
 ) -> None:
