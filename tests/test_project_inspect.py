@@ -1591,9 +1591,63 @@ def test_symlinked_decision_files_are_followed_like_lake(tmp_path: Path, relativ
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX path-buffer semantics")
-def test_expanded_symlink_path_over_kernel_limit_is_unreadable(tmp_path: Path) -> None:
+@pytest.mark.parametrize("absolute_first_target", [False, True])
+def test_nested_symlink_expansion_matches_the_native_kernel(
+    tmp_path: Path, absolute_first_target: bool
+) -> None:
     root = _project(tmp_path)
     (root / "d").mkdir()
+    actual = root / "actual.toml"
+    (root / "lakefile.toml").rename(actual)
+    limit = os.pathconf(root, "PC_PATH_MAX")
+    unit = "d/../"
+    next_target = unit * max(1, (3 * limit // 4) // len(os.fsencode(unit)))
+    (root / "next").symlink_to(next_target, target_is_directory=True)
+    first_prefix = f"{root}/next/" if absolute_first_target else "next/"
+    padding = "./" * max(
+        1,
+        (limit // 2 - len(os.fsencode(first_prefix)) - len(os.fsencode(actual.name)))
+        // len(os.fsencode("./")),
+    )
+    first_target = f"{first_prefix}{padding}{actual.name}"
+    assert len(os.fsencode(next_target)) < limit
+    assert len(os.fsencode(first_target)) < limit
+    assert len(os.fsencode(f"{next_target}{padding}{actual.name}")) >= limit
+    assert len(os.fsencode(os.path.join(next_target, actual.name))) < limit
+    (root / "lakefile.toml").symlink_to(first_target)
+    assert stat.S_ISLNK(os.stat(root / "lakefile.toml", follow_symlinks=False).st_mode)
+    resolved, _, _ = project_snapshot._resolve(root, "lakefile.toml")
+    assert resolved.samefile(actual)
+
+    try:
+        os.stat(root / "lakefile.toml")
+    except OSError as error:
+        assert error.errno == errno.ENAMETOOLONG
+        native_state = "unreadable"
+    else:
+        native_state = "regular"
+
+    captured = project_snapshot._capture_file(root, "lakefile.toml")
+    result = inspect_project(root)
+
+    assert captured.state == native_state
+    if native_state == "unreadable":
+        assert not result.ok
+        assert result.compatibility.status == "indeterminate"
+        assert any(
+            diagnostic.code == "unreadable-file" and diagnostic.path == "lakefile.toml"
+            for diagnostic in result.diagnostics
+        )
+    else:
+        assert result.ok, result.diagnostics
+        assert result.compatibility.status == "supported"
+        assert "unreadable-file" not in _codes(result)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX path-buffer semantics")
+@pytest.mark.parametrize("ending", ["/", "/."])
+def test_directory_symlink_at_kernel_path_limit_remains_readable(tmp_path: Path, ending: str) -> None:
+    root = _project(tmp_path)
     actual_lake = root / "actual-lake"
     actual_lake.mkdir()
     (actual_lake / "package-overrides.json").write_text(
@@ -1601,34 +1655,34 @@ def test_expanded_symlink_path_over_kernel_limit_is_unreadable(tmp_path: Path) -
         encoding="utf-8",
     )
     limit = os.pathconf(root, "PC_PATH_MAX")
-    pending_bytes = len(os.fsencode("/package-overrides.json"))
-    repeat = max(
-        1,
-        (limit - pending_bytes - len(actual_lake.name) + 8) // len("d/../") + 1,
-    )
-    raw_target = ("d/../" * repeat) + actual_lake.name
-    while len(os.fsencode(raw_target)) >= limit:
-        raw_target = raw_target.removeprefix("d/../")
-    expanded = os.path.join(raw_target, "package-overrides.json")
-    assert len(os.fsencode(expanded)) >= limit
+    pending = "package-overrides.json"
+    unit = "d/../"
+    (root / "d").mkdir()
     link = root / ".lake"
+    desired = limit - (2 if ending == "/" else 1)
+    ending_and_join = 1 if ending == "/" else 3
+    budget = desired - len(os.fsencode(pending)) - ending_and_join
+    repeats = (budget - 1) // len(os.fsencode(unit))
+    name = "a" * (budget - repeats * len(os.fsencode(unit)))
+    native_directory = root / name
+    actual_lake.rename(native_directory)
+    raw_target = f"{unit * repeats}{name}{ending}"
     link.symlink_to(raw_target, target_is_directory=True)
 
-    with pytest.raises(OSError) as native:
-        os.stat(link / "package-overrides.json")
-    assert native.value.errno == errno.ENAMETOOLONG
+    native_expansion = os.path.join(raw_target, pending)
+    reconstructed = os.path.join(raw_target, ".", pending)
+    assert len(os.fsencode(native_expansion)) == desired
+    assert len(os.fsencode(reconstructed)) >= limit
+    assert stat.S_ISREG(os.stat(link / pending).st_mode)
+    resolved, _, _ = project_snapshot._resolve(root, ".lake/package-overrides.json")
+    assert resolved.samefile(native_directory / pending)
+    assert project_snapshot._capture_file(root, ".lake/package-overrides.json").state == "regular"
 
-    captured = project_snapshot._capture_file(root, ".lake/package-overrides.json")
     result = inspect_project(root)
 
-    assert captured.state == "unreadable"
-    assert not result.ok
-    assert result.compatibility.status == "indeterminate"
-    assert any(
-        diagnostic.code == "unreadable-file"
-        and diagnostic.path == ".lake/package-overrides.json"
-        for diagnostic in result.diagnostics
-    )
+    assert result.ok, result.diagnostics
+    assert result.compatibility.status == "supported"
+    assert "unreadable-file" not in _codes(result)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")

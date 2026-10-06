@@ -117,12 +117,24 @@ def _capture_file(root: Path, relative: str) -> _FileSnapshot:
     except (OSError, TypeError, ValueError):
         return _FileSnapshot("unreadable")
     try:
+        # Let the kernel decide native link expansion first. `stat` reads no
+        # FIFO/device content, but faithfully enforces raw pending-path limits,
+        # repeated separators, `.` components, link loops, and platform rules
+        # that a normalized Python component walk cannot reconstruct.
+        followed = os.stat(root / relative)
+    except (OSError, TypeError, ValueError):
+        return _FileSnapshot("unreadable", _node_identity(entry))
+    if not stat.S_ISREG(followed.st_mode):
+        return _FileSnapshot("unreadable", _node_identity(entry))
+    try:
         path, before, route = _resolve(root, relative)
     except (OSError, TypeError, ValueError):
         return _FileSnapshot("unreadable", _node_identity(entry))
     if not stat.S_ISREG(before.st_mode):
         return _FileSnapshot("unreadable", _node_identity(entry))
     before_token = _node_identity(before)
+    if _node_identity(followed) != before_token:
+        return _FileSnapshot("changed", before_token, route=route)
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0)
@@ -186,7 +198,6 @@ def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tup
     directory = root
     pending = list(Path(relative).parts)
     links = 0
-    path_max = _path_max(root)
     while pending:
         holder = os.stat(directory, follow_symlinks=False)
         if not stat.S_ISDIR(holder.st_mode):
@@ -213,19 +224,6 @@ def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tup
             target = Path(raw)
             # Path drops a trailing "/" or "/.", after which only a directory resolves.
             must_be_directory = ["."] if raw.endswith(("/", "/.")) else []
-            if path_max is not None:
-                suffix = [*must_be_directory, *pending]
-                # The kernel has already resolved ``directory`` when it
-                # substitutes a relative link. Its bounded expansion buffer is
-                # the raw target plus the still-pending suffix, before ``..``
-                # components are consumed.
-                expanded = os.path.join(raw, *suffix)
-                if len(os.fsencode(expanded)) >= path_max:
-                    raise OSError(
-                        errno.ENAMETOOLONG,
-                        os.strerror(errno.ENAMETOOLONG),
-                        str(root / relative),
-                    )
             if target.is_absolute():
                 directory = Path(target.anchor)
                 pending[:0] = [*target.parts[1:], *must_be_directory]
@@ -237,19 +235,6 @@ def _resolve(root: Path, relative: str) -> tuple[Path, os.stat_result, tuple[tup
         directory = candidate
     # Only ``.``, ``..`` or a link to ``/`` ends on the directory reached so far.
     raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(directory))
-
-
-def _path_max(root: Path) -> int | None:
-    """Return the kernel's path-buffer limit where Python exposes it."""
-
-    pathconf = getattr(os, "pathconf", None)
-    if pathconf is None:
-        return None
-    try:
-        limit = pathconf(root, "PC_PATH_MAX")
-    except (OSError, TypeError, ValueError):
-        return None
-    return limit if isinstance(limit, int) and limit > 0 else None
 
 
 def _walk_unchanged(
