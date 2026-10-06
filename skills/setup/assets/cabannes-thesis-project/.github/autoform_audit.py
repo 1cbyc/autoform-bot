@@ -344,7 +344,10 @@ run_cmd do
         unless allowed.contains usedAxiom do
           badAxioms := badAxioms.push (declName, usedAxiom)
   for (declName, article) in targets do
-    match env.find? declName with
+    -- Every imported constant has a module index. One without was declared by
+    -- this probe, as its helpers and their auxiliaries are, not by the build.
+    let declared := if (env.getModuleIdxFor? declName).isSome then env.find? declName else none
+    match declared with
     | none =>
       errors := errors.push m!"{{declName}} [{{article}}] is not a declaration of the Lean build; fix the article's lean: name or build the module that declares it"
     | some info =>
@@ -761,7 +764,10 @@ run_cmd do
   let mut conditionalCount : Nat := 0
   for (declName, article, isOpen, allowedOpen) in articles do
     let reported := errors.size
-    match env.find? declName with
+    -- Every imported constant has a module index. One without was declared by
+    -- this probe, as its helpers and their auxiliaries are, not by the build.
+    let declared := if (env.getModuleIdxFor? declName).isSome then env.find? declName else none
+    match declared with
     | none =>
       errors := errors.push m!"{{declName}} [{{article}}] is not a declaration of the Lean build; fix the article's lean: name or build the module that declares it"
     | some info =>
