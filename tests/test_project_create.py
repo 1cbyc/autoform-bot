@@ -424,11 +424,7 @@ def test_open_parent_descriptor_rechecks_the_generated_module_filename_limit(
 
 
 def test_rejects_unknown_release_before_writing(tmp_path: Path) -> None:
-    target = tmp_path / "project"
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id="unknown")
-    assert raised.value.code == "project-release-unknown"
-    assert not target.exists()
+    _refused(tmp_path / "project", "project-release-unknown", release_id="unknown")
 
 
 def test_omitted_release_uses_the_recommended_release(tmp_path: Path) -> None:
@@ -840,12 +836,7 @@ def test_invalid_planned_roadmap_is_never_published(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr(create_module, "_build_project_plan", corrupt)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(target, package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-create-validation-failed"
-    assert not target.exists()
-    assert not list(tmp_path.glob(".autoform-new-*"))
+    _refused(target, "project-create-validation-failed")
 
 
 @pytest.mark.parametrize("corruption", ["container", "relative", "content", "mode"])
@@ -1719,12 +1710,7 @@ def test_group_writable_parent_is_refused_with_a_remedy(tmp_path: Path) -> None:
     parent.mkdir(mode=0o700)
     parent.chmod(0o775)
 
-    with pytest.raises(ProjectCreateError) as raised:
-        create_project(parent / "Project", package="Project", release_id=_RELEASE)
-
-    assert raised.value.code == "project-parent-unsafe"
-    assert "chmod g-w,o-w" in raised.value.message
-    assert not list(parent.iterdir())
+    assert "chmod g-w,o-w" in _refused(parent / "Project", "project-parent-unsafe").message
 
 
 _NEEDS_PERMISSIONS = pytest.mark.skipif(
