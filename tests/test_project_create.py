@@ -213,6 +213,21 @@ def test_an_unlisted_pair_never_publishes_a_template_manifest(
     assert stat.S_IMODE(stages[0].stat().st_mode) == 0o700
 
 
+@pytest.mark.parametrize("relative", _CORE_FILES)
+def test_a_template_cannot_replace_a_core_project_file(
+    relative: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = tmp_path / "templates"
+    shutil.copytree(create_module._TEMPLATES, templates)
+    (templates / relative).parent.mkdir(exist_ok=True)
+    (templates / relative).write_text("template\n", encoding="utf-8")
+    monkeypatch.setattr(create_module, "_TEMPLATES", templates)
+
+    error = _refused(tmp_path / "Project", "project-create-validation-failed")
+
+    assert error.message == create_module._CONTRACTS_MESSAGE
+
+
 def test_group_writable_installed_templates_publish_canonical_modes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
