@@ -1031,10 +1031,10 @@ Markdown (step 6); Formalize carries out the Lean side (steps 1 to 5).
      happened under `## Execution notes` of each touched article.
 
    An unused statement dependency, which rules out the contained route, is
-   re-reviewed under X's new meaning like a statement-impacted article: it
-   keeps `statement` only after an Agent Review of its source faithfulness;
-   otherwise it records `statement: retracted`, loses `proof`, and keeps
-   `lean:`.
+   re-reviewed under the revised meaning, X' on the expand route and X's new
+   meaning in place: it keeps `statement` only after an Agent Review of its
+   source faithfulness; otherwise it records `statement: retracted`, loses
+   `proof`, and keeps `lean:`.
 3. Claim the route's claim set with one `autoform claim acquire`. When it is
    refused, release everything and report the held claim as the blocker. After
    acquiring, re-run `work impact`; if the set grew, release and start over
