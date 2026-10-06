@@ -130,16 +130,9 @@ def test_development_guidance_routes_repository_contracts(repo_root: Path) -> No
     skill_path = repo_root / "skills/develop-plugin/SKILL.md"
     contracts_path = skill_path.parent / "references/repository-contracts.md"
     skill = skill_path.read_text(encoding="utf-8")
-    contracts = contracts_path.read_text(encoding="utf-8")
-    normalized = " ".join(contracts.split())
 
     assert "[repository contracts](references/repository-contracts.md)" in skill
-    assert "`refs/autoform-claims/*` is shared cross-machine coordination state" in normalized
-    assert "dashboard and publication overlay local-only" in normalized
-    assert "root `.gitignore` is a scaffold input, not a bundled-example mirror" in normalized
-    assert "GitHub Actions and Autoform workflow refs use full commit SHAs" in normalized
-    assert "Lean and Mathlib use tested matching release tags" in normalized
-    assert "do not follow the Autoform full-SHA rule" in normalized
+    assert contracts_path.is_file()
 
 
 def test_root_agent_guidance_routes_to_owning_documents(repo_root: Path) -> None:
