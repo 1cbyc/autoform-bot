@@ -497,7 +497,8 @@ def _parent_access_error(error: OSError) -> ProjectCreateError:
 def _unsafe_parent_metadata(mode: int, owner: int) -> bool:
     # Sticky directories protect entries only from peers, not from their owner.
     # Trust the invoking user and the system administrator, as conventional
-    # root-owned temporary directories require.
+    # root-owned temporary directories require. ACLs are not read: on macOS,
+    # an inheritable parent ACL can grant another uid access to the stage.
     return bool(mode & (stat.S_IWGRP | stat.S_IWOTH)) and (
         not mode & stat.S_ISVTX or not hasattr(os, "geteuid") or owner not in {0, os.geteuid()}
     )
