@@ -190,6 +190,7 @@ def create_project(
         _require_absent(parent_descriptor, requested.name)
         stage_name = _create_stage(parent_descriptor)
         stage_descriptor = _open_directory(parent_descriptor, stage_name)
+        _require_stage_identity(parent_descriptor, stage_name, stage_descriptor)
         _materialize_project(stage_descriptor, tree)
         os.fchmod(stage_descriptor, 0o755)
         os.fsync(stage_descriptor)

@@ -1254,6 +1254,31 @@ def test_stage_open_failure_preserves_the_owned_empty_stage(tmp_path: Path, monk
     assert not list(stages[0].iterdir())
 
 
+def test_stage_substitution_is_refused_before_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "project"
+    original = create_module._open_directory
+
+    def substitute_after_open(parent_descriptor: int, name: str) -> int:
+        descriptor = original(parent_descriptor, name)
+        if name.startswith(".autoform-new-"):
+            (tmp_path / name).rename(tmp_path / f"{name}-owned")
+            (tmp_path / name).mkdir(mode=0o700)
+        return descriptor
+
+    monkeypatch.setattr(create_module, "_open_directory", substitute_after_open)
+
+    with pytest.raises(ProjectCreateError) as raised:
+        create_project(target, package="Project", release_id=_RELEASE)
+
+    assert raised.value.code == "project-create-failed"
+    assert ".autoform-new-* stage may remain" in raised.value.message
+    assert not target.exists()
+    # Neither the replacement nor the opened stage, now under its -owned name, received a file.
+    stages = list(tmp_path.glob(".autoform-new-*"))
+    assert len(stages) == 2
+    assert not any(list(stage.iterdir()) for stage in stages)
+
+
 def test_failure_path_never_attempts_recursive_deletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "project"
     original = create_module._materialize_project
