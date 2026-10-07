@@ -800,7 +800,7 @@ def test_cli_reference_documents_only_commands_that_exist(repo_root: Path) -> No
 
     reference = (repo_root / "autoform_cli/README.md").read_text(encoding="utf-8")
     documented = _documented_invocations(reference)
-    assert {("check",), ("audit",), ("render",), ("claim", "acquire")} <= documented
+    assert {("check",), ("audit",), ("render",), ("search",), ("claim", "acquire")} <= documented
 
     for invocation in sorted(documented):
         with pytest.raises(SystemExit) as exit_info:
