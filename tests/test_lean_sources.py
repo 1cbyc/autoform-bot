@@ -68,6 +68,23 @@ def toplevel : Nat := 3
 """
 
 
+def _require_directory_descriptors() -> None:
+    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
+        pytest.skip("directory descriptors are unavailable")
+
+
+def _require_descriptor_capture() -> None:
+    if not (
+        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
+        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
+    ):
+        pytest.skip("directory descriptor capture is unavailable")
+
+
+def _use_portable_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+
+
 def _index(tmp_path: Path, text: str = _SOURCE, name: str = "Project/Basic.lean"):
     path = tmp_path / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -228,11 +245,7 @@ def test_changes_inside_an_excluded_build_directory_do_not_invalidate_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
-    ):
-        pytest.skip("directory descriptor capture is unavailable")
+    _require_descriptor_capture()
     _index(tmp_path, "def canonical : Nat := 0\n")
     build_state = tmp_path / ".lake" / "build-state"
     build_state.parent.mkdir()
@@ -336,8 +349,7 @@ def test_symlinked_root_preserves_an_absolute_descendant_exclusion(
 
 
 def test_source_binding_rejects_root_replacement(tmp_path: Path) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     project = tmp_path / "project"
     _index(project, "def original : Nat := 0\n")
     sources = open_project_sources(project)
@@ -360,11 +372,7 @@ def test_source_capture_rejects_mid_capture_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
-    ):
-        pytest.skip("directory descriptor capture is unavailable")
+    _require_descriptor_capture()
     source = tmp_path / "Project" / "Basic.lean"
     _index(tmp_path, "def before : Nat := 0\n")
     changed = False
@@ -438,11 +446,7 @@ def test_snapshot_retries_a_root_replaced_while_it_is_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
-    ):
-        pytest.skip("directory descriptor capture is unavailable")
+    _require_descriptor_capture()
     project = tmp_path / "project"
     _index(project, "def canonical : Nat := 0\n")
     replacement = tmp_path / "replacement"
@@ -608,11 +612,7 @@ def test_lasting_capture_failure_is_reported_without_retrying(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    if not (
-        directory_binding_module.DIRECTORY_BINDING_SUPPORTED
-        and tree_snapshot_module._DESCRIPTOR_CAPTURE_SUPPORTED
-    ):
-        pytest.skip("directory descriptor capture is unavailable")
+    _require_descriptor_capture()
     _index(tmp_path, "def canonical : Nat := 0\n")
 
     def fail_read(*_args, **_kwargs):
@@ -697,9 +697,7 @@ def test_portable_binding_rejects_a_replacement_root_generation(
     replacement = tmp_path / "replacement"
     _index(replacement, "def replacement : Nat := 0\n")
     displaced = tmp_path / "displaced"
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
     bound = BoundDirectoryTree(project)
     original_verify = bound.verify
     original_capture = tree_snapshot_module._capture_portable
@@ -740,8 +738,7 @@ def test_descriptor_and_portable_capture_have_identical_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     root = tmp_path / "tree"
     (root / "a" / "x").mkdir(parents=True)
     (root / "a-").mkdir()
@@ -750,9 +747,7 @@ def test_descriptor_and_portable_capture_have_identical_order(
     with bind_directory_tree(root) as bound:
         descriptor_snapshot = bound.capture()
 
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
     with bind_directory_tree(root) as bound:
         portable_snapshot = bound.capture()
 
@@ -767,8 +762,7 @@ def test_descriptor_and_portable_capture_have_identical_order(
 def test_expected_child_identity_is_checked_during_descriptor_capture(
     tmp_path: Path,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     root = tmp_path / "tree"
     child = root / "child"
     child.mkdir(parents=True)
@@ -792,8 +786,7 @@ def test_expected_child_identity_is_checked_during_descriptor_capture(
 
 
 def test_expected_child_rejects_a_case_colliding_entry(tmp_path: Path) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     root = tmp_path / "tree"
     child = root / "child"
     child.mkdir(parents=True)
@@ -828,9 +821,7 @@ def test_portable_binding_rejects_a_symlinked_ancestor(
         alias.symlink_to(real, target_is_directory=True)
     except OSError:
         pytest.skip("symlinks are unavailable")
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
 
     with pytest.raises(TreeSnapshotError, match="unsafe component"):
         BoundDirectoryTree(alias / "project")
@@ -849,9 +840,7 @@ def test_portable_capture_does_not_require_path_stat_no_follow(
             raise NotImplementedError("no-follow stat is unavailable")
         return original_stat(self, *args, **kwargs)
 
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
     monkeypatch.setattr(Path, "stat", stat_without_no_follow)
 
     with bind_directory_tree(root) as bound:
@@ -892,7 +881,7 @@ def test_portable_capture_rejects_an_unrestored_nested_directory_redirection(
             return (*signature[:3], 0, 0, 0, 0)
         return signature
 
-    monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+    _use_portable_capture(monkeypatch)
     _on_checkpoint(monkeypatch, "between-portable-captures", restore)
     monkeypatch.setattr(tree_snapshot_module, "_stat_signature", coarse_directory_signature)
     bound = BoundDirectoryTree(
@@ -964,7 +953,7 @@ def test_portable_capture_rejects_a_restored_nested_directory_redirection(
             return (*signature[:3], 0, 0, 0, 0)
         return signature
 
-    monkeypatch.setattr(directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False)
+    _use_portable_capture(monkeypatch)
     monkeypatch.setattr(tree_snapshot_module, "_capture_path_names", redirect_then_list)
     monkeypatch.setattr(tree_snapshot_module, "_read_portable_file", read_then_restore)
     monkeypatch.setattr(tree_snapshot_module, "_stat_signature", coarse_directory_signature)
@@ -1013,9 +1002,7 @@ def test_portable_capture_rejects_a_file_swapped_to_fifo_without_blocking(
     def blocking_path_open(*_args, **_kwargs):
         raise AssertionError("portable capture must use nonblocking os.open")
 
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
     monkeypatch.setattr(Path, "open", blocking_path_open)
     bound = BoundDirectoryTree(
         root,
@@ -1034,9 +1021,7 @@ def test_portable_binding_normalizes_an_invalid_root_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        directory_binding_module, "DIRECTORY_BINDING_SUPPORTED", False
-    )
+    _use_portable_capture(monkeypatch)
 
     with pytest.raises(TreeSnapshotError, match="cannot be inspected safely"):
         BoundDirectoryTree(tmp_path / "bad\0name")
@@ -1054,8 +1039,7 @@ def test_source_binding_normalizes_an_invalid_exclusion_path(
 def test_directory_binding_resolves_dot_dot_after_a_symlinked_ancestor_physically(
     tmp_path: Path,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     holder = tmp_path / "holder"
     (holder / "target").mkdir(parents=True)
     elsewhere = tmp_path / "elsewhere"
@@ -1077,8 +1061,7 @@ def test_directory_binding_resolves_dot_dot_after_a_symlinked_ancestor_physicall
 
 
 def test_directory_binding_refuses_a_symlinked_root(tmp_path: Path) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     real = tmp_path / "real"
     real.mkdir()
     alias = tmp_path / "alias"
@@ -1092,8 +1075,7 @@ def test_directory_binding_refuses_a_symlinked_root(tmp_path: Path) -> None:
 
 
 def test_directory_binding_accepts_a_symlinked_ancestor(tmp_path: Path) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     real = tmp_path / "real"
     project = real / "project"
     _index(project, "def throughAncestorLink : Nat := 0\n")
@@ -1118,8 +1100,7 @@ def test_directory_binding_accepts_a_symlinked_ancestor(tmp_path: Path) -> None:
 def test_directory_binding_needs_only_search_permission_on_ancestors(
     tmp_path: Path,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         pytest.skip("root bypasses directory permissions")
     ancestor = tmp_path / "search-only"
@@ -1144,8 +1125,7 @@ def test_directory_binding_rejects_an_invalid_path_without_opening_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     parent = tmp_path / "parent"
     parent.mkdir()
     original_open = os.open
@@ -1172,8 +1152,7 @@ def test_directory_binding_closes_its_descriptor_when_the_root_changes_while_ope
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not directory_binding_module.DIRECTORY_BINDING_SUPPORTED:
-        pytest.skip("directory descriptors are unavailable")
+    _require_directory_descriptors()
     root = tmp_path / "root"
     root.mkdir()
     replacement = tmp_path / "replacement"
