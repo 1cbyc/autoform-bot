@@ -1451,6 +1451,25 @@ def test_malformed_manifest_value_does_not_escape_source_indexing(
     assert index.find("visible") is not None
 
 
+def _synthetic_snapshot(
+    *,
+    directories: tuple[str, ...] = ("",),
+    files: tuple[tuple[str, bytes], ...] = (),
+    symlinks: tuple[tuple[str, str], ...] = (),
+) -> TreeSnapshot:
+    """Build a snapshot by hand, with no special entries, placeholders, or identities."""
+    return TreeSnapshot(
+        root_identity=(1, 1),
+        directories=directories,
+        files=files,
+        symlinks=symlinks,
+        special=(),
+        placeholders=(),
+        omitted=(),
+        identities=(),
+    )
+
+
 @pytest.mark.parametrize(
     "relative",
     [
@@ -1470,16 +1489,7 @@ def test_snapshot_materialization_rejects_non_relative_paths(
     tmp_path: Path,
     relative: str,
 ) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("",),
-        files=((relative, b"escaped\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
+    snapshot = _synthetic_snapshot(files=((relative, b"escaped\n"),))
     destination = tmp_path / "destination"
 
     with pytest.raises(TreeSnapshotError, match="unsafe materialization path"):
@@ -1503,16 +1513,7 @@ def test_snapshot_materialization_rejects_aliases_and_type_conflicts(
     files: tuple[tuple[str, bytes], ...],
     directories: tuple[str, ...],
 ) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=directories,
-        files=files,
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
+    snapshot = _synthetic_snapshot(directories=directories, files=files)
     destination = tmp_path / "destination"
 
     with pytest.raises(TreeSnapshotError, match="materialization path"):
@@ -1522,15 +1523,9 @@ def test_snapshot_materialization_rejects_aliases_and_type_conflicts(
 
 
 def test_snapshot_materialization_orders_valid_directory_records(tmp_path: Path) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
+    snapshot = _synthetic_snapshot(
         directories=("", "a/b", "a"),
         files=(("a/b/result.txt", b"result\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
     )
     destination = tmp_path / "destination"
 
@@ -1543,16 +1538,7 @@ def test_snapshot_materialization_root_swap_never_redirects_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("", "nested"),
-        files=(("result.txt", b"captured\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
+    snapshot = _synthetic_snapshot(directories=("", "nested"), files=(("result.txt", b"captured\n"),))
     destination = tmp_path / "destination"
     displaced = tmp_path / "displaced"
     outside = tmp_path / "outside"
@@ -1584,15 +1570,9 @@ def test_snapshot_materialization_nested_swap_never_redirects_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
+    snapshot = _synthetic_snapshot(
         directories=("", "nested"),
         files=(("nested/result.txt", b"captured\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
     )
     destination = tmp_path / "destination"
     outside = tmp_path / "outside"
@@ -1622,16 +1602,7 @@ def test_snapshot_materialization_retries_short_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
-        directories=("",),
-        files=(("result.txt", b"captured bytes\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
-    )
+    snapshot = _synthetic_snapshot(files=(("result.txt", b"captured bytes\n"),))
     destination = tmp_path / "destination"
     original_write = tree_snapshot_module.os.write
 
@@ -1649,15 +1620,9 @@ def test_snapshot_materialization_closes_descriptors_after_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
+    snapshot = _synthetic_snapshot(
         directories=("", "nested"),
         files=(("nested/result.txt", b"captured\n"),),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
     )
     destination = tmp_path / "destination"
     original_open = tree_snapshot_module.os.open
@@ -1700,15 +1665,9 @@ def test_snapshot_materialization_rejects_final_tree_tampering(
     monkeypatch: pytest.MonkeyPatch,
     attack: str,
 ) -> None:
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
+    snapshot = _synthetic_snapshot(
         directories=("", "nested"),
         files=(("first.txt", b"first\n"), ("second.txt", b"second\n")),
-        symlinks=(),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
     )
     destination = tmp_path / "destination"
     attacked = False
@@ -1761,8 +1720,7 @@ def test_outer_managed_marker_ignores_unrelated_files_below_it(
         b'{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
     )
     nested_name = "other.json"
-    snapshot = TreeSnapshot(
-        root_identity=(1, 1),
+    snapshot = _synthetic_snapshot(
         directories=("", "generated", "generated/nested"),
         files=(
             ("generated/nested/Copied.lean", b"def hiddenByOuterMarker : Nat := 0\n"),
@@ -1770,10 +1728,6 @@ def test_outer_managed_marker_ignores_unrelated_files_below_it(
             (f"generated/{outer_name}", outer_data),
         ),
         symlinks=((f"generated/nested/{nested_name.upper()}", "elsewhere"),),
-        special=(),
-        placeholders=(),
-        omitted=(),
-        identities=(),
     )
 
     index = lean_module._indexed_source_snapshot(tmp_path, snapshot, ())
