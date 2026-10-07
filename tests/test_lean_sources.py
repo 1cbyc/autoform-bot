@@ -2294,22 +2294,8 @@ def test_build_linker_rejects_a_captured_index_from_another_root(tmp_path: Path)
         build_linker(second, source_index=index, detect_missing=False)
 
 
-def _init_git_repository(root: Path, *, object_format: str = "sha1") -> str:
-    initialized = subprocess.run(
-        ["git", "init", f"--object-format={object_format}"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if initialized.returncode != 0:
-        pytest.skip(f"Git does not support {object_format} repositories")
-    subprocess.run(
-        ["git", "remote", "add", "origin", "https://github.com/owner/repo.git"],
-        cwd=root,
-        check=True,
-    )
-    subprocess.run(["git", "add", "."], cwd=root, check=True)
+def _git_commit(root: Path, message: str, path: str = ".") -> str:
+    subprocess.run(["git", "add", path], cwd=root, check=True)
     subprocess.run(
         [
             "git",
@@ -2319,7 +2305,7 @@ def _init_git_repository(root: Path, *, object_format: str = "sha1") -> str:
             "user.email=autoform@example.invalid",
             "commit",
             "-m",
-            "fixture",
+            message,
         ],
         cwd=root,
         capture_output=True,
@@ -2332,6 +2318,25 @@ def _init_git_repository(root: Path, *, object_format: str = "sha1") -> str:
         text=True,
         check=True,
     ).stdout.strip()
+
+
+def _init_git_repository(
+    root: Path,
+    *,
+    object_format: str = "sha1",
+    origin: str = "https://github.com/owner/repo.git",
+) -> str:
+    initialized = subprocess.run(
+        ["git", "init", f"--object-format={object_format}"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if initialized.returncode != 0:
+        pytest.skip(f"Git does not support {object_format} repositories")
+    subprocess.run(["git", "remote", "add", "origin", origin], cwd=root, check=True)
+    return _git_commit(root, "fixture")
 
 
 @pytest.mark.parametrize("object_format", ["sha1", "sha256"])
@@ -2378,29 +2383,7 @@ def test_auto_linker_retries_ref_and_source_as_one_unit(
         captures += 1
         if captures == 1:
             source.write_text("def second : Nat := 0\n")
-            subprocess.run(["git", "add", "A.lean"], cwd=root, check=True)
-            subprocess.run(
-                [
-                    "git",
-                    "-c",
-                    "user.name=Autoform Tests",
-                    "-c",
-                    "user.email=autoform@example.invalid",
-                    "commit",
-                    "-m",
-                    "second",
-                ],
-                cwd=root,
-                capture_output=True,
-                check=True,
-            )
-            second_commit = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
+            second_commit = _git_commit(root, "second", "A.lean")
         return snapshot
 
     monkeypatch.setattr(lean_module, "snapshot_project_sources", capture_then_commit)
@@ -2466,29 +2449,7 @@ def test_auto_linker_ignores_git_replace_objects(tmp_path: Path) -> None:
     source.write_text("def originalTree : Nat := 0\n")
     original = _init_git_repository(root)
     source.write_text("def replacementTree : Nat := 0\n")
-    subprocess.run(["git", "add", "A.lean"], cwd=root, check=True)
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=Autoform Tests",
-            "-c",
-            "user.email=autoform@example.invalid",
-            "commit",
-            "-m",
-            "replacement",
-        ],
-        cwd=root,
-        capture_output=True,
-        check=True,
-    )
-    replacement = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    replacement = _git_commit(root, "replacement", "A.lean")
     subprocess.run(["git", "checkout", "--detach", original], cwd=root, check=True)
     source.write_text("def replacementTree : Nat := 0\n")
     subprocess.run(["git", "replace", original, replacement], cwd=root, check=True)
@@ -2507,21 +2468,11 @@ def test_explicit_ref_linker_keeps_remote_bound_to_resolved_root(
     first = tmp_path / "first"
     first.mkdir()
     _index(first, "def fromFirstRepository : Nat := 0\n", "A.lean")
-    commit = _init_git_repository(first)
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "https://github.com/owner/A.git"],
-        cwd=first,
-        check=True,
-    )
+    commit = _init_git_repository(first, origin="https://github.com/owner/A.git")
     second = tmp_path / "second"
     second.mkdir()
     _index(second, "def fromSecondRepository : Nat := 0\n", "B.lean")
-    _init_git_repository(second)
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "https://github.com/owner/B.git"],
-        cwd=second,
-        check=True,
-    )
+    _init_git_repository(second, origin="https://github.com/owner/B.git")
     alias = tmp_path / "alias"
     try:
         alias.symlink_to(first, target_is_directory=True)
@@ -2557,22 +2508,12 @@ def test_auto_linker_ignores_inherited_repo_and_ci_redirects(
     first = tmp_path / "first"
     first.mkdir()
     (first / "A.lean").write_text("def stableRepository : Nat := 0\n")
-    first_commit = _init_git_repository(first)
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "https://github.com/owner/A.git"],
-        cwd=first,
-        check=True,
-    )
+    first_commit = _init_git_repository(first, origin="https://github.com/owner/A.git")
     second = tmp_path / "second"
     second.mkdir()
     (second / "A.lean").write_text("def stableRepository : Nat := 0\n")
     (second / "OnlyB.txt").write_text("different tree\n")
-    second_commit = _init_git_repository(second)
-    subprocess.run(
-        ["git", "remote", "set-url", "origin", "https://github.com/owner/B.git"],
-        cwd=second,
-        check=True,
-    )
+    second_commit = _init_git_repository(second, origin="https://github.com/owner/B.git")
     monkeypatch.setenv("GIT_DIR", str(second / ".git"))
     monkeypatch.setenv("GIT_WORK_TREE", str(second))
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
