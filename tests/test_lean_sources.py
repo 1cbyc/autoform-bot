@@ -92,6 +92,19 @@ def _on_checkpoint(
     monkeypatch.setattr(tree_snapshot_module, "_tree_snapshot_checkpoint", checkpoint)
 
 
+def _count_binds(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    """Record the arguments of every `bind_project_sources` call, one per capture attempt."""
+    calls: list[tuple] = []
+    original_bind = lean_module.bind_project_sources
+
+    def counted_bind(*args, **kwargs):
+        calls.append(args)
+        return original_bind(*args, **kwargs)
+
+    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    return calls
+
+
 def test_qualifies_names_with_their_namespace(tmp_path: Path) -> None:
     index = _index(tmp_path)
 
@@ -273,15 +286,7 @@ def test_direct_snapshot_names_a_stable_invalid_root(
     root = tmp_path / "root"
     if root_kind == "file":
         root.write_text("not a directory\n")
-    attempts = 0
-    original_bind = lean_module.bind_project_sources
-
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
     reason = (
         "directory root does not exist"
@@ -292,7 +297,7 @@ def test_direct_snapshot_names_a_stable_invalid_root(
     with pytest.raises(lean_module.LeanSourceError, match=reason):
         snapshot_project_sources(root)
 
-    assert attempts == lean_module._SNAPSHOT_ATTEMPTS
+    assert len(attempts) == lean_module._SNAPSHOT_ATTEMPTS
 
 
 def test_index_project_keeps_supporting_a_symlinked_root(tmp_path: Path) -> None:
@@ -452,22 +457,14 @@ def test_snapshot_retries_a_root_replaced_while_it_is_bound(
             return original_stat(replacement, *args, **kwargs)
         return original_stat(path, *args, **kwargs)
 
-    original_bind = lean_module.bind_project_sources
-    attempts = 0
-
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
     with monkeypatch.context() as context:
         context.setattr(directory_binding_module.os, "stat", stat_once_replaced)
         snapshot = snapshot_project_sources(project)
 
     assert swapped
-    assert attempts == 2
+    assert len(attempts) == 2
     assert snapshot.index.find("canonical") is not None
 
 
@@ -544,8 +541,6 @@ def test_nested_checkout_marker_replacement_retries_one_generation(
     )
 
     changed = False
-    attempts = 0
-    original_bind = lean_module.bind_project_sources
 
     def replace_marker() -> None:
         nonlocal changed
@@ -559,19 +554,14 @@ def test_nested_checkout_marker_replacement_retries_one_generation(
             marker.unlink()
             marker.mkdir()
 
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
     _on_checkpoint(monkeypatch, "before-final-verification", replace_marker)
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
 
     snapshot = snapshot_project_sources(tmp_path)
 
     assert changed
-    assert attempts == 2
+    assert len(attempts) == 2
     assert snapshot.index.find("toplevel") is not None
     assert snapshot.index.find("nestedWorker") is None
 
@@ -635,15 +625,7 @@ def test_lasting_capture_failure_is_reported_without_retrying(
         "_read_file",
         fail_read,
     )
-    original_bind = lean_module.bind_project_sources
-    attempts = 0
-
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
     reason = (
         f"directory tree could not be read: {os.strerror(errno.EIO)}"
         if failure == "io-error"
@@ -653,7 +635,7 @@ def test_lasting_capture_failure_is_reported_without_retrying(
     with pytest.raises(lean_module.LeanSourceError, match=rf"^{re.escape(reason)}$"):
         snapshot_project_sources(tmp_path)
 
-    assert attempts == 1
+    assert len(attempts) == 1
 
 
 @pytest.mark.parametrize(
@@ -698,20 +680,12 @@ def test_unsupported_entry_name_is_reported_without_retrying(
         (tmp_path / "Project" / "Odd\\Name.lean").write_text("def odd : Nat := 0\n", encoding="utf-8")
     except OSError:
         pytest.skip("backslashes in file names are unavailable")
-    original_bind = lean_module.bind_project_sources
-    attempts = 0
-
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
 
     with pytest.raises(lean_module.LeanSourceError, match="directory tree contains an unsupported entry name"):
         snapshot_project_sources(tmp_path)
 
-    assert attempts == 1
+    assert len(attempts) == 1
 
 
 def test_portable_binding_rejects_a_replacement_root_generation(
@@ -2054,8 +2028,6 @@ def test_managed_output_marker_change_retries_the_whole_capture(
         '{"kind":"packets","packets":[],"schema":"autoform-skeleton-packets/v2"}\n'
     )
     changed = False
-    attempts = 0
-    original_bind = lean_module.bind_project_sources
 
     def change_marker_once() -> None:
         nonlocal changed
@@ -2066,19 +2038,14 @@ def test_managed_output_marker_change_retries_the_whole_capture(
                 '"schema": "autoform-skeleton-packets/v2"}\n'
             )
 
-    def counted_bind(*args, **kwargs):
-        nonlocal attempts
-        attempts += 1
-        return original_bind(*args, **kwargs)
-
     _on_checkpoint(monkeypatch, "before-final-verification", change_marker_once, relative="")
-    monkeypatch.setattr(lean_module, "bind_project_sources", counted_bind)
+    attempts = _count_binds(monkeypatch)
     monkeypatch.setattr(lean_module, "_SNAPSHOT_RETRY_DELAY_SECONDS", 0)
 
     snapshot = snapshot_project_sources(tmp_path)
 
     assert changed
-    assert attempts == 2
+    assert len(attempts) == 2
     assert snapshot.index.find("authored") is not None
     assert snapshot.index.find("generated") is None
 
