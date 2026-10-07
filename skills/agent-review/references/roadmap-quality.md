@@ -11,6 +11,13 @@ scope against the sources, then inspect the fine DAG and its coarse roadmap.
    graphs.
 3. Inspect every milestone and every node in the requested review scope.
 4. Distinguish statement prerequisites from proof-only prerequisites.
+5. Run `autoform search`, described in the
+   [search contract](../../../autoform_cli/README.md#search-contract), for each
+   main result in scope, by a few distinctive words and by its Lean name when
+   it has one, and list the queries run. Each result hits its own article; a
+   second article stating the same result is a duplicate. Finding none, even
+   after a retry with fewer words, is not proof, because matching is literal:
+   also compare the statements read for item 3.
 
 ## Source fidelity and coverage — 40%
 
