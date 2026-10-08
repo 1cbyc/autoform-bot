@@ -261,6 +261,42 @@ def test_a_full_lean_name_finds_the_article_that_owns_it_before_those_that_cite_
     assert _matched(project, "onvex.sep")["convexity/owner"] == ("qualified_names",)
 
 
+@pytest.mark.parametrize("name", ["Project.sep'", "Project.sep''", "Project.get?", "Project.get!"])
+def test_a_full_lean_name_ending_in_a_prime_or_a_mark_finds_its_owner_first(tmp_path: Path, name: str) -> None:
+    project = _project(tmp_path)
+    _article(project, "convexity/cite.md", title="Corollary", body=f"By `{name}` it holds.")
+    _article(project, "convexity/owner.md", title="Owner", metadata=("declaration: theorem", f"lean: {name}"))
+
+    assert _matched(project, name)["convexity/owner"] == ("lean",)
+    assert _ids(project, name)[0] == "convexity/owner"
+
+
+def test_a_full_mathlib_name_finds_the_article_that_owns_it(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _article(
+        project,
+        "convexity/hahn.md",
+        title="Extension",
+        metadata=(
+            "declaration: theorem",
+            "mathlib: true",
+            "mathlib_declaration: Real.exists_extension_norm_eq",
+            "mathlib_file: Mathlib/Analysis/HahnBanach.lean",
+        ),
+    )
+
+    assert _matched(project, "Real.exists_extension_norm_eq")["convexity/hahn"] == ("lean",)
+
+
+def test_a_lean_name_written_with_quoting_marks_is_found_by_the_name_without_them(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _article(
+        project, "convexity/owner.md", title="Owner", metadata=("declaration: theorem", "lean: Project.Convex.\u00absep\u00bb")
+    )
+
+    assert _matched(project, "Project.Convex.sep")["convexity/owner"] == ("lean",)
+
+
 def test_a_chapter_title_does_not_bury_the_article_titled_for_the_result(tmp_path: Path) -> None:
     project = _project(tmp_path)
     _article(project, "sep/README.md", title="Separating hyperplanes")

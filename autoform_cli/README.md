@@ -915,7 +915,9 @@ quotes, and invisible characters do not matter. Fields, best
 first: `title`; `lean` (the last component of each `lean:` and
 `mathlib_declaration` name, and a term that is the whole name or its last
 components, as `Convex.separation` is of `Project.Convex.separation`, with or
-without `_root_.` and `«»`); `node_id` (the last component of the path ID);
+without `_root_.` and `«»`; a prime, `?`, or `!` ending a name is not compared,
+so `Project.foo` is also a `lean` match for `Project.foo'`); `node_id` (the
+last component of the path ID);
 `statement_text`; `ancestors` (titles of containing articles below the roadmap
 root); `qualified_names` (the path ID and Lean names in full, which is where a
 namespace alone matches). A title is

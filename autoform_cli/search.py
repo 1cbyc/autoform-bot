@@ -281,9 +281,13 @@ def _ranks(terms: tuple[str, ...], fields: dict[str, str]) -> list[int] | None:
 
 
 def _lean_name(name: str) -> str:
-    """Return a folded Lean name without the spellings that leave it the same name."""
+    """Return a folded Lean name as a query term spells it.
 
-    return name.removeprefix("_root_.").replace("\u00ab", "").replace("\u00bb", "")
+    ``_root_.`` and the quoting marks leave it the same name. A term has lost
+    the prime, ``?`` or ``!`` a name ends with, so the name loses it as well.
+    """
+
+    return name.removeprefix("_root_.").replace("\u00ab", "").replace("\u00bb", "").rstrip(_QUOTING)
 
 
 def _words(query: str) -> tuple[str, ...]:
