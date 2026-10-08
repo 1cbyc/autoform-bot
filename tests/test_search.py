@@ -465,7 +465,6 @@ def test_a_hit_keeps_the_authored_statement_and_previews_the_published_one(tmp_p
 
     assert hit.statement_text == "A **sublinear** map $p$."
     assert statement_preview(hit) == "A sublinear map \\(p\\)."
-    assert _ids(project, "sublinear", declarations=["def"]) == []
     assert search_blueprint(project, "convex", states=["proved", "can_prove", "proved"]).states == (
         "can_prove",
         "proved",
@@ -496,6 +495,21 @@ def test_filters_and_limit_narrow_the_hits_but_not_the_count(tmp_path: Path) -> 
         search_blueprint(project, "convex", limit=0)
     with pytest.raises(SearchError, match="declaration kind is empty"):
         search_blueprint(project, "convex", declarations=[" "])
+
+
+def test_a_declaration_kind_no_article_uses_is_refused_with_the_kinds_in_use(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _article(project, "convexity/hull.md", title="Convex hull", metadata=("declaration: noncomputable DEF",))
+
+    # An empty answer would read as "this result is new" when the kind was only misspelled.
+    with pytest.raises(SearchError) as refused:
+        search_blueprint(project, "convex", declarations=["theorem", "Definition", "thm"])
+
+    assert str(refused.value) == (
+        "no article declares kind definition, thm; this blueprint uses: lemma, noncomputable def, theorem"
+    )
+    # A kind in use that the query does not reach is an ordinary empty result.
+    assert _ids(project, "nowhere", declarations=["def"]) == []
 
 
 def test_a_hit_names_at_most_ten_dependents_and_counts_them_all(tmp_path: Path) -> None:

@@ -64,7 +64,10 @@ and the published theorem box both read that span. A fence closes only on a
 bare fence line; one that never closes is plain text on the page and hides no
 heading and no dependency link. A later bare fence line of the same character
 and at least the opener's length closes it here, though the page asks for the
-opener's exact length and indent, so close each fence with its own line.
+opener's exact length and indent, so close each fence with its own line. The
+page can also pair an unclosed backtick fence line with a later backtick run in
+the same paragraph and show the text between them as inline code; a link there
+is not a link on the page but is still read as a dependency.
 
 `## Depends on` lists what the article needs in order to be *stated*;
 `## Proof depends on` lists what only its *proof* needs. Both are graph edges.
@@ -942,7 +945,9 @@ needed, then more dependents first, then node ID.
 (`proved` does not include `fully_proved`), and `--declaration` frontmatter
 `declaration` kinds, each repeatable; they apply before `total_matches` is
 counted and `--limit` (default 20) after. `--declaration def` also keeps
-`noncomputable def`, but not `definition`.
+`noncomputable def`, but not `definition`. A kind that no article in the
+blueprint declares is refused with exit code 2 and the kinds in use, rather
+than answered with no hits.
 
 `--json` writes `autoform-search/v1`: `schema`, `source_revision`,
 `open_statements`, `query`, `terms`, `filters` (`declaration` and `state`,

@@ -176,6 +176,15 @@ def search_blueprint(
     root_page = (paths.blueprint_dir / "roadmap" / "README.md").resolve()
     root = next((node_id for node_id, node in graph.nodes.items() if node.path.resolve() == root_page), None)
 
+    # A kind no article uses would give an empty answer, which reads as "this
+    # result is new" when the kind was only misspelled.
+    unused = [kind for kind in wanted_declarations if not any(_declares(node, (kind,)) for node in runtime.nodes)]
+    if unused:
+        in_use = sorted({_normalize(node.declaration) for node in runtime.nodes if node.declaration})
+        raise SearchError(
+            f"no article declares kind {', '.join(unused)}; this blueprint uses: {', '.join(in_use) or 'none'}"
+        )
+
     used_by: dict[str, list[str]] = {node_id: [] for node_id in nodes}
     title_count: dict[str, int] = {}
     for node in runtime.nodes:
